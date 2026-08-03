@@ -2,7 +2,11 @@
 import os
 import json
 import math
+import hashlib
 import logging
+import re
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -32,7 +36,6 @@ _LEGACY_OWNER = "__legacy__"
 FOLIAGE_SOURCE_MODE_FULL = "FULL"
 FOLIAGE_SOURCE_MODE_PROXY = "PROXY"
 
-_SOURCE_MODE_PROP = "_foliage_source_mode"
 _SOURCE_CONTEXT_PROP = "_foliage_source_context_path"
 _SOURCE_KIND_PROP = "_foliage_source_kind"
 _SOURCE_READY_PROP = "_foliage_source_ready"
@@ -45,13 +48,10 @@ _VIEWPORT_DISTANCE_NODE_NAME = "W3 Viewport Distance"
 _VIEWPORT_CULL_ENABLED_NODE_NAME = "W3 Viewport Cull Enabled"
 _VIEWPORT_DENSITY_NODE_NAME = "W3 Ground Cover Density"
 _VIEWPORT_DENSITY_ENABLED_NODE_NAME = "W3 Ground Cover Density Enabled"
-_VIEWPORT_SOURCE_NODE_NAME = "W3 Fast Viewport Source"
-_VIEWPORT_FAST_MATERIAL_ENABLED_NODE_NAME = "W3 Fast Viewport Material Enabled"
-_VIEWPORT_MATERIAL_PROP = "_w3_foliage_viewport_material"
-_VIEWPORT_MATERIAL_SOURCE_PROP = "_w3_foliage_viewport_material_source"
+# Legacy twin-source marker retained for cleanup.
 _VIEWPORT_SOURCE_PROP = "_w3_foliage_viewport_source"
 _LEGACY_VIEWPORT_DRIVER_PROP = "_w3_foliage_viewport_driver"
-_FOLIAGE_GN_VERSION = 8
+_FOLIAGE_GN_VERSION = 9
 
 _PROXY_KIND_GRASS = "grass"
 _PROXY_KIND_FLOWER = "flower"
@@ -60,19 +60,8 @@ _PROXY_KIND_SHRUB = "shrub"
 _PROXY_KIND_CONIFER = "conifer"
 _PROXY_KIND_TREE = "tree"
 
-# Viewer mode hydrates only dominant source types.
-FOLIAGE_VIEWER_GROUND_SOURCE_LIMIT = 8
-FOLIAGE_VIEWER_TREE_SOURCE_LIMIT = 6
-
 _DEFAULT_VIEWPORT_DISTANCE = 75.0
 _DEFAULT_VIEWPORT_GROUND_DENSITY = 0.25
-
-
-def _normalise_source_mode(source_mode: str) -> str:
-    mode = str(source_mode or FOLIAGE_SOURCE_MODE_FULL).strip().upper()
-    if mode not in {FOLIAGE_SOURCE_MODE_FULL, FOLIAGE_SOURCE_MODE_PROXY}:
-        raise ValueError("Foliage source_mode must be 'FULL' or 'PROXY'")
-    return mode
 
 
 @dataclass(frozen=True)
@@ -544,8 +533,13 @@ def _foliage_proxy_kind(depot_path: str) -> str:
     return _PROXY_KIND_SHRUB
 
 
-def _is_ground_cover(depot_path: str) -> bool:
-    return _foliage_proxy_kind(depot_path) not in {_PROXY_KIND_TREE, _PROXY_KIND_CONIFER}
+def _is_generic_grass(depot_path: str) -> bool:
+    return _foliage_proxy_kind(depot_path) == _PROXY_KIND_GRASS
+
+
+def _source_import_order(depot_path: str) -> tuple:
+    kind = _foliage_proxy_kind(depot_path)
+    return (0 if kind in (_PROXY_KIND_TREE, _PROXY_KIND_CONIFER) else 1, depot_path)
 
 
 def _foliage_viewport_settings(scene=None):
@@ -556,6 +550,9 @@ def _foliage_viewport_settings(scene=None):
         "distance": max(
             1.0,
             float(getattr(settings, "foliage_viewport_distance", _DEFAULT_VIEWPORT_DISTANCE)),
+        ),
+        "ground_density_enabled": bool(
+            getattr(settings, "foliage_viewport_use_ground_density", True)
         ),
         "ground_density": min(
             1.0,
@@ -570,7 +567,6 @@ def _foliage_viewport_settings(scene=None):
                 ),
             ),
         ),
-        "fast_materials": bool(getattr(settings, "foliage_viewport_fast_materials", True)),
     }
 
 
@@ -579,120 +575,36 @@ def _viewport_density_threshold(density: float) -> float:
     return density * 100.0 - 0.5
 
 
-def _diffuse_image_from_material(material):
-    node_tree = getattr(material, "node_tree", None)
-    nodes = list(getattr(node_tree, "nodes", ()) or ())
-    image_nodes = [node for node in nodes if getattr(node, "type", "") == 'TEX_IMAGE' and node.image]
-    if not image_nodes:
-        return None
-    for node in image_nodes:
-        label = f"{getattr(node, 'name', '')} {getattr(node, 'label', '')}".lower()
-        if any(word in label for word in ("diffuse", "base color", "basecolor", "albedo")):
-            return node.image
-    return image_nodes[0].image
-
-
-def _get_or_create_fast_viewport_material(source_material):
-    source_key = str(getattr(source_material, "name_full", None) or source_material.name)
-    for material in bpy.data.materials:
-        if (
-            material.get(_VIEWPORT_MATERIAL_PROP)
-            and str(material.get(_VIEWPORT_MATERIAL_SOURCE_PROP, "")) == source_key
-        ):
-            return material
-
-    material = bpy.data.materials.new(name=f"{source_material.name} [W3 Viewport]")
-    material.use_nodes = True
-    material[_VIEWPORT_MATERIAL_PROP] = True
-    material[_VIEWPORT_MATERIAL_SOURCE_PROP] = source_key
+def _apply_hide_state(obj, hidden: bool) -> None:
+    obj.hide_viewport = hidden
+    obj.hide_render = hidden
     try:
-        material.diffuse_color = source_material.diffuse_color
+        obj.hide_select = hidden
     except Exception:
         pass
-
-    nodes = material.node_tree.nodes
-    links = material.node_tree.links
-    nodes.clear()
-    output = nodes.new('ShaderNodeOutputMaterial')
-    output.location = (320, 0)
-    shader = nodes.new('ShaderNodeBsdfPrincipled')
-    shader.location = (40, 0)
-    shader.inputs['Roughness'].default_value = 0.8
-    links.new(shader.outputs['BSDF'], output.inputs['Surface'])
-
-    image = _diffuse_image_from_material(source_material)
-    if image is not None:
-        texture = nodes.new('ShaderNodeTexImage')
-        texture.location = (-260, 0)
-        texture.image = image
-        links.new(texture.outputs['Color'], shader.inputs['Base Color'])
-        links.new(texture.outputs['Alpha'], shader.inputs['Alpha'])
-    else:
+    applied = False
+    try:
+        scenes = list(bpy.data.scenes)
+    except Exception:
+        scenes = []
+    for scene in scenes:
+        for view_layer in getattr(scene, "view_layers", ()) or ():
+            try:
+                obj.hide_set(hidden, view_layer=view_layer)
+                applied = True
+            except Exception:
+                pass
+    if not applied:
         try:
-            shader.inputs['Base Color'].default_value = source_material.diffuse_color
+            obj.hide_set(hidden)
         except Exception:
             pass
-
-    try:
-        material.surface_render_method = 'DITHERED'
-    except Exception:
-        try:
-            material.blend_method = 'HASHED'
-        except Exception:
-            pass
-    try:
-        material.use_transparency_overlap = False
-    except Exception:
-        pass
-    return material
 
 
 def _hide_foliage_source(source) -> None:
     """Keep source datablocks usable by GN but out of the viewport and render."""
 
-    source.hide_viewport = True
-    source.hide_render = True
-    try:
-        source.hide_select = True
-    except Exception:
-        pass
-    try:
-        source.hide_set(True)
-    except Exception:
-        pass
-
-
-def _get_or_create_fast_viewport_source(source_obj, foliage_root):
-    data = getattr(source_obj, "data", None)
-    if data is None:
-        return None
-    source_materials = [slot.material for slot in getattr(source_obj, "material_slots", ())]
-    if not source_materials or not any(source_materials):
-        return None
-
-    source_key = str(getattr(source_obj, "name_full", None) or source_obj.name)
-    fast_source = next(
-        (
-            obj for obj in foliage_root.objects
-            if str(obj.get(_VIEWPORT_SOURCE_PROP, "")) == source_key
-            and getattr(obj, "data", None) is data
-        ),
-        None,
-    )
-    if fast_source is None:
-        fast_source = bpy.data.objects.new(f"{source_obj.name} [W3 Viewport]", data)
-        fast_source[_VIEWPORT_SOURCE_PROP] = source_key
-        foliage_root.objects.link(fast_source)
-
-    for slot, source_material in zip(fast_source.material_slots, source_materials):
-        slot.link = 'OBJECT'
-        slot.material = (
-            _get_or_create_fast_viewport_material(source_material)
-            if source_material is not None
-            else None
-        )
-    _hide_foliage_source(fast_source)
-    return fast_source
+    _apply_hide_state(source, True)
 
 
 def _get_or_create_proxy_source(foliage_root, depot_path: str = ""):
@@ -718,11 +630,127 @@ def _get_or_create_proxy_source(foliage_root, depot_path: str = ""):
     return source
 
 
+_SOURCE_CACHE_VERSION = 1
+
+
+def _source_cache_file(depot_path: str, source_context_path: str = "") -> str:
+    try:
+        from ..CR2W.common_blender import redkit_repo_context, repo_file
+        from ..extension_paths import get_cache_root
+
+        with redkit_repo_context(source_context_path or None):
+            srt_abs = repo_file(depot_path)
+        stat = os.stat(srt_abs)
+        directory = os.path.join(get_cache_root(), "foliage_sources")
+        os.makedirs(directory, exist_ok=True)
+    except Exception:
+        return ""
+    key = f"{os.path.normcase(srt_abs)}|{stat.st_mtime_ns}|{stat.st_size}|v{_SOURCE_CACHE_VERSION}"
+    digest = hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()[:20]
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.path.splitext(os.path.basename(depot_path))[0])
+    stem = stem.strip("._")[:60] or "srt"
+    return os.path.join(directory, f"{stem}_{digest}.blend")
+
+
+def _has_source_cache(depot_path: str, source_context_path: str = "") -> bool:
+    path = _source_cache_file(depot_path, source_context_path)
+    return bool(path) and os.path.isfile(path)
+
+
+def _dedupe_source_images(source) -> None:
+    try:
+        by_path = {}
+        for image in bpy.data.images:
+            filepath = str(getattr(image, "filepath", "") or "")
+            if filepath:
+                by_path.setdefault(os.path.normcase(bpy.path.abspath(filepath)), image)
+        for slot in getattr(source, "material_slots", ()):
+            node_tree = getattr(slot.material, "node_tree", None)
+            for node in getattr(node_tree, "nodes", ()) or ():
+                image = getattr(node, "image", None)
+                filepath = str(getattr(image, "filepath", "") or "")
+                if image is None or not filepath:
+                    continue
+                keeper = by_path.get(os.path.normcase(bpy.path.abspath(filepath)))
+                if keeper is not None and keeper is not image:
+                    node.image = keeper
+                    if image.users == 0:
+                        bpy.data.images.remove(image)
+    except Exception:
+        log.debug("Foliage source image dedupe failed", exc_info=True)
+
+
+def _discard_source_cache(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _append_source_from_cache(depot_path: str, foliage_root, source_context_path: str = ""):
+    path = _source_cache_file(depot_path, source_context_path)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with bpy.data.libraries.load(path, link=False) as (data_from, data_to):
+            data_to.objects = list(data_from.objects)
+    except Exception:
+        log.warning("Unreadable foliage source cache, reimporting: %s", path)
+        _discard_source_cache(path)
+        return None
+    source = _pick_best_mesh([obj for obj in data_to.objects if obj is not None])
+    if source is None or source.data is None or len(source.data.vertices) == 0:
+        if source is not None:
+            _remove_source_object(source)
+        _discard_source_cache(path)
+        return None
+    source["_depot_path"] = "_src_" + depot_path
+    source["_is_foliage_source"] = True
+    source[_SOURCE_KIND_PROP] = FOLIAGE_SOURCE_MODE_FULL
+    source[_SOURCE_READY_PROP] = True
+    foliage_root.objects.link(source)
+    _dedupe_source_images(source)
+    _hide_foliage_source(source)
+    return source
+
+
+def _write_source_cache(depot_path: str, source, source_context_path: str = "") -> None:
+    path = _source_cache_file(depot_path, source_context_path)
+    if not path or os.path.isfile(path):
+        return
+    tmp_path = path + ".tmp.blend"
+    try:
+        bpy.data.libraries.write(tmp_path, {source}, path_remap='ABSOLUTE', compress=True)
+        os.replace(tmp_path, path)
+    except Exception:
+        log.warning("Could not write foliage source cache: %s", path, exc_info=True)
+        try:
+            if os.path.isfile(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+@contextmanager
+def _isolated_source_imports(context, pending_count: int):
+    if pending_count < 2:
+        yield
+        return
+    from . import import_isolation
+    with import_isolation.isolated_import_batch_session(
+        context or getattr(bpy, "context", None),
+        label="FoliageSources",
+    ):
+        yield
+
+
 def _get_or_import_source_mesh(
     depot_path: str,
     foliage_root,
     source_context_path: str = "",
     context=None,
+    *,
+    cached_only: bool = False,
 ):
     """Return the single LOD0 source mesh for this depot path, importing if needed."""
     marker = "_src_" + depot_path
@@ -735,6 +763,12 @@ def _get_or_import_source_mesh(
     for obj in list(foliage_root.objects):
         if obj.get("_depot_path") == marker:
             _remove_source_object(obj)
+
+    cached = _append_source_from_cache(depot_path, foliage_root, source_context_path)
+    if cached is not None:
+        return cached
+    if cached_only:
+        return None
 
     from ..importers.import_helpers import meshPath
     from ..importers.import_blender_fun import _import_foliage_mesh
@@ -767,12 +801,13 @@ def _get_or_import_source_mesh(
     source["_is_foliage_source"] = True
     source[_SOURCE_KIND_PROP] = FOLIAGE_SOURCE_MODE_FULL
     source[_SOURCE_READY_PROP] = True
-    _hide_foliage_source(source)
 
     # Move to foliage root (remove from any scene collection it landed in)
     for c in list(source.users_collection):
         c.objects.unlink(source)
     foliage_root.objects.link(source)
+    _hide_foliage_source(source)
+    _write_source_cache(depot_path, source, source_context_path)
 
     return source
 
@@ -887,9 +922,8 @@ def _build_foliage_gn_tree(
     viewport_distance: float = _DEFAULT_VIEWPORT_DISTANCE,
     viewport_cull_enabled: bool = True,
     viewport_ground_density: float = _DEFAULT_VIEWPORT_GROUND_DENSITY,
+    viewport_ground_density_enabled: bool = True,
     is_ground_cover: bool = True,
-    fast_viewport_source=None,
-    fast_viewport_material_enabled: bool = True,
 ):
     """
     Named Attribute "rot" (FLOAT_VECTOR, XYZ euler)
@@ -1023,7 +1057,9 @@ def _build_foliage_gn_tree(
     density_enabled.name = _VIEWPORT_DENSITY_ENABLED_NODE_NAME
     density_enabled.label = _VIEWPORT_DENSITY_ENABLED_NODE_NAME
     density_enabled.operation = 'AND'
-    density_enabled.inputs[1].default_value = bool(is_ground_cover)
+    density_enabled.inputs[1].default_value = bool(
+        is_ground_cover and viewport_ground_density_enabled
+    )
     density_enabled.location = (50, 550)
     viewport_remove = nodes.new('FunctionNodeBooleanMath')
     viewport_remove.operation = 'OR'
@@ -1049,32 +1085,7 @@ def _build_foliage_gn_tree(
     links.new(viewport_remove.outputs[0], delete.inputs['Selection'])
     links.new(delete.outputs['Geometry'], iop.inputs['Points'])
 
-    # Swap to cheap object-linked materials only in the viewport.
-    fast_oi = nodes.new('GeometryNodeObjectInfo')
-    fast_oi.name = _VIEWPORT_SOURCE_NODE_NAME
-    fast_oi.label = _VIEWPORT_SOURCE_NODE_NAME
-    fast_oi.location = (-100, -450)
-    fast_oi.inputs['Object'].default_value = fast_viewport_source
-    try:
-        fast_oi.transform_space = 'ORIGINAL'
-    except Exception:
-        pass
-    material_switch = nodes.new('GeometryNodeSwitch')
-    material_switch.input_type = 'GEOMETRY'
-    material_switch.location = (100, -300)
-    fast_enabled = nodes.new('FunctionNodeBooleanMath')
-    fast_enabled.name = _VIEWPORT_FAST_MATERIAL_ENABLED_NODE_NAME
-    fast_enabled.label = _VIEWPORT_FAST_MATERIAL_ENABLED_NODE_NAME
-    fast_enabled.operation = 'AND'
-    fast_enabled.inputs[1].default_value = bool(
-        fast_viewport_material_enabled and fast_viewport_source is not None
-    )
-    fast_enabled.location = (-100, -550)
-    links.new(is_viewport.outputs[0], fast_enabled.inputs[0])
-    links.new(fast_enabled.outputs[0], material_switch.inputs['Switch'])
-    links.new(oi.outputs['Geometry'], material_switch.inputs['False'])
-    links.new(fast_oi.outputs['Geometry'], material_switch.inputs['True'])
-    links.new(material_switch.outputs['Output'], iop.inputs['Instance'])
+    links.new(oi.outputs['Geometry'], iop.inputs['Instance'])
     if e2r is not None:
         links.new(na.outputs[0], e2r.inputs[0])
         try:
@@ -1091,26 +1102,6 @@ def _build_foliage_gn_tree(
     except Exception:
         pass
     links.new(iop.outputs['Instances'], gout.inputs['Geometry'])
-
-
-def _set_instancer_viewport_source(
-    instancer_obj,
-    source_obj,
-    foliage_root,
-    enabled: bool,
-) -> None:
-    fast_source = _get_or_create_fast_viewport_source(source_obj, foliage_root)
-    for modifier in instancer_obj.modifiers:
-        if modifier.type != 'NODES' or modifier.node_group is None:
-            continue
-        nodes = modifier.node_group.nodes
-        source_node = nodes.get(_VIEWPORT_SOURCE_NODE_NAME)
-        fast_enabled = nodes.get(_VIEWPORT_FAST_MATERIAL_ENABLED_NODE_NAME)
-        if source_node is not None:
-            source_node.inputs['Object'].default_value = fast_source
-        if fast_enabled is not None:
-            fast_enabled.inputs[1].default_value = bool(enabled and fast_source is not None)
-        modifier.node_group.update_tag()
 
 
 def _set_instancer_viewport_settings(
@@ -1138,7 +1129,9 @@ def _set_instancer_viewport_settings(
                 settings["ground_density"]
             )
         if density_enabled is not None:
-            density_enabled.inputs[1].default_value = _is_ground_cover(depot_path)
+            density_enabled.inputs[1].default_value = bool(
+                _is_generic_grass(depot_path) and settings["ground_density_enabled"]
+            )
         modifier.node_group.update_tag()
 
 
@@ -1173,16 +1166,7 @@ def _sync_instancer_source_visibility(instancer_obj, source_obj) -> bool:
     """Show hydrated vegetation and completely hide diagnostic fallback types."""
 
     hidden = not _is_real_foliage_source(source_obj)
-    instancer_obj.hide_viewport = hidden
-    instancer_obj.hide_render = hidden
-    try:
-        instancer_obj.hide_select = hidden
-    except Exception:
-        pass
-    try:
-        instancer_obj.hide_set(hidden)
-    except Exception:
-        pass
+    _apply_hide_state(instancer_obj, hidden)
     instancer_obj[_FALLBACK_HIDDEN_PROP] = hidden
     return hidden
 
@@ -1202,12 +1186,6 @@ def _set_instancer_source(instancer_obj, source_obj) -> bool:
         except Exception:
             pass
     if changed:
-        mode = (
-            FOLIAGE_SOURCE_MODE_FULL
-            if _is_real_foliage_source(source_obj)
-            else FOLIAGE_SOURCE_MODE_PROXY
-        )
-        instancer_obj[_SOURCE_MODE_PROP] = mode
         _sync_instancer_source_visibility(instancer_obj, source_obj)
         try:
             instancer_obj.update_tag()
@@ -1262,7 +1240,6 @@ def _get_or_create_instancer(
 ):
     """Return (or create) the GN instancer object for this depot path."""
     viewport_settings = _foliage_viewport_settings()
-    fast_source = _get_or_create_fast_viewport_source(source_obj, foliage_root)
     marker = "_inst_" + depot_path
     for obj in foliage_root.objects:
         if obj.get("_depot_path") == marker:
@@ -1282,20 +1259,13 @@ def _get_or_create_instancer(
                     viewport_distance=viewport_settings["distance"],
                     viewport_cull_enabled=viewport_settings["cull_enabled"],
                     viewport_ground_density=viewport_settings["ground_density"],
-                    is_ground_cover=_is_ground_cover(depot_path),
-                    fast_viewport_source=fast_source,
-                    fast_viewport_material_enabled=viewport_settings["fast_materials"],
+                    viewport_ground_density_enabled=viewport_settings["ground_density_enabled"],
+                    is_ground_cover=_is_generic_grass(depot_path),
                 )
                 if old_group is not None and old_group.users == 0:
                     bpy.data.node_groups.remove(old_group)
                 obj["_foliage_gn_version"] = _FOLIAGE_GN_VERSION
             _set_instancer_source(obj, source_obj)
-            _set_instancer_viewport_source(
-                obj,
-                source_obj,
-                foliage_root,
-                viewport_settings["fast_materials"],
-            )
             _set_instancer_viewport_settings(
                 obj,
                 settings=viewport_settings,
@@ -1322,9 +1292,8 @@ def _get_or_create_instancer(
         viewport_distance=viewport_settings["distance"],
         viewport_cull_enabled=viewport_settings["cull_enabled"],
         viewport_ground_density=viewport_settings["ground_density"],
-        is_ground_cover=_is_ground_cover(depot_path),
-        fast_viewport_source=fast_source,
-        fast_viewport_material_enabled=viewport_settings["fast_materials"],
+        viewport_ground_density_enabled=viewport_settings["ground_density_enabled"],
+        is_ground_cover=_is_generic_grass(depot_path),
     )
     _set_instancer_source(obj, source_obj)
     if source_context_path:
@@ -1340,7 +1309,7 @@ def apply_foliage_viewport_settings(scene=None, position=None) -> int:
         if not foliage_root.get("_is_foliage_root"):
             continue
         for obj in list(foliage_root.objects):
-            if obj.get(_LEGACY_VIEWPORT_DRIVER_PROP):
+            if obj.get(_LEGACY_VIEWPORT_DRIVER_PROP) or obj.get(_VIEWPORT_SOURCE_PROP):
                 bpy.data.objects.remove(obj, do_unlink=True)
         for instancer in list(foliage_root.objects):
             if not instancer.get("_is_foliage_instancer"):
@@ -1354,12 +1323,6 @@ def apply_foliage_viewport_settings(scene=None, position=None) -> int:
                 source,
                 foliage_root,
                 str(instancer.get(_SOURCE_CONTEXT_PROP, "") or ""),
-            )
-            _set_instancer_viewport_source(
-                instancer,
-                source,
-                foliage_root,
-                settings["fast_materials"],
             )
             _set_instancer_viewport_settings(
                 instancer,
@@ -1422,42 +1385,6 @@ def _instancer_depot_path(instancer_obj) -> str:
     return marker[len("_inst_"):] if marker.startswith("_inst_") else ""
 
 
-def _foliage_type_instance_counts(root_transforms: dict) -> dict[str, int]:
-    counts = {}
-    for by_type in root_transforms.values():
-        for depot_path, transforms in by_type.items():
-            count = len(transforms)
-            if count:
-                counts[depot_path] = counts.get(depot_path, 0) + count
-    return counts
-
-
-def _viewer_source_priority(
-    root_transforms: dict,
-    *,
-    ground_limit: int = FOLIAGE_VIEWER_GROUND_SOURCE_LIMIT,
-    tree_limit: int = FOLIAGE_VIEWER_TREE_SOURCE_LIMIT,
-) -> tuple[str, ...]:
-    """Choose a bounded set of dominant real sources for a fast polished view."""
-
-    counts = _foliage_type_instance_counts(root_transforms)
-    tree_kinds = {_PROXY_KIND_TREE, _PROXY_KIND_CONIFER}
-    trees = []
-    ground = []
-    for depot_path, count in counts.items():
-        item = (-count, depot_path.lower(), depot_path)
-        if _foliage_proxy_kind(depot_path) in tree_kinds:
-            trees.append(item)
-        else:
-            ground.append(item)
-    trees.sort()
-    ground.sort()
-    selected = ground[:max(0, int(ground_limit))] + trees[:max(0, int(tree_limit))]
-    # Prioritize the most common selected types.
-    selected.sort()
-    return tuple(item[2] for item in selected)
-
-
 def _sync_fallback_instancer_visibility(foliage_root) -> tuple[str, ...]:
     hidden = []
     for obj in foliage_root.objects:
@@ -1476,43 +1403,54 @@ def _rebuild_depot_types(
     root_transforms: dict,
     depot_paths: Iterable[str],
     source_context_by_type: dict | None = None,
-    source_mode: str = FOLIAGE_SOURCE_MODE_FULL,
+    import_sources: bool = True,
+    cached_only: bool = False,
     context=None,
 ) -> None:
     """Upload every affected type once after all requested cells were parsed."""
 
-    source_mode = _normalise_source_mode(source_mode)
     source_context_by_type = source_context_by_type or {}
     owner_indices_by_key = _ensure_owner_indices(foliage_root, root_transforms)
-    for depot_path in sorted(set(depot_paths)):
-        transforms, owner_indices = _transforms_for_depot(
-            root_transforms,
-            depot_path,
-            owner_indices_by_key,
-        )
-        if not transforms:
-            instancer = _find_instancer(depot_path, foliage_root)
-            if instancer is not None:
-                _rebuild_instancer_mesh(instancer, (), ())
-            continue
-        source_context_path = source_context_by_type.get(depot_path, "")
-        source = _find_real_source_mesh(depot_path, foliage_root)
-        if source is None and source_mode == FOLIAGE_SOURCE_MODE_FULL:
-            source = _get_or_import_source_mesh(
+    depot_paths = sorted(set(depot_paths), key=_source_import_order)
+    pending_imports = 0
+    if import_sources and not cached_only:
+        for depot_path in depot_paths:
+            if _find_real_source_mesh(depot_path, foliage_root) is not None:
+                continue
+            if _has_source_cache(depot_path, source_context_by_type.get(depot_path, "")):
+                continue
+            pending_imports += 1
+    with _isolated_source_imports(context, pending_imports):
+        for depot_path in depot_paths:
+            transforms, owner_indices = _transforms_for_depot(
+                root_transforms,
                 depot_path,
+                owner_indices_by_key,
+            )
+            if not transforms:
+                instancer = _find_instancer(depot_path, foliage_root)
+                if instancer is not None:
+                    _rebuild_instancer_mesh(instancer, (), ())
+                continue
+            source_context_path = source_context_by_type.get(depot_path, "")
+            source = _find_real_source_mesh(depot_path, foliage_root)
+            if source is None and import_sources:
+                source = _get_or_import_source_mesh(
+                    depot_path,
+                    foliage_root,
+                    source_context_path,
+                    context,
+                    cached_only=cached_only,
+                )
+            if source is None:
+                source = _get_or_create_proxy_source(foliage_root, depot_path)
+            instancer = _get_or_create_instancer(
+                depot_path,
+                source,
                 foliage_root,
                 source_context_path,
-                context,
             )
-        if source is None:
-            source = _get_or_create_proxy_source(foliage_root, depot_path)
-        instancer = _get_or_create_instancer(
-            depot_path,
-            source,
-            foliage_root,
-            source_context_path,
-        )
-        _rebuild_instancer_mesh(instancer, transforms, owner_indices)
+            _rebuild_instancer_mesh(instancer, transforms, owner_indices)
 
 
 def list_missing_foliage_sources(foliage_root) -> tuple[str, ...]:
@@ -1551,6 +1489,7 @@ def hydrate_missing_foliage_sources(
             selected = list(dict.fromkeys(str(value) for value in depot_paths))
         missing_set = set(missing)
         requested = [depot_path for depot_path in selected if depot_path in missing_set]
+    requested.sort(key=_source_import_order)
 
     if max_sources is not None:
         max_sources = int(max_sources)
@@ -1560,32 +1499,43 @@ def hydrate_missing_foliage_sources(
 
     hydrated = []
     failed = []
-    for depot_path in requested:
-        instancer = _find_instancer(depot_path, foliage_root)
-        if instancer is None:
-            failed.append(depot_path)
-            continue
-        source_context_path = str(instancer.get(_SOURCE_CONTEXT_PROP, "") or "")
-        try:
-            source = _get_or_import_source_mesh(
-                depot_path,
-                foliage_root,
-                source_context_path,
-                context,
-            )
-            if source is None:
+    with _isolated_source_imports(context, len(requested)):
+        for index, depot_path in enumerate(requested):
+            instancer = _find_instancer(depot_path, foliage_root)
+            if instancer is None:
                 failed.append(depot_path)
                 continue
-            _get_or_create_instancer(
-                depot_path,
-                source,
-                foliage_root,
-                source_context_path,
-            )
-            hydrated.append(depot_path)
-        except Exception:
-            log.exception("Failed to hydrate foliage type: %s", depot_path)
-            failed.append(depot_path)
+            source_context_path = str(instancer.get(_SOURCE_CONTEXT_PROP, "") or "")
+            try:
+                source_started = time.perf_counter()
+                source = _get_or_import_source_mesh(
+                    depot_path,
+                    foliage_root,
+                    source_context_path,
+                    context,
+                )
+                source_seconds = time.perf_counter() - source_started
+                if source_seconds >= 0.25:
+                    log.info(
+                        "[foliage] source %s ready in %.2fs (%d/%d)",
+                        depot_path,
+                        source_seconds,
+                        index + 1,
+                        len(requested),
+                    )
+                if source is None:
+                    failed.append(depot_path)
+                    continue
+                _get_or_create_instancer(
+                    depot_path,
+                    source,
+                    foliage_root,
+                    source_context_path,
+                )
+                hydrated.append(depot_path)
+            except Exception:
+                log.exception("Failed to hydrate foliage type: %s", depot_path)
+                failed.append(depot_path)
 
     return FoliageHydrationResult(
         requested_types=tuple(requested),
@@ -1595,28 +1545,73 @@ def hydrate_missing_foliage_sources(
     )
 
 
-def apply_viewer_source_budget(foliage_root, context=None) -> FoliageHydrationResult:
-    """Keep only the root-wide dominant foliage types on real source meshes."""
+_BG_HYDRATION = {"root_names": [], "failed": {}}
 
-    root_transforms = _get_root_transform_bucket(foliage_root, create=True)
-    priority = tuple(_viewer_source_priority(root_transforms))
-    priority_set = set(priority)
-    placeholder = None
-    for obj in foliage_root.objects:
-        if not obj.get("_is_foliage_instancer"):
-            continue
-        depot_path = _instancer_depot_path(obj)
-        if not depot_path or depot_path in priority_set:
-            continue
-        if placeholder is None:
-            placeholder = _get_or_create_proxy_source(foliage_root)
-        _set_instancer_source(obj, placeholder)
 
-    return hydrate_missing_foliage_sources(
-        foliage_root,
-        context,
-        depot_paths=priority,
-    )
+def _background_hydration_tick():
+    try:
+        from ..ui import ui_map
+        if ui_map.foliage_busy() or ui_map.layer_stream_job_running():
+            return 0.5
+    except Exception:
+        pass
+    for name in list(_BG_HYDRATION["root_names"]):
+        root = bpy.data.collections.get(name)
+        failed = _BG_HYDRATION["failed"].setdefault(name, set())
+        pending = []
+        if root is not None:
+            pending = [
+                depot_path
+                for depot_path in list_missing_foliage_sources(root)
+                if depot_path not in failed
+            ]
+        if root is None or not pending:
+            if root is not None and failed:
+                log.warning(
+                    "[foliage] %d source(s) failed to import and stay hidden: %s",
+                    len(failed),
+                    ", ".join(sorted(failed)),
+                )
+            _BG_HYDRATION["root_names"].remove(name)
+            _BG_HYDRATION["failed"].pop(name, None)
+            continue
+        result = hydrate_missing_foliage_sources(
+            root,
+            None,
+            depot_paths=pending,
+            max_sources=1,
+        )
+        failed.update(result.failed_types)
+        return 0.05
+    return None
+
+
+def cancel_background_source_hydration() -> None:
+    try:
+        if bpy.app.timers.is_registered(_background_hydration_tick):
+            bpy.app.timers.unregister(_background_hydration_tick)
+    except Exception:
+        pass
+    _BG_HYDRATION["root_names"].clear()
+    _BG_HYDRATION["failed"].clear()
+
+
+def schedule_background_source_hydration(foliage_root) -> bool:
+    if bool(getattr(getattr(bpy, "app", None), "background", False)):
+        return False
+    name = str(getattr(foliage_root, "name", "") or "")
+    if not name:
+        return False
+    if name not in _BG_HYDRATION["root_names"]:
+        _BG_HYDRATION["root_names"].append(name)
+        _BG_HYDRATION["failed"].setdefault(name, set())
+    if not bpy.app.timers.is_registered(_background_hydration_tick):
+        try:
+            bpy.app.timers.register(_background_hydration_tick, first_interval=0.1)
+        except Exception:
+            _BG_HYDRATION["root_names"].remove(name)
+            return False
+    return True
 
 
 def _rebuild_depot_types_transactionally(
@@ -1626,7 +1621,8 @@ def _rebuild_depot_types_transactionally(
     affected_types,
     source_context_by_type=None,
     *,
-    source_mode: str,
+    import_sources: bool = True,
+    cached_only: bool = False,
     context=None,
 ) -> None:
     """Restore previous point geometry if any affected-type rebuild fails."""
@@ -1638,7 +1634,8 @@ def _rebuild_depot_types_transactionally(
             candidate_transforms,
             affected_types,
             source_context_by_type,
-            source_mode=source_mode,
+            import_sources=import_sources,
+            cached_only=cached_only,
             context=context,
         )
     except Exception:
@@ -1648,7 +1645,7 @@ def _rebuild_depot_types_transactionally(
                 foliage_root,
                 previous_transforms,
                 affected_types,
-                source_mode=FOLIAGE_SOURCE_MODE_PROXY,
+                import_sources=False,
                 context=context,
             )
         except Exception:
@@ -1733,15 +1730,12 @@ def load_foliage_cells(
     bounds: Bounds2D | Sequence[float] | None = None,
     owner_scope: str = "",
     replace: bool = False,
-    source_mode: str = FOLIAGE_SOURCE_MODE_FULL,
-    hydrate_viewer_sources: bool = True,
 ) -> FoliageLoadResult:
     """Parse cells and upload each affected foliage type once."""
 
     from ..CR2W.CR2W_reader import load_foliage
     from ..CR2W.common_blender import redkit_repo_context
 
-    source_mode = _normalise_source_mode(source_mode)
     entries = _normalise_cell_entries(cell_paths)
     if bounds is not None and not isinstance(bounds, Bounds2D):
         bounds = Bounds2D(*(float(value) for value in bounds))
@@ -1760,17 +1754,14 @@ def load_foliage_cells(
     source_context_by_type = {}
     new_owner_keys = set()
 
+    parse_started = time.perf_counter()
     for key, path in entries:
         owner_key = _scoped_owner_key(owner_scope, key)
         if not replace and (
             owner_key in candidate_transforms
             or (bounds is None and not owner_scope and key in loaded_cell_keys)
         ):
-            if source_mode == FOLIAGE_SOURCE_MODE_FULL:
-                hydrate_types.update(candidate_transforms.get(owner_key, {}))
-            else:
-                # Reapply viewer source policy to cached cells.
-                affected_types.update(candidate_transforms.get(owner_key, {}))
+            hydrate_types.update(candidate_transforms.get(owner_key, {}))
             skipped.append(key)
             continue
 
@@ -1809,6 +1800,12 @@ def load_foliage_cells(
         else:
             loaded_owner_keys.add(owner_key)
 
+    parse_seconds = time.perf_counter() - parse_started
+
+    # Interactive imports defer uncached SRT sources to the timer.
+    defer_cold_sources = not bool(getattr(getattr(bpy, "app", None), "background", False))
+
+    rebuild_started = time.perf_counter()
     if affected_types:
         _rebuild_depot_types_transactionally(
             foliage_root,
@@ -1816,32 +1813,57 @@ def load_foliage_cells(
             candidate_transforms,
             affected_types,
             source_context_by_type,
-            source_mode=source_mode,
+            cached_only=defer_cold_sources,
             context=context,
         )
     elif new_owner_keys:
         _ensure_owner_indices(foliage_root, new_owner_keys)
+    rebuild_seconds = time.perf_counter() - rebuild_started
 
     if new_owner_keys:
         root_transforms.clear()
         root_transforms.update(candidate_transforms)
         _set_json_string_list(foliage_root, "_loaded_cells", sorted(loaded_cell_keys))
         _set_json_string_list(foliage_root, _LOADED_OWNERS_PROP, sorted(loaded_owner_keys))
-    foliage_root[_SOURCE_MODE_PROP] = source_mode
 
     hydrated_types = ()
-    if source_mode == FOLIAGE_SOURCE_MODE_PROXY and hydrate_viewer_sources:
-        hydration = apply_viewer_source_budget(foliage_root, context)
-        hydrated_types = hydration.hydrated_types
-    elif source_mode == FOLIAGE_SOURCE_MODE_FULL and hydrate_types:
+    hydrate_started = time.perf_counter()
+    if hydrate_types and not defer_cold_sources:
         hydration = hydrate_missing_foliage_sources(
             foliage_root,
             context,
             depot_paths=hydrate_types,
         )
         hydrated_types = hydration.hydrated_types
+    hydrate_seconds = time.perf_counter() - hydrate_started
+
+    total_seconds = parse_seconds + rebuild_seconds + hydrate_seconds
+    if total_seconds >= 1.0:
+        log.info(
+            "[foliage] load: %d cell(s) parsed in %.2fs (%d instances), "
+            "sources+instancers %.2fs (%d types), retry-hydrate %.2fs",
+            len(loaded),
+            parse_seconds,
+            instance_count,
+            rebuild_seconds,
+            len(affected_types),
+            hydrate_seconds,
+        )
 
     hidden_fallback_types = _sync_fallback_instancer_visibility(foliage_root)
+    if hidden_fallback_types:
+        if defer_cold_sources and schedule_background_source_hydration(foliage_root):
+            log.info(
+                "[foliage] %d source(s) importing in the background, trees first: %s",
+                len(hidden_fallback_types),
+                ", ".join(hidden_fallback_types),
+            )
+        else:
+            log.warning(
+                "[foliage] %d placed type(s) hidden because their source mesh failed to import: %s",
+                len(hidden_fallback_types),
+                ", ".join(hidden_fallback_types),
+            )
 
     return FoliageLoadResult(
         requested_cells=requested,
@@ -1863,8 +1885,6 @@ def load_foliage_cell(
     game_rel_path: str,
     foliage_root,
     context,
-    *,
-    source_mode: str = FOLIAGE_SOURCE_MODE_FULL,
 ):
     """Compatibility wrapper for the original single-cell operator API."""
 
@@ -1872,7 +1892,6 @@ def load_foliage_cell(
         (game_rel_path,),
         foliage_root,
         context,
-        source_mode=source_mode,
     )
     succeeded = bool(result.loaded_cells or result.skipped_cells) and not result.failed_cells
     return succeeded, result.instance_count
@@ -1886,7 +1905,6 @@ def load_foliage_for_bounds(
     *,
     owner_scope: str,
     replace: bool = False,
-    source_mode: str = FOLIAGE_SOURCE_MODE_FULL,
 ) -> FoliageLoadResult:
     """Directly resolve and batch-load the foliage intersecting world bounds."""
 
@@ -1905,7 +1923,6 @@ def load_foliage_for_bounds(
         bounds=bounds,
         owner_scope=owner_scope,
         replace=replace,
-        source_mode=source_mode,
     )
 
 
@@ -1921,7 +1938,6 @@ def load_foliage_for_tile(
     *,
     invert_y: bool = False,
     replace: bool = False,
-    source_mode: str = FOLIAGE_SOURCE_MODE_FULL,
 ) -> FoliageLoadResult:
     """Import only one terrain tile's foliage using deterministic cell paths."""
 
@@ -1940,7 +1956,6 @@ def load_foliage_for_tile(
         bounds,
         owner_scope=f"tile:{int(tile_x)}:{int(tile_y)}",
         replace=replace,
-        source_mode=source_mode,
     )
 
 
@@ -1969,7 +1984,7 @@ def unload_foliage_owners(foliage_root, owner_keys: Iterable[str]) -> int:
             root_transforms,
             candidate_transforms,
             affected_types,
-            source_mode=FOLIAGE_SOURCE_MODE_PROXY,
+            import_sources=False,
         )
     root_transforms.clear()
     root_transforms.update(candidate_transforms)

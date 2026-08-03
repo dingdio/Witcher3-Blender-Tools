@@ -1614,19 +1614,20 @@ def _import_voice_entity(context, abs_file_path: str, selected_appearance_name="
 
     selected_appearance_name = str(selected_appearance_name or "").strip()
     metadata = import_entity.get_entity_appearance_metadata(abs_file_path)
-    w2ent_mode = import_entity.classify_entity_import_metadata(metadata, context=context)
-    if w2ent_mode == "character":
-        default_appearance_name = selected_appearance_name or str(metadata.get("default_name", "") or "").strip()
-        return import_entity.import_direct_entity_file(
-            abs_file_path,
-            False,
-            0 if default_appearance_name else 1,
-            None,
-            selected_appearance_name=default_appearance_name,
-        )
-    if not import_entity.try_apply_inventory_file_to_selected_character(context, abs_file_path):
-        return import_entity.import_direct_entity_file(abs_file_path, False, 0, None)
-    return None
+    appearance_name = selected_appearance_name or str(metadata.get("default_name", "") or "").strip()
+    result = import_entity.import_entity_file(
+        abs_file_path,
+        load_face_poses=False,
+        import_apperance=0 if appearance_name else 1,
+        parent_transform=None,
+        selected_appearance_name=appearance_name,
+    )
+    ok, errors = import_entity.entity_import_result_errors(result)
+    if not ok:
+        raise RuntimeError(errors[0])
+    if errors:
+        log.warning("Entity import completed with errors for %s: %s", abs_file_path, errors[0])
+    return getattr(result, "main_object", None) or list(result.created_objects)[0]
 
 
 def _import_w2_voice_entity(context, abs_file_path: str):

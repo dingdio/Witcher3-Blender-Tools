@@ -26,7 +26,7 @@ from ..ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_w2mesh_export, WITCH_OT_apx,
                           WITCH_OT_create_trimesh_collider,
                           WITCH_OT_create_sound_info, WITCH_OT_remove_sound_info,
                           PHYSICAL_MATERIAL_ENUM_ITEMS, DEFAULT_PHYSICAL_MATERIAL)
-from ..ui.ui_entity import WITCH_OT_w2ent, WITCH_OT_flyr, WITCH_OT_ENTITY_w2ent_chara, WITCH_OT_ENTITY_import_inventory
+from ..ui.ui_entity import WITCH_OT_w2ent, WITCH_OT_flyr, WITCH_OT_ENTITY_import_inventory
 from ..ui.ui_cutscene import ButtonOperatorImportW2cutscene
 from ..ui.ui_scene import ButtonOperatorImportW2scene
 from ..ui.ui_speech import ButtonOperatorImportVoice, ImportWEM
@@ -104,7 +104,9 @@ class WITCH_OT_srt(bpy.types.Operator, ImportHelper):
         import_path = tex_stats.get("import_path") or fdir
         if lod0_only:
             import_path = _prepare_srt_lod0_json(import_path)
-        result = getattr(bpy.ops, "import").srt_json(filepath=import_path)
+        from ..cloth.importer import surgical_external_joins
+        with surgical_external_joins():
+            result = getattr(bpy.ops, "import").srt_json(filepath=import_path)
         if 'FINISHED' not in result:
             self.report({'ERROR'}, f"SRT import failed: {os.path.basename(fdir)}")
             return {'CANCELLED'}
@@ -130,7 +132,6 @@ _ASSET_BROWSER_DIALOG_OPERATORS = (
     WITCH_OT_nxs,
     WITCH_OT_w2ent,
     WITCH_OT_flyr,
-    WITCH_OT_ENTITY_w2ent_chara,
     WITCH_OT_ENTITY_import_inventory,
     ButtonOperatorImportW2scene,
     ButtonOperatorImportW2cutscene,
@@ -158,8 +159,7 @@ class WITCH_MT_Menu(bpy.types.Menu):
         layout.operator(WITCH_OT_nxs.bl_idname, text="Collision (.nxs)", icon='MESH_DATA')
         layout.operator(WITCH_OT_import_w3_fbx.bl_idname, text="Witcher 3 FBX (.fbx)", icon='MESH_DATA')
         layout.separator()
-        layout.operator(WITCH_OT_w2ent.bl_idname, text="Item Entity (.w2ent)", icon='MESH_DATA')
-        layout.operator(WITCH_OT_ENTITY_w2ent_chara.bl_idname, text="Character Entity (.w2ent)", icon='MESH_DATA')
+        layout.operator(WITCH_OT_w2ent.bl_idname, text="Entity (.w2ent)", icon='MESH_DATA')
         layout.operator(WITCH_OT_ENTITY_import_inventory.bl_idname, text="Inventory (.w2ent)", icon='MESH_DATA')
         layout.separator()
         layout.operator(WITCH_OT_w2mi.bl_idname, text="Instance (.w2mi)", icon='MESH_DATA')
@@ -200,7 +200,7 @@ class WITCH_MT_Menu_witcher_2(bpy.types.Menu):
         layout.operator(WITCH_OT_w2mesh.bl_idname, text="Mesh (.w2mesh)", icon='MESH_DATA')
         layout.separator()
         layout.operator(WITCH_OT_w2ent.bl_idname, text="Entity (.w2ent)", icon='MESH_DATA')
-        layout.operator(WITCH_OT_ENTITY_w2ent_chara.bl_idname, text="Character Entity (.w2ent)", icon='MESH_DATA')
+        layout.operator(WITCH_OT_ENTITY_import_inventory.bl_idname, text="Inventory (.w2ent)", icon='MESH_DATA')
         layout.separator()
         layout.operator(WITCH_OT_ImportW2Rig.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
         layout.operator(ButtonOperatorImportW2Anims.bl_idname, text="Animations (.w2anims)", icon='ACTION')

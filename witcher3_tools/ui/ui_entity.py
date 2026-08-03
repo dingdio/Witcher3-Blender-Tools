@@ -65,31 +65,31 @@ def _get_attr_or_key(obj, key, default=None):
     return getattr(obj, key, default)
 
 
-_CHARACTER_APPEARANCE_BASE_ID = "__base__"
+_ENTITY_APPEARANCE_BASE_ID = "__base__"
 
 
-def _normalize_character_appearance_metadata(metadata):
+def _normalize_entity_appearance_metadata(metadata):
     return import_entity.normalize_entity_appearance_metadata(metadata)
 
 
-def _character_appearance_metadata_json(metadata):
-    normalized = _normalize_character_appearance_metadata(metadata)
+def _entity_appearance_metadata_json(metadata):
+    normalized = _normalize_entity_appearance_metadata(metadata)
     return json.dumps(normalized, sort_keys=False)
 
 
-def _load_character_appearance_metadata_json(raw_json):
+def _load_entity_appearance_metadata_json(raw_json):
     try:
         data = json.loads(raw_json or "{}")
     except Exception:
         data = {}
-    return _normalize_character_appearance_metadata(data)
+    return _normalize_entity_appearance_metadata(data)
 
 
-def _get_character_appearance_enum_items(raw_json):
-    metadata = _load_character_appearance_metadata_json(raw_json)
+def _get_entity_appearance_enum_items(raw_json):
+    metadata = _load_entity_appearance_metadata_json(raw_json)
     items = [
         (
-            _CHARACTER_APPEARANCE_BASE_ID,
+            _ENTITY_APPEARANCE_BASE_ID,
             "None",
             "Import the entity without applying an appearance.",
         )
@@ -105,8 +105,8 @@ def _get_character_appearance_enum_items(raw_json):
     return items
 
 
-def _enum_character_appearance_items(self, _context):
-    return _get_character_appearance_enum_items(getattr(self, "appearance_metadata_json", "") or "")
+def _enum_entity_appearance_items(self, _context):
+    return _get_entity_appearance_enum_items(getattr(self, "appearance_metadata_json", "") or "")
 
 
 def _draw_entity_mesh_import_settings(layout, settings_owner):
@@ -773,6 +773,23 @@ def _cache_imported_inventory_on_rig(rig_settings, inventory_entity, filepath, p
     return True
 
 
+def _import_standalone_entity_file(export_path, template, result):
+    from ..importers import import_entity
+    entity_result = import_entity.import_entity_file(
+        export_path,
+        load_face_poses=False,
+        import_apperance=1,
+        parent_transform=None,
+    )
+    ok, errors = import_entity.entity_import_result_errors(entity_result)
+    if not ok:
+        result['messages'].append(f"Error importing {template}: {errors[0]}")
+        return False
+    if errors:
+        result['messages'].append(f"Warning importing {template}: {errors[0]}")
+    return True
+
+
 def _import_standalone_item(context, category, item_name, template, result):
     """Import an equipment item without binding to a character."""
     from ..CR2W.witcher_cache.Bundles import LoadBundleManager
@@ -794,9 +811,7 @@ def _import_standalone_item(context, category, item_name, template, result):
                 source_game=source_game,
             )
             if os.path.exists(export_path):
-                from ..importers import import_entity
-                import_entity.import_ent_template(export_path, False, 1, None)
-                return True
+                return _import_standalone_entity_file(export_path, template, result)
 
         search_pattern = "\\" + template + ".w2ent"
         items = bundle_manager.find_item_by_partial_hash(start="items", end=search_pattern)
@@ -817,9 +832,8 @@ def _import_standalone_item(context, category, item_name, template, result):
         if not os.path.exists(export_path):
             final_item.extract_to_file(export_path)
 
-        # Import the entity
-        from ..importers import import_entity
-        import_entity.import_ent_template(export_path, False, 1, None)
+        if not _import_standalone_entity_file(export_path, template, result):
+            return False
 
         result['messages'].append(f"Imported standalone: {category}:{item_name}")
         return True
@@ -898,143 +912,7 @@ class WITCH_OT_w3app(bpy.types.Operator, ImportHelper):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
 
-class WITCH_OT_w2ent(bpy.types.Operator, ImportHelper):
-    """Load Witcher 3 Entity File"""
-    bl_idname = "witcher.import_w2ent"
-    bl_label = "Import .w2ent"
-    filename_ext = ".w2ent"
-    filter_glob: StringProperty(default='*.w2ent;*.w2ent.json', options={'HIDDEN'})
-
-    def draw(self, context):
-        layout = self.layout
-        addon_prefs = get_all_addon_prefs(context)
-        box = layout.box()
-        box.label(text="Settings")
-        box.prop(addon_prefs, "import_idle_animation")
-
-    def execute(self, context):
-        log.debug("importing entity")
-        fdir = self.filepath
-        with mod_loading_context(context):
-            if os.path.isdir(fdir):
-                self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-                return {'CANCELLED'}
-            ext = file_helpers.getFilenameType(fdir)
-            if ext == ".w2ent" or fdir.endswith(".json"):
-                metadata = import_entity.get_entity_appearance_metadata(fdir)
-                w2ent_mode = import_entity.classify_entity_import_metadata(metadata, context=context)
-                if w2ent_mode == "character":
-                    default_appearance_name = str(metadata.get("default_name", "") or "").strip()
-                    arm_obj = import_entity.import_direct_entity_file(
-                        fdir,
-                        load_face_poses=False,
-                        import_apperance=0 if default_appearance_name else 1,
-                        parent_transform=None,
-                        selected_appearance_name=default_appearance_name,
-                    )
-                elif w2ent_mode == "inventory":
-                    if not import_entity.try_apply_inventory_file_to_selected_character(context, fdir):
-                        arm_obj = import_entity.import_direct_entity_file(
-                            fdir,
-                            load_face_poses=False,
-                            import_apperance=0,
-                            parent_transform=None,
-                        )
-                    else:
-                        arm_obj = None
-                else:
-                    arm_obj = import_entity.import_direct_entity_file(
-                        fdir,
-                        load_face_poses=False,
-                        import_apperance=0,
-                        parent_transform=None,
-                    )
-                if arm_obj and get_all_addon_prefs(context).import_idle_animation:
-                    import_anims.load_idle_animation_for_armature(context, arm_obj)
-            else:
-                self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-                return {'CANCELLED'}
-            return {'FINISHED'}
-
-    def invoke(self, context, event):
-        UNCOOK_PATH = os.path.join(get_uncook_path(context),"items\\")
-        if os.path.exists(UNCOOK_PATH):
-            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
-        return ImportHelper.invoke(self, context, event)
-
-
-class WITCH_OT_flyr(bpy.types.Operator, ImportHelper):
-    """Load Witcher 3 Foliage File"""
-    bl_idname = "witcher.import_flyr"
-    bl_label = "Import .flyr"
-    filename_ext = ".flyr"
-
-    filter_glob: StringProperty(default='*.flyr', options={'HIDDEN'})
-
-    def execute(self, context):
-        log.debug("importing foliage")
-        fdir = self.filepath
-        if os.path.isdir(fdir):
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        ext = file_helpers.getFilenameType(fdir)
-        if ext != ".flyr":
-            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-            return {'CANCELLED'}
-        foliage = CR2W.CR2W_reader.load_foliage(fdir)
-        import_w2l.btn_import_w2ent(foliage)
-        return {'FINISHED'}
-
-    def invoke(self, context, event):
-        UNCOOK_PATH = get_uncook_path(context)
-        if os.path.exists(UNCOOK_PATH):
-            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
-        return ImportHelper.invoke(self, context, event)
-
-
-class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
-    """Load a Witcher 3 character (.w2ent) file"""
-    bl_idname = "witcher.import_w2ent_character"
-    bl_label = "Import Character"
-    filename_ext = ".w2ent"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    filter_glob: StringProperty(default='*.w2ent;*.w2ent.json', options={'HIDDEN'})
-    import_apperance: IntProperty(
-        name="Select Apperance",
-        default=0,
-        description="Select index of apperance. 0 will only import character base",
-        options={'HIDDEN', 'SKIP_SAVE'},
-    )
-    selected_appearance_name: EnumProperty(
-        name="Appearance",
-        items=_enum_character_appearance_items,
-        description="Choose which appearance to import",
-    )
-    do_import_lods: BoolProperty(
-        name="Include LODs",
-        description="Include lower-detail mesh LODs for imported character meshes",
-        default=False,
-    )
-    keep_empty_lods: BoolProperty(
-        name="Keep Empty LODs",
-        description="Keep empty mesh LODs with zero polygons when LODs are imported",
-        default=False,
-    )
-    keep_proxy_meshes: BoolProperty(
-        name="Keep Proxy Meshes",
-        description="Keep proxy meshes even when higher LOD meshes are skipped",
-        default=False,
-    )
-    hide_zero_weight_faces: BoolProperty(
-        name="Hide Zero-Weight Faces",
-        description="Hide faces without bone weights on skinned meshes during import",
-        default=True,
-    )
-    appearance_selection_initialized: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
-    appearance_metadata_json: StringProperty(default="{}", options={'HIDDEN', 'SKIP_SAVE'})
-    appearance_metadata_path: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
-
+class _W2EntImportOperatorMixin:
     def _resolve_legacy_appearance_name(self, metadata):
         all_names = list(metadata.get("all_names", []) or [])
         if not all_names:
@@ -1060,11 +938,11 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
             and prev_json != "{}"
         )
         if metadata_ready:
-            metadata = _load_character_appearance_metadata_json(prev_json)
-        elif os.path.isfile(filepath) and (filepath.endswith(".w2ent") or filepath.endswith(".json")):
+            metadata = _load_entity_appearance_metadata_json(prev_json)
+        elif os.path.isfile(filepath) and filepath.lower().endswith((".w2ent", ".w2ent.json")):
             metadata = import_entity.get_entity_appearance_metadata(filepath)
-        metadata = _normalize_character_appearance_metadata(metadata)
-        next_json = _character_appearance_metadata_json(metadata)
+        metadata = _normalize_entity_appearance_metadata(metadata)
+        next_json = _entity_appearance_metadata_json(metadata)
         self.appearance_metadata_json = next_json
         self.appearance_metadata_path = filepath
 
@@ -1074,9 +952,9 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
         if metadata_changed or not self.appearance_selection_initialized:
             legacy_name = self._resolve_legacy_appearance_name(metadata)
             default_name = str(metadata.get("default_name", "") or "").strip()
-            next_selection = legacy_name or default_name or _CHARACTER_APPEARANCE_BASE_ID
+            next_selection = legacy_name or default_name or _ENTITY_APPEARANCE_BASE_ID
             self.appearance_selection_initialized = True
-        elif next_selection == _CHARACTER_APPEARANCE_BASE_ID:
+        elif next_selection == _ENTITY_APPEARANCE_BASE_ID:
             pass
         elif next_selection and next_selection.lower() in valid_names:
             pass
@@ -1086,101 +964,178 @@ class WITCH_OT_ENTITY_w2ent_chara(bpy.types.Operator, ImportHelper):
                 next_selection = legacy_name
             else:
                 default_name = str(metadata.get("default_name", "") or "").strip()
-                next_selection = default_name or _CHARACTER_APPEARANCE_BASE_ID
+                next_selection = default_name or _ENTITY_APPEARANCE_BASE_ID
 
         if next_selection != prev_selection:
             self.selected_appearance_name = next_selection
 
-        return (
-            metadata_changed or
-            next_selection != prev_selection
-        )
+        return metadata_changed or next_selection != prev_selection, metadata
 
     def check(self, _context):
-        return self._refresh_appearance_metadata()
+        return self._refresh_appearance_metadata()[0]
 
     def draw(self, context):
-        filepath = self.filepath
         layout = self.layout
-        self._refresh_appearance_metadata()
+        _changed, metadata = self._refresh_appearance_metadata()
 
-        # check if the file is a file and has the .w2ent extension
-        if os.path.isfile(self.filepath) and (self.filepath.endswith('.w2ent') or self.filepath.endswith('.json')):
-            pass
+        if not (
+            os.path.isfile(self.filepath)
+            and self.filepath.lower().endswith((".w2ent", ".w2ent.json"))
+        ):
+            layout.label(text="Selected file is not an entity file.", icon='ERROR')
 
-        else:
-            layout.label(text="Selected file is not a character entity file.")
+        if metadata.get("all_names"):
+            appearance_box = layout.box()
+            appearance_box.label(text="Appearance", icon='OUTLINER_OB_ARMATURE')
+            appearance_box.prop(self, "selected_appearance_name", text="Appearance")
 
-        sections = ["Settings"]
-        section_options = {
-            "Settings" : [
-                        "selected_appearance_name",
-                        ]
-        }
-        for section in sections:
-            row = layout.row()
-            box = row.box()
-            box.label(text=section)
-            for prop in section_options[section]:
-                box.prop(self, prop)
-        _draw_entity_mesh_import_settings(layout, self)
+        metadata_known = bool(metadata.get("component_metadata_known"))
+        if not metadata_known or metadata.get("has_mesh_components"):
+            _draw_entity_mesh_import_settings(layout, self)
         addon_prefs = get_all_addon_prefs(context)
-        anim_box = layout.box()
-        anim_box.label(text="Global Animation Settings", icon='ARMATURE_DATA')
-        anim_box.prop(addon_prefs, "import_idle_animation")
-        redcloth_box = layout.box()
-        redcloth_box.label(text="Global Redcloth Settings", icon='MATCLOTH')
-        redcloth_box.prop(addon_prefs, "do_import_redcloth")
-        redcloth_box.prop(addon_prefs, "DO_WEAR_CLOTH")
-        redcloth_box.prop(addon_prefs, "redcloth_simulation_enabled")
-        redcloth_box.prop(addon_prefs, "redcloth_wind_velocity")
+        if not metadata_known or metadata.get("has_armature_root"):
+            anim_box = layout.box()
+            anim_box.label(text="Animation", icon='ARMATURE_DATA')
+            anim_box.prop(addon_prefs, "import_idle_animation")
+        if not metadata_known or import_entity.entity_appearance_has_cloth(
+            metadata,
+            self.selected_appearance_name,
+        ):
+            redcloth_box = layout.box()
+            redcloth_box.label(text="Redcloth", icon='MATCLOTH')
+            redcloth_box.prop(addon_prefs, "do_import_redcloth")
+            redcloth_box.prop(addon_prefs, "DO_WEAR_CLOTH")
+            redcloth_box.prop(addon_prefs, "redcloth_simulation_enabled")
+            redcloth_box.prop(addon_prefs, "redcloth_wind_velocity")
 
     def execute(self, context):
-        log.debug("importing character")
-        fdir = self.filepath
+        log.debug("importing entity")
+        fdir = str(self.filepath or "").strip()
+        if os.path.isdir(fdir) or not fdir.lower().endswith((".w2ent", ".w2ent.json")):
+            self.report({'ERROR'}, "File format unrecognized; entity import cancelled.")
+            return {'CANCELLED'}
 
+        started = time.time()
         with mod_loading_context(context):
-            if os.path.isdir(fdir):
-                self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
-                return {'CANCELLED'}
+            from ..ui.ui_equipment import EquipmentDefinitionEntry as _EDE
+            if not getattr(_EDE, "item_attributes", None):
+                bpy.ops.witcher.equipment_refresh_categories()
 
-            s = time.time()
-            if fdir.endswith(".w2ent") or fdir.endswith(".json"):
-                from ..ui.ui_equipment import EquipmentDefinitionEntry as _EDE
-                if not getattr(_EDE, "item_attributes", None):
-                    bpy.ops.witcher.equipment_refresh_categories()
-                self._refresh_appearance_metadata()
-                selected_appearance_name = str(self.selected_appearance_name or "").strip()
-                import_appearance_index = int(self.import_apperance or 0)
-                if selected_appearance_name == _CHARACTER_APPEARANCE_BASE_ID:
-                    selected_appearance_name = ""
-                    import_appearance_index = 0
-                elif selected_appearance_name:
-                    import_appearance_index = 0
-                arm_obj = import_entity.import_ent_template(
-                    fdir,
-                    False,
-                    import_appearance_index,
-                    parent_transform=None,
-                    selected_appearance_name=selected_appearance_name,
-                    mesh_import_settings=import_entity.get_entity_mesh_import_settings(self),
-                )
-                if arm_obj and get_all_addon_prefs(context).import_idle_animation:
-                    import_anims.load_idle_animation_for_armature(context, arm_obj)
-            else:
-                self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            self._refresh_appearance_metadata()
+            selected_appearance_name = str(self.selected_appearance_name or "").strip()
+            import_appearance_index = int(self.import_apperance or 0)
+            if selected_appearance_name == _ENTITY_APPEARANCE_BASE_ID:
+                selected_appearance_name = ""
+                import_appearance_index = 0
+            elif selected_appearance_name:
+                import_appearance_index = 0
+
+            entity_result = import_entity.import_entity_file(
+                fdir,
+                load_face_poses=False,
+                import_apperance=import_appearance_index,
+                parent_transform=None,
+                selected_appearance_name=selected_appearance_name,
+                mesh_import_settings=import_entity.get_entity_mesh_import_settings(self),
+            )
+            ok, errors = import_entity.entity_import_result_errors(entity_result)
+            if not ok:
+                self.report({'ERROR'}, errors[0])
                 return {'CANCELLED'}
-            message = f'Read character file in {time.time() - s} seconds.'
-            log.info(message)
-            self.report({'INFO'}, message)
-            return {'FINISHED'}
+            if errors:
+                self.report({'WARNING'}, errors[0])
+            arm_obj = getattr(entity_result, "main_armature", entity_result)
+            if arm_obj and get_all_addon_prefs(context).import_idle_animation:
+                import_anims.load_idle_animation_for_armature(context, arm_obj)
+
+        message = f'Read entity file in {time.time() - started} seconds.'
+        log.info(message)
+        self.report({'INFO'}, message)
+        return {'FINISHED'}
 
     def invoke(self, context, event):
-        UNCOOK_PATH = os.path.join(get_uncook_path(context),"characters\\")
-        if os.path.exists(UNCOOK_PATH):
-            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        uncook_path = get_uncook_path(context)
+        if uncook_path and os.path.exists(uncook_path):
+            self.filepath = uncook_path if self.filepath == '' else self.filepath
         self._refresh_appearance_metadata()
         return ImportHelper.invoke(self, context, event)
+
+
+class WITCH_OT_w2ent(_W2EntImportOperatorMixin, bpy.types.Operator, ImportHelper):
+    bl_idname = "witcher.import_w2ent"
+    bl_label = "Import Entity (.w2ent)"
+    filename_ext = ".w2ent"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filter_glob: StringProperty(default='*.w2ent;*.w2ent.json', options={'HIDDEN'})
+    import_apperance: IntProperty(
+        name="Select Appearance",
+        default=0,
+        description="Legacy appearance index; prefer selected_appearance_name",
+        options={'HIDDEN', 'SKIP_SAVE'},
+    )
+    selected_appearance_name: EnumProperty(
+        name="Appearance",
+        items=_enum_entity_appearance_items,
+        description="Choose which appearance to import",
+    )
+    do_import_lods: BoolProperty(
+        name="Include LODs",
+        description="Include lower-detail mesh LODs",
+        default=False,
+    )
+    keep_empty_lods: BoolProperty(
+        name="Keep Empty LODs",
+        description="Keep empty mesh LODs with zero polygons when LODs are imported",
+        default=False,
+    )
+    keep_proxy_meshes: BoolProperty(
+        name="Keep Proxy Meshes",
+        description="Keep proxy meshes even when higher LOD meshes are skipped",
+        default=False,
+    )
+    hide_zero_weight_faces: BoolProperty(
+        name="Hide Zero-Weight Faces",
+        description="Hide faces without bone weights on skinned meshes during import",
+        default=True,
+    )
+    appearance_selection_initialized: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+    appearance_metadata_json: StringProperty(default="{}", options={'HIDDEN', 'SKIP_SAVE'})
+    appearance_metadata_path: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+
+
+class WITCH_OT_flyr(bpy.types.Operator, ImportHelper):
+    bl_idname = "witcher.import_flyr"
+    bl_label = "Import .flyr"
+    filename_ext = ".flyr"
+
+    filter_glob: StringProperty(default='*.flyr', options={'HIDDEN'})
+
+    def execute(self, context):
+        log.debug("importing foliage")
+        fdir = self.filepath
+        if os.path.isdir(fdir):
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        ext = file_helpers.getFilenameType(fdir)
+        if ext != ".flyr":
+            self.report({'ERROR'}, "ERROR File Format unrecognized, operation cancelled.")
+            return {'CANCELLED'}
+        foliage = CR2W.CR2W_reader.load_foliage(fdir)
+        import_w2l.btn_import_W2L(foliage, context)
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        UNCOOK_PATH = get_uncook_path(context)
+        if os.path.exists(UNCOOK_PATH):
+            self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
+        return ImportHelper.invoke(self, context, event)
+
+
+class WITCH_OT_ENTITY_w2ent_chara(WITCH_OT_w2ent):
+    bl_idname = "witcher.import_w2ent_character"
+    bl_label = "Import Entity (Compatibility)"
+    bl_options = {'INTERNAL', 'UNDO'}
 
 
 class WITCH_OT_ENTITY_import_inventory(bpy.types.Operator, ImportHelper):
@@ -1450,6 +1405,17 @@ def _apply_geralt_inventory_preset(context, preset_id, operator=None, source_gam
     return ""
 
 
+def _quick_character_import_armature(operator, result, label):
+    errors = [str(error) for error in (getattr(result, "errors", None) or []) if str(error)]
+    armature = getattr(result, "main_armature", None)
+    if armature is None:
+        operator.report({'ERROR'}, errors[0] if errors else f"{label} import produced no character armature.")
+        return None
+    if errors:
+        operator.report({'WARNING'}, errors[0])
+    return armature
+
+
 class WITCH_OT_ENTITY_import_geralt(bpy.types.Operator):
     """Import Geralt (player.w2ent) with default equipment"""
     bl_idname = "witcher.import_geralt"
@@ -1494,8 +1460,15 @@ class WITCH_OT_ENTITY_import_geralt(bpy.types.Operator):
                 return {'CANCELLED'}
 
             # import_apperance=1 means app_idx=0 (first appearance with equipment entries)
-            import_entity.import_ent_template(path, False, 1,
-                                              parent_transform=None)
+            entity_result = import_entity.import_entity_file(
+                path,
+                load_face_poses=False,
+                import_apperance=1,
+                parent_transform=None,
+                load_appearance_equipment=True,
+            )
+            if _quick_character_import_armature(self, entity_result, "Geralt") is None:
+                return {'CANCELLED'}
 
             inventory_preset_id = _resolve_geralt_inventory_preset_id(
                 context,
@@ -1555,8 +1528,15 @@ class WITCH_OT_ENTITY_import_ciri(bpy.types.Operator):
                 pass
 
             # import_apperance=1 means app_idx=0 (first appearance)
-            import_entity.import_ent_template(path, False, 1,
-                                              parent_transform=None)
+            entity_result = import_entity.import_entity_file(
+                path,
+                load_face_poses=False,
+                import_apperance=1,
+                parent_transform=None,
+                load_appearance_equipment=True,
+            )
+            if _quick_character_import_armature(self, entity_result, "Ciri") is None:
+                return {'CANCELLED'}
 
             message = f'Imported Ciri with inventory in {time.time() - s:.2f} seconds.'
             log.info(message)
@@ -1620,7 +1600,15 @@ class WITCH_OT_ENTITY_import_geralt_w2(bpy.types.Operator):
                 )
                 return {'CANCELLED'}
 
-            import_entity.import_ent_template(path, False, 1, parent_transform=None)
+            entity_result = import_entity.import_entity_file(
+                path,
+                load_face_poses=False,
+                import_apperance=1,
+                parent_transform=None,
+                load_appearance_equipment=True,
+            )
+            if _quick_character_import_armature(self, entity_result, "Witcher 2 Geralt") is None:
+                return {'CANCELLED'}
 
             inventory_preset_id = _resolve_geralt_inventory_preset_id(
                 context,
@@ -1687,7 +1675,15 @@ class WITCH_OT_ENTITY_import_triss_w2(bpy.types.Operator):
                 )
                 return {'CANCELLED'}
 
-            import_entity.import_ent_template(path, False, 1, parent_transform=None)
+            entity_result = import_entity.import_entity_file(
+                path,
+                load_face_poses=False,
+                import_apperance=1,
+                parent_transform=None,
+                load_appearance_equipment=True,
+            )
+            if _quick_character_import_armature(self, entity_result, "Witcher 2 Triss") is None:
+                return {'CANCELLED'}
 
             message = f'Imported Witcher 2 Triss in {time.time() - s:.2f} seconds.'
             log.info(message)

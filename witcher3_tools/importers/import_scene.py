@@ -2076,7 +2076,7 @@ def _load_w2scene_camera_entity(context, scene_filepath="", source_game=""):
     if not resolved_path or not os.path.isfile(resolved_path):
         raise RuntimeError(f"Could not resolve {source_game.upper()} scene camera entity: {camera_path}")
     try:
-        scene_cam_obj = import_entity.import_ent_template(resolved_path)
+        scene_cam_obj = import_entity.import_entity_file(resolved_path).main_object
     except Exception as exc:
         raise RuntimeError(f"Failed to import {source_game.upper()} scene camera entity: {resolved_path}") from exc
     if scene_cam_obj is not None:
@@ -2114,7 +2114,7 @@ def _import_scene_prop_object(prop, context, scene_filepath="", source_game=""):
     before_ids = {id(obj) for obj in bpy.data.objects}
     resolved_path = _resolve_scene_template_path(template_path, scene_filepath, source_game=source_game)
     try:
-        prop_obj = import_entity.import_ent_template(resolved_path)
+        prop_obj = import_entity.import_entity_file(resolved_path).main_object
     except Exception:
         log.warning("Failed to import scene prop %s from %s", prop_id or "<unnamed>", resolved_path or template_path, exc_info=True)
         prop_obj = None
@@ -4181,12 +4181,12 @@ class SceneImporter():
                     self._scene_filepath,
                     source_game=self._source_game,
                 )
-                actor_obj = import_entity.import_ent_template(
+                actor_obj = import_entity.import_entity_file(
                     resolved_entity_template,
                     load_face_poses=actor_needs_face_setup,
                     import_apperance=1,
                     selected_appearance_name=preferred_appearance,
-                )
+                ).main_object
             else:
                 _ensure_cutscene_actor_appearance(actor_obj, preferred_appearance)
             if actor_obj is None:

@@ -1,4 +1,8 @@
 import logging
+import hashlib
+import json
+import copy
+from dataclasses import dataclass, field
 from pathlib import Path
 import re
 from ..CR2W.CR2W_helpers import Enums
@@ -76,29 +80,11 @@ def _log_layer_import_complete(level_file, progress_count, errors):
         log.info("Layer contained no importable items: %s", level_file)
 
 
-def _layer_entity_label(entity):
-    name = str(getattr(entity, "name", "") or "").strip()
-    entity_type = str(getattr(entity, "type", "") or "").strip()
-    if name and entity_type and entity_type not in name:
-        return f"{name} ({entity_type})"
-    return name or entity_type or "<unnamed entity>"
-
-
 def _preview_list(items, limit=12):
     values = [str(item) for item in (items or []) if str(item)]
     if len(values) <= limit:
         return ", ".join(values)
     return ", ".join(values[:limit]) + f", ... (+{len(values) - limit} more)"
-
-
-def _record_layer_entity_skip(kwargs, entity, reason):
-    skips = kwargs.get("_layer_entity_skip_reasons")
-    if skips is None:
-        return
-    try:
-        skips.append(f"{_layer_entity_label(entity)}: {reason}")
-    except Exception:
-        pass
 
 
 def _mesh_repo_path(mesh) -> str:
@@ -252,9 +238,6 @@ def _new_layer_import_profile():
         "fresh_meshes": 0,
         "unique_mesh_paths": set(),
         "slowest_mesh": {"path": "", "seconds": 0.0, "backend": ""},
-        "entity_calls": 0,
-        "entity_imported": 0,
-        "slowest_entity": {"name": "", "seconds": 0.0},
     }
 
 
@@ -303,25 +286,12 @@ def _record_layer_mesh_profile(
         }
 
 
-def _record_layer_entity_profile(kwargs, entity_name, total_seconds, imported_any):
-    profile = _get_layer_import_profile(kwargs)
-    profile["entity_calls"] += 1
-    if imported_any:
-        profile["entity_imported"] += 1
-    if total_seconds >= profile["slowest_entity"]["seconds"]:
-        profile["slowest_entity"] = {
-            "name": str(entity_name or ""),
-            "seconds": float(total_seconds or 0.0),
-        }
-
-
 def _log_layer_import_profile_summary(level_file, kwargs):
     profile = kwargs.get("_layer_import_profile")
     if not profile:
         return
     mesh_total_seconds = float(profile.get("mesh_total_seconds", 0.0) or 0.0)
-    entity_calls = int(profile.get("entity_calls", 0) or 0)
-    if mesh_total_seconds < _LAYER_IMPORT_PROFILE_WARN_THRESHOLD and entity_calls <= 0:
+    if mesh_total_seconds < _LAYER_IMPORT_PROFILE_WARN_THRESHOLD:
         return
 
     backend_bits = []
@@ -336,9 +306,8 @@ def _log_layer_import_profile_summary(level_file, kwargs):
     backend_summary = ", ".join(backend_bits) if backend_bits else "none"
 
     slowest_mesh = profile.get("slowest_mesh", {}) or {}
-    slowest_entity = profile.get("slowest_entity", {}) or {}
     _log_layer_import_profile_warning(
-        "%s meshes %d total %.3fs (import %.3fs, finalize %.3fs, transform %.3fs, fresh %d, reused %d, unique %d, backends %s, slowest mesh %s %.3fs %s, entities %d/%d imported, slowest entity %s %.3fs)",
+        "%s meshes %d total %.3fs (import %.3fs, finalize %.3fs, transform %.3fs, fresh %d, reused %d, unique %d, backends %s, slowest mesh %s %.3fs %s)",
         level_file,
         int(profile.get("mesh_calls", 0) or 0),
         mesh_total_seconds,
@@ -352,10 +321,6 @@ def _log_layer_import_profile_summary(level_file, kwargs):
         slowest_mesh.get("path", "") or "<none>",
         float(slowest_mesh.get("seconds", 0.0) or 0.0),
         slowest_mesh.get("backend", "") or "",
-        int(profile.get("entity_imported", 0) or 0),
-        entity_calls,
-        slowest_entity.get("name", "") or "<none>",
-        float(slowest_entity.get("seconds", 0.0) or 0.0),
     )
 
 
@@ -379,12 +344,14 @@ _CACHED_FULL_LIGHT_ITEM_KINDS = frozenset({
     "component_spot_light",
 })
 _CACHED_FULL_EMPTY_ITEM_KINDS = frozenset({"component_empty", "entity_empty"})
+_CACHED_ENTITY_ASSET_ITEM_KINDS = frozenset({"entity_asset"})
 _CACHED_SECTOR_INSTANCER_KINDS = frozenset({"sector_instancer"})
 _CACHED_FULL_ITEM_KINDS = (
     _CACHED_FULL_MESH_ITEM_KINDS
     | _CACHED_REDCLOTH_ITEM_KINDS
     | _CACHED_FULL_LIGHT_ITEM_KINDS
     | _CACHED_FULL_EMPTY_ITEM_KINDS
+    | _CACHED_ENTITY_ASSET_ITEM_KINDS
     | _CACHED_SECTOR_INSTANCER_KINDS
 )
 _CACHED_FULL_PARENT_ITEM_KINDS = frozenset({"group", "entity"})
@@ -535,6 +502,461 @@ _ENTITY_LIGHT_PROPERTY_NAMES = (
 )
 
 
+@dataclass
+class EntityImportResult:
+    root_object: object | None = None
+    main_armature: object | None = None
+    created_objects: list = field(default_factory=list)
+    materialized_item_ids: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+    @property
+    def main_object(self):
+        return self.main_armature or self.root_object
+
+
+def _instance_entry_value(entry, name, default=None):
+    if isinstance(entry, dict):
+        return entry.get(name, default)
+    return getattr(entry, name, default)
+
+
+def _normalize_entity_buffer_v2(buffer_v2):
+    entries = _instance_entry_value(buffer_v2, "elements", buffer_v2)
+    if not isinstance(entries, (list, tuple)):
+        raise ValueError("BufferV2 is not a decoded entry list")
+    normalized = []
+    for entry in entries:
+        component_name_value = _instance_entry_value(
+            entry,
+            "component_name",
+            _instance_entry_value(entry, "componentName", ""),
+        )
+        component_name = str(
+            getattr(component_name_value, "value", component_name_value) or ""
+        ).strip()
+        if not component_name:
+            raise ValueError("BufferV2 entry has no componentName")
+        variables = _instance_entry_value(entry, "variables", ())
+        variables = _instance_entry_value(variables, "elements", variables)
+        if not isinstance(variables, (list, tuple)):
+            raise ValueError(f"BufferV2 component {component_name} has no decoded variables")
+        normalized_variables = []
+        for variable in variables:
+            prop = _instance_entry_value(variable, "PROP", variable)
+            prop_name = str(
+                _instance_entry_value(prop, "name", _instance_entry_value(prop, "theName", ""))
+                or ""
+            ).strip()
+            prop_type = str(
+                _instance_entry_value(prop, "type", _instance_entry_value(prop, "theType", ""))
+                or ""
+            ).strip()
+            if not prop_name or not prop_type:
+                raise ValueError(f"BufferV2 component {component_name} has an undecoded variable")
+            value = (
+                _instance_entry_value(prop, "value")
+                if isinstance(prop, dict) and "value" in prop
+                else read_prop_value(prop, ())
+            )
+            normalized_variables.append({
+                "name": prop_name,
+                "type": prop_type,
+                "value": _json_safe_plan_value(value),
+            })
+        normalized.append({
+            "component_name": component_name,
+            "variables": normalized_variables,
+        })
+    return normalized
+
+
+def _entity_instance_overrides(entity):
+    overrides = {}
+    buffer_v1 = getattr(entity, "BufferV1", None)
+    if buffer_v1:
+        overrides["BufferV1"] = _json_safe_plan_value(buffer_v1)
+    buffer_v2 = getattr(entity, "BufferV2", None)
+    if buffer_v2:
+        try:
+            overrides["BufferV2"] = _normalize_entity_buffer_v2(buffer_v2)
+        except Exception as exc:
+            overrides["BufferV2"] = {
+                "error": str(exc),
+                "raw": _json_safe_plan_value(buffer_v2),
+            }
+    return overrides
+
+
+def _entity_instance_override_shape_error(overrides):
+    if not overrides:
+        return ""
+    if not isinstance(overrides, dict):
+        return "instance_overrides is not an object"
+    if overrides.get("BufferV1"):
+        return "BufferV1 additional component data is opaque and cannot be applied"
+    buffer_v2 = overrides.get("BufferV2")
+    if not buffer_v2:
+        return ""
+    if isinstance(buffer_v2, dict):
+        return f"BufferV2 could not be decoded: {buffer_v2.get('error', 'invalid data')}"
+    if not isinstance(buffer_v2, list):
+        return "BufferV2 is not a decoded entry list"
+    for entry in buffer_v2:
+        if not isinstance(entry, dict) or not str(entry.get("component_name", "") or "").strip():
+            return "BufferV2 contains an invalid component entry"
+        variables = entry.get("variables")
+        if not isinstance(variables, list):
+            return f"BufferV2 component {entry.get('component_name')} has invalid variables"
+        for variable in variables:
+            if (
+                not isinstance(variable, dict)
+                or not str(variable.get("name", "") or "").strip()
+                or not str(variable.get("type", "") or "").strip()
+                or "value" not in variable
+            ):
+                return f"BufferV2 component {entry.get('component_name')} has an invalid variable"
+    return ""
+
+
+def _iter_entity_override_components(entity):
+    static_meshes = getattr(entity, "staticMeshes", None)
+    chunks = _instance_entry_value(static_meshes, "chunks", ())
+    for chunk in chunks or ():
+        yield chunk
+    moving = getattr(entity, "MovingPhysicalAgentComponent", None)
+    if moving:
+        yield moving
+    for appearance in getattr(entity, "appearances", None) or ():
+        for template in _instance_entry_value(appearance, "includedTemplates", ()) or ():
+            for chunk in _instance_entry_value(template, "chunks", ()) or ():
+                yield chunk
+
+
+def _apply_entity_instance_overrides(entity, overrides):
+    error = _entity_instance_override_shape_error(overrides)
+    if error:
+        return error
+    components = list(_iter_entity_override_components(entity))
+    for entry in (overrides or {}).get("BufferV2", ()):
+        component_name = str(entry["component_name"]).strip()
+        matches = [
+            component
+            for component in components
+            if str(_instance_entry_value(component, "name", "") or "").strip().lower()
+            == component_name.lower()
+        ]
+        if not matches:
+            return f"BufferV2 component {component_name} is not present in embedded entity_data"
+        for component in matches:
+            for variable in entry["variables"]:
+                value = copy.deepcopy(variable["value"])
+                if isinstance(component, dict):
+                    component[variable["name"]] = value
+                else:
+                    setattr(component, variable["name"], value)
+    return ""
+
+
+def _merge_unique_entity_metadata(base_values, overlay_values, key_fields=(), *, replace_existing=False):
+    merged = list(base_values or [])
+    key_indices = {}
+
+    def entry_key(entry):
+        if key_fields:
+            values = tuple(
+                str(_instance_entry_value(entry, field_name, "") or "").strip().lower()
+                for field_name in key_fields
+            )
+            if any(values):
+                return ("fields", values)
+        return ("json", json.dumps(entry, sort_keys=True, separators=(",", ":"), default=str))
+
+    for index, entry in enumerate(merged):
+        key_indices[entry_key(entry)] = index
+    for entry in overlay_values or []:
+        key = entry_key(entry)
+        existing_index = key_indices.get(key)
+        if existing_index is not None:
+            if replace_existing:
+                merged[existing_index] = entry
+            continue
+        key_indices[key] = len(merged)
+        merged.append(entry)
+    return merged
+
+
+def _merge_entity_appearance_metadata(base_appearances, overlay_appearances):
+    merged = list(base_appearances or [])
+    by_name = {
+        str(_instance_entry_value(appearance, "name", "") or "").strip().lower(): index
+        for index, appearance in enumerate(merged)
+        if str(_instance_entry_value(appearance, "name", "") or "").strip()
+    }
+    for appearance in overlay_appearances or []:
+        name_key = str(_instance_entry_value(appearance, "name", "") or "").strip().lower()
+        existing_index = by_name.get(name_key) if name_key else None
+        if (
+            existing_index is None
+            or not isinstance(merged[existing_index], dict)
+            or not isinstance(appearance, dict)
+        ):
+            merged.append(appearance)
+            if name_key:
+                by_name[name_key] = len(merged) - 1
+            continue
+        existing = merged[existing_index]
+        combined = dict(existing)
+        combined.update(appearance)
+        combined["includedTemplates"] = _merge_unique_entity_metadata(
+            existing.get("includedTemplates"),
+            appearance.get("includedTemplates"),
+        )
+        merged[existing_index] = combined
+    return merged
+
+
+def _merge_instance_entity_metadata(template_data, instance_data):
+    if not isinstance(template_data, dict) or not isinstance(instance_data, dict):
+        return template_data, instance_data
+
+    template_data = dict(template_data)
+    instance_data = dict(instance_data)
+    template_data["appearances"] = _merge_entity_appearance_metadata(
+        template_data.get("appearances"),
+        instance_data.get("appearances"),
+    )
+    instance_data["appearances"] = []
+
+    template_data["coloringEntries"] = _merge_unique_entity_metadata(
+        template_data.get("coloringEntries"),
+        instance_data.get("coloringEntries"),
+        ("appearance", "componentName"),
+        replace_existing=True,
+    )
+    template_data["slots"] = _merge_unique_entity_metadata(
+        template_data.get("slots"),
+        instance_data.get("slots"),
+        ("name", "componentName", "boneName"),
+        replace_existing=True,
+    )
+    template_data["cookedEffects"] = _merge_unique_entity_metadata(
+        template_data.get("cookedEffects"),
+        instance_data.get("cookedEffects"),
+        ("name",),
+        replace_existing=True,
+    )
+    instance_component_names = _entity_data_override_component_names(instance_data)
+    instance_data["coloringEntries"] = [
+        entry for entry in instance_data.get("coloringEntries") or []
+        if str(_instance_entry_value(entry, "componentName", "") or "").strip().lower()
+        in instance_component_names
+    ]
+
+    list_fields = {
+        "CAnimAnimsetsParam": (),
+        "CAnimMimicParam": (),
+        "inventoryDefinitions": (),
+        "beh_paths": (),
+        "included_template_paths": (),
+        "template_dependency_paths": (),
+    }
+    for field_name, key_fields in list_fields.items():
+        template_data[field_name] = _merge_unique_entity_metadata(
+            template_data.get(field_name),
+            instance_data.get(field_name),
+            key_fields,
+        )
+        instance_data[field_name] = []
+
+    body_states = dict(template_data.get("w2_body_part_states") or {})
+    body_states.update(instance_data.get("w2_body_part_states") or {})
+    template_data["w2_body_part_states"] = body_states
+    instance_data["w2_body_part_states"] = {}
+    if instance_data.get("isLightOn") is not None:
+        template_data["isLightOn"] = instance_data.get("isLightOn")
+        instance_data["isLightOn"] = None
+    instance_static_meshes = instance_data.get("staticMeshes") or {}
+    has_instance_component_graph = bool(
+        _instance_entry_value(instance_static_meshes, "chunks", ())
+        or instance_data.get("MovingPhysicalAgentComponent")
+    )
+    if not has_instance_component_graph:
+        # Avoid a metadata-only overlay after materializing the template.
+        instance_data["slots"] = []
+        instance_data["coloringEntries"] = []
+        instance_data["cookedEffects"] = []
+    return template_data, instance_data
+
+
+def _entity_data_override_component_names(entity_data):
+    if not isinstance(entity_data, dict):
+        return set()
+    names = set()
+
+    def add_component(component):
+        name = str(_instance_entry_value(component, "name", "") or "").strip().lower()
+        if name:
+            names.add(name)
+
+    static_meshes = entity_data.get("staticMeshes") or {}
+    for component in _instance_entry_value(static_meshes, "chunks", ()) or ():
+        add_component(component)
+    moving = entity_data.get("MovingPhysicalAgentComponent")
+    if moving:
+        add_component(moving)
+    for appearance in entity_data.get("appearances") or ():
+        for template in _instance_entry_value(appearance, "includedTemplates", ()) or ():
+            for component in _instance_entry_value(template, "chunks", ()) or ():
+                add_component(component)
+    return names
+
+
+def _partition_entity_instance_overrides(overrides, *entity_data_values):
+    partitions = [{} for _value in entity_data_values]
+    if not overrides:
+        return partitions, []
+    if not isinstance(overrides, dict):
+        return partitions, ["instance_overrides is not an object"]
+    usable_indices = [
+        index for index, entity_data in enumerate(entity_data_values)
+        if isinstance(entity_data, dict)
+    ]
+    if not usable_indices:
+        return partitions, ["instance overrides have no embedded entity asset"]
+
+    first_index = usable_indices[0]
+    if _entity_instance_override_shape_error(overrides):
+        partitions[first_index] = copy.deepcopy(overrides)
+        return partitions, []
+    for key, value in overrides.items():
+        if key != "BufferV2":
+            partitions[first_index][key] = copy.deepcopy(value)
+
+    component_names = [
+        _entity_data_override_component_names(entity_data)
+        for entity_data in entity_data_values
+    ]
+    errors = []
+    for entry in overrides.get("BufferV2", ()) or ():
+        component_name = str(entry.get("component_name", "") or "").strip()
+        owners = [
+            index for index, names in enumerate(component_names)
+            if component_name.lower() in names
+        ]
+        if not owners:
+            errors.append(
+                f"BufferV2 component {component_name or '<unknown>'} is absent from template and instance graphs"
+            )
+            continue
+        if len(owners) > 1:
+            errors.append(
+                f"BufferV2 component {component_name} is ambiguous across template and instance graphs"
+            )
+            continue
+        partitions[owners[0]].setdefault("BufferV2", []).append(copy.deepcopy(entry))
+    return partitions, errors
+
+
+@dataclass(frozen=True)
+class EntityInstanceSpec:
+    identity: str = ""
+    name: str = ""
+    entity_class: str = "CEntity"
+    template_path: str = ""
+    source_path: str = ""
+    transform: dict | None = None
+    parent_id: str = ""
+    world_position: tuple | None = None
+    direct_components: tuple = ()
+    streamed_components: object | None = None
+    instance_overrides: dict = field(default_factory=dict)
+    guid: str = ""
+    entity_id: str = ""
+    action_name: str = ""
+    engine_visible: bool | None = None
+    compiled_entity_asset: object | None = None
+    compiled_entity_error: str = ""
+
+    @classmethod
+    def from_layer_entity(cls, entity, source_path="", parent_id="", world_position=None):
+        name = str(getattr(entity, "name", "") or "")
+        entity_class = str(getattr(entity, "type", "") or "CEntity")
+        guid = str(getattr(entity, "guid", "") or "")
+        entity_id = str(getattr(entity, "id", "") or "")
+        identity = str(
+            guid
+            or entity_id
+            or f"{entity_class}:{name}"
+        )
+        visible = getattr(entity, "visible", None)
+        return cls(
+            identity=identity,
+            name=name,
+            entity_class=entity_class,
+            template_path=str(
+                getattr(entity, "templatePath", "")
+                if getattr(entity, "isCreatedFromTemplate", False)
+                else ""
+            ),
+            source_path=str(source_path or ""),
+            transform=_copy_engine_transform_dict(getattr(entity, "transform", None)),
+            parent_id=str(parent_id or ""),
+            world_position=_copy_world_position(world_position),
+            direct_components=tuple(getattr(entity, "Components", None) or ()),
+            streamed_components=getattr(entity, "streamingDataBuffer", None) or None,
+            instance_overrides=_entity_instance_overrides(entity),
+            guid=guid,
+            entity_id=entity_id,
+            action_name=_entity_prop_string(entity, "actionName"),
+            engine_visible=bool(visible) if visible is not None else None,
+            compiled_entity_asset=getattr(entity, "entityAsset", None),
+            compiled_entity_error=str(getattr(entity, "entityAssetError", "") or ""),
+        )
+
+
+def _json_safe_plan_value(value, _seen=None):
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, bytes):
+        return {"encoding": "hex", "data": value.hex()}
+    if callable(value):
+        return None
+    _seen = set() if _seen is None else _seen
+    value_id = id(value)
+    if value_id in _seen:
+        return None
+    _seen.add(value_id)
+    try:
+        if isinstance(value, dict):
+            return {str(key): _json_safe_plan_value(item, _seen) for key, item in value.items()}
+        if isinstance(value, set):
+            return [_json_safe_plan_value(item, _seen) for item in sorted(value, key=str)]
+        if isinstance(value, (list, tuple)):
+            return [_json_safe_plan_value(item, _seen) for item in value]
+        serializer = getattr(value, "__json_serializable__", None)
+        if callable(serializer):
+            return _json_safe_plan_value(serializer(), _seen)
+        if hasattr(value, "__dict__"):
+            return {
+                str(key): _json_safe_plan_value(item, _seen)
+                for key, item in vars(value).items()
+                if not callable(item)
+            }
+        try:
+            parsed = read_prop_value(value, None)
+        except Exception:
+            parsed = None
+        if parsed is not None and parsed is not value:
+            return _json_safe_plan_value(parsed, _seen)
+        try:
+            return str(value.ToString())
+        except Exception:
+            return str(value)
+    finally:
+        _seen.discard(value_id)
+
+
 def _component_light_properties(component):
     values = {}
     for prop_name in _ENTITY_LIGHT_PROPERTY_NAMES:
@@ -576,7 +998,17 @@ def _is_template_preview_entity(entity):
     return name.lower() == "previewentity"
 
 
-def _set_redkit_entity_metadata(obj, entity_type="CEntity", *, entity_name="", template_path="", action_name=""):
+def _set_redkit_entity_metadata(
+    obj,
+    entity_type="CEntity",
+    *,
+    entity_name="",
+    template_path="",
+    action_name="",
+    instance_id="",
+    entity_guid="",
+    entity_id="",
+):
     if obj is None:
         return
     entity_type = str(entity_type or "CEntity").strip() or "CEntity"
@@ -589,6 +1021,12 @@ def _set_redkit_entity_metadata(obj, entity_type="CEntity", *, entity_name="", t
             obj["template"] = str(template_path)
         if action_name:
             obj["witcher_redkit_actionName"] = str(action_name)
+        if instance_id:
+            obj["witcher_redkit_instance_id"] = str(instance_id)
+        if entity_guid:
+            obj["witcher_redkit_guid"] = str(entity_guid)
+        if entity_id:
+            obj["witcher_redkit_id"] = str(entity_id)
     except Exception:
         pass
 
@@ -1027,11 +1465,23 @@ def _drawable_flags_display_value(flags):
     return str(flags)
 
 
-def _tag_entity_empty_engine_visibility_from_children(entity_empty, kwargs=None):
+def _build_object_children_map(objects=None):
+    children_map = {}
+    for candidate in (objects if objects is not None else bpy.data.objects):
+        parent_id = _object_identity(getattr(candidate, "parent", None))
+        if parent_id is not None:
+            children_map.setdefault(parent_id, []).append(candidate)
+    return children_map
+
+
+def _tag_entity_empty_engine_visibility_from_children(entity_empty, kwargs=None, children_map=None):
     if entity_empty is None:
         return
     tagged_children = []
-    child_candidates = list(getattr(entity_empty, "children", []) or [])
+    if children_map is not None:
+        child_candidates = children_map.get(_object_identity(entity_empty), [])
+    else:
+        child_candidates = list(getattr(entity_empty, "children", []) or [])
     for child in child_candidates:
         try:
             value = child.get("witcher_layer_engine_visible", None)
@@ -1041,7 +1491,16 @@ def _tag_entity_empty_engine_visibility_from_children(entity_empty, kwargs=None)
             continue
         tagged_children.append((child, bool(value)))
     if not tagged_children:
-        for child in list(getattr(entity_empty, "children_recursive", []) or []):
+        if children_map is not None:
+            descendants = []
+            stack = list(child_candidates)
+            while stack:
+                child = stack.pop()
+                descendants.append(child)
+                stack.extend(children_map.get(_object_identity(child), []))
+        else:
+            descendants = list(getattr(entity_empty, "children_recursive", []) or [])
+        for child in descendants:
             try:
                 value = child.get("witcher_layer_engine_visible", None)
             except Exception:
@@ -1055,9 +1514,14 @@ def _tag_entity_empty_engine_visibility_from_children(entity_empty, kwargs=None)
     hidden_children = [child for child, visible in tagged_children if not visible]
     all_hidden = len(hidden_children) == len(tagged_children)
     try:
+        instance_visible = entity_empty.get("witcher_entity_instance_visible", None)
+    except Exception:
+        instance_visible = None
+    effective_visible = (not all_hidden) and instance_visible is not False
+    try:
         entity_empty["witcher_entity_drawable_components"] = len(tagged_children)
         entity_empty["witcher_entity_engine_hidden_components"] = len(hidden_children)
-        entity_empty["witcher_layer_engine_visible"] = not all_hidden
+        entity_empty["witcher_layer_engine_visible"] = effective_visible
         drawable_values = []
         for child, _visible in tagged_children:
             value = child.get("witcher_redkit_drawableFlags", child.get("witcher_drawableFlags", None))
@@ -1069,16 +1533,9 @@ def _tag_entity_empty_engine_visibility_from_children(entity_empty, kwargs=None)
     except Exception:
         pass
 
-    if all_hidden and _hide_engine_hidden_meshes_enabled(kwargs):
+    if _hide_engine_hidden_meshes_enabled(kwargs):
         try:
-            entity_empty.hide_viewport = True
-            entity_empty.hide_render = True
-        except Exception:
-            pass
-    elif _hide_engine_hidden_meshes_enabled(kwargs):
-        try:
-            entity_empty.hide_viewport = False
-            entity_empty.hide_render = False
+            _set_hide_flags(entity_empty, not effective_visible)
         except Exception:
             pass
 
@@ -1528,8 +1985,10 @@ def _copy_world_position(position):
     )
 
 
-def _new_level_import_plan():
+def _new_level_import_plan(mode="parsed_layer"):
     return {
+        "mode": str(mode or "parsed_layer"),
+        "_next_item_id": 1,
         "items": [],
         "stats": {
             "total": 0,
@@ -1537,6 +1996,19 @@ def _new_level_import_plan():
             "by_kind": {},
         },
     }
+
+
+def entity_import_plan_hash(plan):
+    items = []
+    for item in (plan or {}).get("items", []) or []:
+        if isinstance(item, dict) and item.get("entity_data_hash") and "entity_data" in item:
+            item = {key: value for key, value in item.items() if key != "entity_data"}
+        items.append(item)
+    try:
+        payload = json.dumps(items, sort_keys=True, separators=(",", ":"))
+    except Exception as exc:
+        raise ValueError(f"Entity import plan is not JSON-safe: {exc}") from exc
+    return hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest()
 
 
 def _add_level_import_plan_item(
@@ -1563,13 +2035,30 @@ def _add_level_import_plan_item(
     component_type="",
     component_name="",
     action_name="",
+    entity_class="",
+    instance_id="",
+    entity_guid="",
+    entity_id="",
+    instance_overrides=None,
+    source_path="",
+    selected_appearance="",
+    entity_data=None,
+    entity_data_hash="",
+    entity_asset_overlay=None,
+    shared_armature_item_id="",
     light_properties=None,
     cr2w_version=None,
     mesh_uncook_path=None,
 ):
     item_kind = str(kind or "unknown").strip() or "unknown"
+    try:
+        next_item_index = max(1, int(plan.get("_next_item_id", 1) or 1))
+    except Exception:
+        next_item_index = 1
+    item_id = f"item_{next_item_index}"
+    plan["_next_item_id"] = next_item_index + 1
     item = {
-        "id": f"item_{len(plan['items']) + 1}",
+        "id": item_id,
         "kind": item_kind,
         "name": str(name or item_kind).strip() or item_kind,
         "parent_id": str(parent_id or "").strip(),
@@ -1606,6 +2095,28 @@ def _add_level_import_plan_item(
         item["component_name"] = str(component_name)
     if action_name:
         item["action_name"] = str(action_name)
+    if entity_class:
+        item["entity_class"] = str(entity_class)
+    if instance_id:
+        item["instance_id"] = str(instance_id)
+    if entity_guid:
+        item["entity_guid"] = str(entity_guid)
+    if entity_id:
+        item["entity_id"] = str(entity_id)
+    if instance_overrides:
+        item["instance_overrides"] = _json_safe_plan_value(instance_overrides)
+    if source_path:
+        item["source_path"] = str(source_path)
+    if selected_appearance:
+        item["selected_appearance"] = str(selected_appearance)
+    if entity_data is not None:
+        item["entity_data"] = entity_data if entity_data_hash else _json_safe_plan_value(entity_data)
+    if entity_data_hash:
+        item["entity_data_hash"] = str(entity_data_hash)
+    if entity_asset_overlay:
+        item["entity_asset_overlay"] = True
+    if shared_armature_item_id:
+        item["shared_armature_item_id"] = str(shared_armature_item_id)
     if light_properties:
         item.update(light_properties)
     if cr2w_version is not None:
@@ -1796,10 +2307,270 @@ def _cached_plan_filter_for_position(camera_position=None, radius=0.0):
         return None
 
 
-def cached_plan_can_use_full_import(plan_items, camera_position=None, radius=0.0, import_kwargs=None, context=None):
+def _embedded_entity_data_has_complete_appearance_templates(entity_data):
+    if not isinstance(entity_data, dict):
+        return False
+    for appearance in entity_data.get("appearances", []) or []:
+        if not isinstance(appearance, dict):
+            return False
+        if bool(appearance.get("_dlc_mounter_lazy", False)):
+            return False
+        for template in appearance.get("includedTemplates", []) or []:
+            if isinstance(template, dict):
+                if (
+                    not (template.get("chunks") or [])
+                    and str(template.get("templateFilename", "") or "").strip()
+                    and not bool(template.get("plan_complete", False))
+                ):
+                    return False
+            elif (
+                not (getattr(template, "chunks", None) or [])
+                and str(getattr(template, "templateFilename", "") or "").strip()
+                and not bool(getattr(template, "plan_complete", False))
+            ):
+                return False
+    return True
+
+
+def _embedded_entity_data_missing_w2_mimic_skeleton(entity_data):
+    def visit(value):
+        if isinstance(value, dict):
+            try:
+                embedded_index = int(
+                    value.get("w2_mimic_skeleton_embedded_chunk_index", -1)
+                )
+            except Exception:
+                embedded_index = -1
+            if (
+                embedded_index >= 0
+                and not value.get("w2_mimic_embedded_skeleton_data")
+            ):
+                return True
+            return any(visit(child) for child in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(visit(child) for child in value)
+        return False
+
+    return visit(entity_data)
+
+
+def _embedded_entity_data_validation_error(entity_data, instance_overrides=None, deep=True):
+    if not isinstance(entity_data, dict):
+        return "embedded entity_data is not an object"
+    if not str(entity_data.get("name", "") or "").strip():
+        return "embedded entity_data has no entity name"
+    if _embedded_entity_data_missing_w2_mimic_skeleton(entity_data):
+        return "embedded Witcher 2 mimic skeleton data is incomplete"
+    if not deep:
+        return _entity_instance_override_shape_error(instance_overrides) if instance_overrides else None
+    try:
+        from ..CR2W import w3_types
+
+        entity = w3_types.Entity.from_json(copy.deepcopy(entity_data))
+    except Exception as exc:
+        return f"embedded entity_data cannot be restored: {exc}"
+    if entity is None:
+        return "embedded entity_data restored to no entity"
+    return _apply_entity_instance_overrides(entity, instance_overrides)
+
+
+def _embedded_entity_data_unsupported_components(entity_data):
+    if not isinstance(entity_data, dict):
+        return []
+    return [str(value) for value in (entity_data.get("unsupported_components") or []) if str(value)]
+
+
+def _entity_import_plan_preflight(plan, deep=True):
+    items = (plan.get("items", []) if isinstance(plan, dict) else plan) or []
+
+    fatal = []
+    item_errors = {}
+
+    def add_item_error(item_id, message):
+        if item_id:
+            item_errors.setdefault(item_id, []).append(message)
+        else:
+            fatal.append(message)
+
+    item_ids = set()
+    parent_by_id = {}
+    kind_by_id = {}
+    item_order = {}
+    item_by_id = {}
+    entity_asset_override_parent_ids = {
+        str(item.get("parent_id", "") or "").strip()
+        for item in items
+        if isinstance(item, dict)
+        and str(item.get("kind", "") or "").strip().lower() in _CACHED_ENTITY_ASSET_ITEM_KINDS
+        and (item.get("instance_overrides") or {}).get("BufferV2")
+    }
+    for item_index, item in enumerate(items):
+        if not isinstance(item, dict):
+            fatal.append("plan contains a non-object item")
+            continue
+        item_id = str(item.get("id", "") or "").strip()
+        kind = str(item.get("kind", "") or "").strip().lower()
+        if not item_id:
+            fatal.append("plan item is missing an id")
+        elif item_id in item_ids:
+            fatal.append(f"duplicate plan item id: {item_id}")
+        item_ids.add(item_id)
+        if item_id:
+            parent_by_id[item_id] = str(item.get("parent_id", "") or "").strip()
+            kind_by_id[item_id] = kind
+            item_order[item_id] = item_index
+            item_by_id[item_id] = item
+        if kind not in _CACHED_FULL_ITEM_KINDS and kind not in _CACHED_FULL_PARENT_ITEM_KINDS:
+            add_item_error(item_id, f"unsupported plan item kind: {kind or '<empty>'}")
+        entity_data = item.get("entity_data")
+        if kind in _CACHED_ENTITY_ASSET_ITEM_KINDS and not isinstance(entity_data, dict):
+            add_item_error(
+                item_id,
+                f"plan item {item_id or '<unknown>'} requires embedded entity_data",
+            )
+        elif (
+            kind in _CACHED_ENTITY_ASSET_ITEM_KINDS
+            and not _embedded_entity_data_has_complete_appearance_templates(entity_data)
+        ):
+            add_item_error(
+                item_id,
+                f"plan item {item_id or '<unknown>'} has incomplete embedded appearance templates",
+            )
+        if kind in _CACHED_ENTITY_ASSET_ITEM_KINDS and entity_data is not None:
+            validation_error = _embedded_entity_data_validation_error(
+                entity_data,
+                item.get("instance_overrides"),
+                deep=deep,
+            )
+            if validation_error:
+                add_item_error(item_id, f"plan item {item_id or '<unknown>'}: {validation_error}")
+        elif item.get("instance_overrides"):
+            validation_error = _entity_instance_override_shape_error(item.get("instance_overrides"))
+            if validation_error:
+                add_item_error(item_id, f"plan item {item_id or '<unknown>'}: {validation_error}")
+            elif (
+                (item.get("instance_overrides") or {}).get("BufferV2")
+                and item_id not in entity_asset_override_parent_ids
+            ):
+                add_item_error(
+                    item_id,
+                    f"plan item {item_id or '<unknown>'} has BufferV2 overrides but no embedded entity asset",
+                )
+        if kind in (_CACHED_FULL_MESH_ITEM_KINDS | _CACHED_REDCLOTH_ITEM_KINDS | _CACHED_SECTOR_INSTANCER_KINDS):
+            if not str(item.get("repo_path", "") or item.get("source_path", "") or "").strip():
+                add_item_error(item_id, f"plan item {item_id or '<unknown>'} has no resource path")
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id", "") or "").strip()
+        parent_id = str(item.get("parent_id", "") or "").strip()
+        if parent_id and parent_id not in item_ids:
+            add_item_error(item_id, f"plan item {item.get('id', '<unknown>')} has missing parent {parent_id}")
+        shared_asset_id = str(item.get("shared_armature_item_id", "") or "").strip()
+        if bool(item.get("entity_asset_overlay", False)) and not shared_asset_id:
+            add_item_error(item_id, f"plan item {item_id or '<unknown>'} is an overlay without a shared entity asset")
+        if shared_asset_id:
+            if kind_by_id.get(shared_asset_id) != "entity_asset":
+                add_item_error(
+                    item_id,
+                    f"plan item {item_id or '<unknown>'} has invalid shared entity asset {shared_asset_id}",
+                )
+            elif item_order.get(shared_asset_id, -1) >= item_order.get(item_id, -1):
+                add_item_error(
+                    item_id,
+                    f"plan item {item_id or '<unknown>'} must follow shared entity asset {shared_asset_id}",
+                )
+            else:
+                shared_item = item_by_id[shared_asset_id]
+                if str(shared_item.get("parent_id", "") or "").strip() != parent_id:
+                    add_item_error(
+                        item_id,
+                        f"plan item {item_id or '<unknown>'} cannot share an armature across entity parents",
+                    )
+                shared_instance_id = str(shared_item.get("instance_id", "") or "").strip()
+                instance_id = str(item.get("instance_id", "") or "").strip()
+                if shared_instance_id and instance_id and shared_instance_id != instance_id:
+                    add_item_error(
+                        item_id,
+                        f"plan item {item_id or '<unknown>'} cannot share an armature across entity instances",
+                    )
+    reported_cycles = set()
+    for item_id in parent_by_id:
+        path = []
+        path_indices = {}
+        current_id = item_id
+        while current_id:
+            if current_id in path_indices:
+                cycle = path[path_indices[current_id]:]
+                cycle_key = tuple(sorted(cycle))
+                if cycle_key not in reported_cycles:
+                    reported_cycles.add(cycle_key)
+                    fatal.append(f"plan parent cycle: {' -> '.join(cycle + [current_id])}")
+                break
+            if current_id not in parent_by_id:
+                break
+            path_indices[current_id] = len(path)
+            path.append(current_id)
+            current_id = parent_by_id.get(current_id, "")
+    return fatal, item_errors
+
+
+def _entity_import_plan_preflight_errors(plan):
+    fatal, item_errors = _entity_import_plan_preflight(plan)
+    return list(fatal) + [message for messages in item_errors.values() for message in messages]
+
+
+def _entity_plan_skip_ids(items, item_errors):
+    if not item_errors:
+        return set()
+    skip = set(item_errors)
+    changed = True
+    while changed:
+        changed = False
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id", "") or "").strip()
+            if not item_id or item_id in skip:
+                continue
+            parent_id = str(item.get("parent_id", "") or "").strip()
+            shared_id = str(item.get("shared_armature_item_id", "") or "").strip()
+            if (parent_id and parent_id in skip) or (shared_id and shared_id in skip):
+                skip.add(item_id)
+                changed = True
+    return skip
+
+
+def _log_entity_plan_unsupported(level_file, plan):
+    unsupported = [
+        str(value) for value in ((plan or {}).get("unsupported", []) or []) if str(value)
+    ]
+    if unsupported:
+        log.warning(
+            "Layer %s has %d unsupported entity note(s), importing the rest: %s",
+            level_file,
+            len(unsupported),
+            _preview_list(unsupported, limit=4),
+        )
+
+
+def entity_import_plan_can_materialize(plan, camera_position=None, radius=0.0, import_kwargs=None, context=None):
     nearby_filter = _cached_plan_filter_for_position(camera_position, radius)
     nearby_stats = {"filtered": 0}
+    plan_items = plan.get("items", []) if isinstance(plan, dict) else plan
     source_items = [item for item in plan_items or [] if isinstance(item, dict)]
+
+    # Validate the complete plan before view filtering.
+    if isinstance(plan, dict) and all(isinstance(item, dict) for item in plan_items or []):
+        fatal, _item_errors = _entity_import_plan_preflight(plan, deep=False)
+    else:
+        unfiltered_plan = dict(plan) if isinstance(plan, dict) else {}
+        unfiltered_plan["items"] = source_items
+        fatal, _item_errors = _entity_import_plan_preflight(unfiltered_plan, deep=False)
+    if fatal:
+        return False
+
     if import_kwargs is not None:
         source_items = cached_plan_filter_items_for_import_options(
             source_items,
@@ -1813,9 +2584,7 @@ def cached_plan_can_use_full_import(plan_items, camera_position=None, radius=0.0
         nearby_filter,
         nearby_stats,
     )
-    has_nearby_item = False
     for item in filtered_items:
-        has_nearby_item = True
         kind = str(item.get("kind", "") or "").strip().lower()
         if kind in _CACHED_FULL_ITEM_KINDS:
             continue
@@ -1823,7 +2592,7 @@ def cached_plan_can_use_full_import(plan_items, camera_position=None, radius=0.0
             continue
         if kind:
             return False
-    return has_nearby_item
+    return True
 
 
 def _filter_cached_plan_items_by_kinds(items, item_kinds):
@@ -1895,7 +2664,12 @@ def _cached_plan_nearest_entity_parent(item, by_id):
 def _cached_plan_item_matches_regex(item, by_id, regex_pattern):
     if regex_pattern is None:
         return True
-    candidates = [item.get("name", ""), item.get("repo_path", "")]
+    entity_parent = _cached_plan_nearest_entity_parent(item, by_id)
+    candidates = (
+        [entity_parent.get("name", "")]
+        if entity_parent is not None
+        else [item.get("name", ""), item.get("repo_path", "")]
+    )
     for value in candidates:
         value = str(value or "")
         if value and regex_pattern.search(value):
@@ -1924,7 +2698,7 @@ def _cached_plan_item_enabled_by_import_options(item, by_id, kwargs, *, context=
         return bool(kwargs.get("do_import_SpotLight", True))
     if kind in _CACHED_FULL_EMPTY_ITEM_KINDS:
         return bool(kwargs.get("do_import_Entity", True))
-    if kind == "entity_template":
+    if kind in {"entity_template", "entity_asset"}:
         return bool(kwargs.get("do_import_Entity", True))
     return True
 
@@ -2061,11 +2835,17 @@ def _import_cached_plan_redcloth_items(plan, target_collection, kwargs, context=
             if kind == "entity":
                 _set_redkit_entity_metadata(
                     obj,
-                    "CEntity",
+                    str(item.get("entity_class", "") or "CEntity"),
                     entity_name=str(item.get("name", "") or ""),
                     template_path=str(item.get("repo_path", "") or ""),
                     action_name=str(item.get("action_name", "") or ""),
+                    instance_id=str(item.get("instance_id", "") or ""),
+                    entity_guid=str(item.get("entity_guid", "") or ""),
+                    entity_id=str(item.get("entity_id", "") or ""),
                 )
+                if "engine_visible" in item:
+                    obj["witcher_entity_instance_visible"] = bool(item["engine_visible"])
+                    _tag_object_tree_engine_visibility(obj, item["engine_visible"], kwargs)
             obj["witcher_cached_plan_proxy"] = True
             obj["witcher_cached_plan_kind"] = kind
         except Exception:
@@ -2316,6 +3096,7 @@ def _import_cached_plan_empty_item(
     owner_tag,
     item_id,
     mode_signature,
+    kwargs=None,
 ):
     obj = _create_linked_empty(item.get("name", "Component"), target_collection, display_size=0.2)
     if obj is None:
@@ -2342,10 +3123,17 @@ def _import_cached_plan_empty_item(
             obj["witcher_entity_empty_only"] = True
             _set_redkit_entity_metadata(
                 obj,
-                "CEntity",
+                str(item.get("entity_class", "") or "CEntity"),
                 entity_name=str(item.get("name", "") or ""),
+                template_path=str(item.get("repo_path", "") or ""),
                 action_name=str(item.get("action_name", "") or ""),
+                instance_id=str(item.get("instance_id", "") or ""),
+                entity_guid=str(item.get("entity_guid", "") or ""),
+                entity_id=str(item.get("entity_id", "") or ""),
             )
+            if "engine_visible" in item:
+                obj["witcher_entity_instance_visible"] = bool(item["engine_visible"])
+                _tag_object_tree_engine_visibility(obj, item["engine_visible"], kwargs)
         obj["witcher_cached_plan_kind"] = kind
     except Exception:
         pass
@@ -2695,7 +3483,7 @@ def _import_sector_w2mesh_collision(mesh, errors, parent_transform, **kwargs):
             except Exception:
                 pass
 
-    _record_duplicate_root(wrapper)
+    _record_duplicate_root(wrapper, subtree=[wrapper] + [o for o in nxs_objects if o is not None])
     return _apply_sector_collision_transform_and_tags(wrapper, mesh, parent_transform, kwargs)
 
 
@@ -2797,7 +3585,7 @@ def _import_sector_collision_from_cache(mesh, errors, parent_transform, **kwargs
             except Exception:
                 pass
 
-    _record_duplicate_root(wrapper)
+    _record_duplicate_root(wrapper, subtree=[wrapper] + [o for o in nxs_objects if o is not None])
     return _apply_sector_collision_transform_and_tags(wrapper, mesh, parent_transform, kwargs)
 
 
@@ -3300,7 +4088,332 @@ def _import_cached_plan_sector_instancer_item(
     return inst_obj
 
 
-def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None, loaded_collection=None, errors=None, level_file=""):
+def _snapshot_blender_objects():
+    try:
+        return {_object_identity(obj): obj for obj in list(bpy.data.objects)}
+    except Exception:
+        return {}
+
+
+def _rollback_blender_objects_created_after(before_snapshot):
+    after = _snapshot_blender_objects()
+    created = [obj for key, obj in after.items() if key not in before_snapshot]
+    removed = 0
+    for obj in reversed(created):
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed += 1
+        except Exception:
+            log.warning(
+                "Failed to roll back entity import object '%s'.",
+                getattr(obj, "name", "<unknown>"),
+                exc_info=True,
+            )
+    return removed
+
+
+def _materialize_entity_asset_plan_item(
+    item,
+    target_collection,
+    parent_obj,
+    owner_tag,
+    item_id,
+    mode_signature,
+    kwargs,
+    errors,
+    import_entity,
+    *,
+    context=None,
+    shared_armature=None,
+    before_snapshot=None,
+    snapshot_out=None,
+):
+    entity_data = item.get("entity_data")
+    source_path = str(item.get("source_path", "") or item.get("repo_path", "") or "").strip()
+    if not source_path:
+        if not isinstance(entity_data, dict):
+            errors.append(f"Entity plan item {item_id} has no source path")
+            return None
+        source_path = f"{str(item.get('name', '') or entity_data.get('name', '') or 'embedded_entity')}.w2ent"
+
+    entity_override = None
+    if entity_data is not None:
+        if not isinstance(entity_data, dict):
+            errors.append(f"Entity plan item {item_id} has invalid embedded entity_data")
+            return None
+        try:
+            entity_override = import_entity.w3_types.Entity.from_json(copy.deepcopy(entity_data))
+            override_error = _apply_entity_instance_overrides(
+                entity_override,
+                item.get("instance_overrides"),
+            )
+            if override_error:
+                errors.append(f"Entity plan item {item_id} has unsupported overrides: {override_error}")
+                return None
+        except Exception as exc:
+            errors.append(f"Could not restore embedded entity data for {source_path}: {exc}")
+            return None
+
+    mesh_import_settings = kwargs.get("mesh_import_settings")
+    defer_materials = mesh_import_settings is None and bool(kwargs.get("defer_mesh_materials", False))
+    if defer_materials:
+        mesh_import_settings = {"build_material_nodes": False, "import_morphs": False}
+
+    before = before_snapshot if before_snapshot is not None else _snapshot_blender_objects()
+    try:
+        if target_collection is not None:
+            _activate_collection(context or bpy.context, target_collection)
+        component_import_options = {
+            option_name: bool(kwargs[option_name])
+            for option_name in (
+                "do_import_Mesh",
+                "do_import_ProxyMesh",
+                "do_import_Redcloth",
+                "do_import_Redapex",
+                "do_import_PointLight",
+                "do_import_SpotLight",
+            )
+            if option_name in kwargs
+        }
+        returned = import_entity._materialize_entity_asset(
+            source_path,
+            load_face_poses=bool(kwargs.get("load_face_poses", False)),
+            import_apperance=int(kwargs.get("import_apperance", kwargs.get("import_appearance", 0)) or 0),
+            parent_transform=parent_obj if parent_obj is not None else kwargs.get("parent_transform"),
+            selected_appearance_name=str(
+                item.get("selected_appearance", "")
+                or kwargs.get("selected_appearance_name", "")
+                or ""
+            ),
+            mesh_import_settings=mesh_import_settings,
+            entity_namespace=str(item.get("entity_namespace", "") or kwargs.get("entity_namespace", "") or ""),
+            entity_override=entity_override,
+            component_import_options=component_import_options or None,
+            load_appearance_equipment=bool(kwargs.get("load_appearance_equipment", False)),
+            existing_root_skeleton=shared_armature,
+            entity_overlay=bool(item.get("entity_asset_overlay", False)),
+        )
+    except Exception as exc:
+        _rollback_blender_objects_created_after(before)
+        message = f"Problem with entity import {source_path}: {exc}"
+        log.warning("%s", message)
+        errors.append(message)
+        return None
+
+    after = _snapshot_blender_objects()
+    created_objects = [obj for key, obj in after.items() if key not in before]
+    created_ids = set(after).difference(before)
+    if defer_materials and created_objects:
+        try:
+            queue_deferred_materials_for_objects(created_objects)
+        except Exception:
+            log.warning("Could not queue deferred materials for %s", source_path, exc_info=True)
+    returned_armature = getattr(returned, "main_armature", None)
+    if returned_armature is None and str(getattr(returned, "type", "") or "") == "ARMATURE":
+        returned_armature = returned
+    if shared_armature is not None:
+        returned_armature = shared_armature
+    root_obj = None
+    if not (bool(item.get("entity_asset_overlay", False)) and shared_armature is not None):
+        root_obj = getattr(returned, "main_object", None) or getattr(returned, "root_object", None)
+        if root_obj is None and returned is not None and hasattr(returned, "name"):
+            root_obj = returned
+    while root_obj is not None:
+        parent = getattr(root_obj, "parent", None)
+        if parent is None or _object_identity(parent) not in created_ids:
+            break
+        root_obj = parent
+    if root_obj is None and created_objects:
+        root_obj = next(
+            (
+                obj for obj in created_objects
+                if getattr(obj, "parent", None) is None
+                or _object_identity(getattr(obj, "parent", None)) not in created_ids
+            ),
+            created_objects[0],
+        )
+    if root_obj is None and parent_obj is not None and entity_override is not None:
+        # Preserve materialization state when filtering removes every component.
+        root_obj = _create_linked_empty(
+            f"{str(item.get('name', '') or 'Entity')} [filtered]",
+            target_collection,
+        )
+        if root_obj is not None:
+            root_obj.parent = parent_obj
+            created_objects.append(root_obj)
+            after[_object_identity(root_obj)] = root_obj
+    for obj in created_objects:
+        _tag_single_object_for_layer(obj, owner_tag)
+        _tag_object_tree_for_plan_item(obj, item_id, mode_signature)
+    if root_obj is not None:
+        _tag_object_tree_for_layer_and_plan(root_obj, owner_tag, item_id, mode_signature)
+    if root_obj is None:
+        errors.append(f"Entity import produced no Blender objects: {source_path}")
+    execution_results = kwargs.get("_entity_import_execution_results")
+    if isinstance(execution_results, dict):
+        execution_results[item_id] = {
+            "root_object": root_obj,
+            "main_armature": returned_armature,
+            "created_objects": created_objects,
+        }
+    if snapshot_out is not None:
+        snapshot_out["after"] = after
+    return root_obj
+
+
+def _find_entity_asset_armature(root_obj):
+    current = root_obj
+    seen = set()
+    while current is not None and _object_identity(current) not in seen:
+        seen.add(_object_identity(current))
+        if str(getattr(current, "type", "") or "") == "ARMATURE":
+            return current
+        current = getattr(current, "parent", None)
+
+    pending = [root_obj] if root_obj is not None else []
+    seen.clear()
+    while pending:
+        current = pending.pop()
+        identity = _object_identity(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if str(getattr(current, "type", "") or "") == "ARMATURE":
+            return current
+        pending.extend(list(getattr(current, "children", None) or ()))
+    return None
+
+
+_ENTITY_CLONE_KEY_PROP = "witcher_entity_clone_key"
+_ENTITY_CLONE_SOURCE_NAMES = {}
+
+
+def _entity_clone_source_lookup(clone_key):
+    name = _ENTITY_CLONE_SOURCE_NAMES.get(clone_key)
+    if not name:
+        return None
+    obj = bpy.data.objects.get(name)
+    if obj is None or str(obj.get(_ENTITY_CLONE_KEY_PROP, "")) != clone_key:
+        _ENTITY_CLONE_SOURCE_NAMES.pop(clone_key, None)
+        return None
+    return obj
+
+
+def _entity_clone_source_register(clone_key, root_obj):
+    try:
+        root_obj[_ENTITY_CLONE_KEY_PROP] = clone_key
+        name = root_obj.name
+    except Exception:
+        return
+    if len(_ENTITY_CLONE_SOURCE_NAMES) > 4096:
+        _ENTITY_CLONE_SOURCE_NAMES.clear()
+    _ENTITY_CLONE_SOURCE_NAMES[clone_key] = name
+
+
+def _entity_asset_clone_key(item):
+    if bool(item.get("entity_asset_overlay", False)):
+        return ""
+    if str(item.get("shared_armature_item_id", "") or "").strip():
+        return ""
+    data_hash = str(item.get("entity_data_hash", "") or "").strip()
+    if not data_hash:
+        # Backfill hashes for older cached plans.
+        entity_data = item.get("entity_data")
+        if isinstance(entity_data, dict):
+            data_hash = _hash_plan_entity_data(entity_data)
+            if data_hash:
+                item["entity_data_hash"] = data_hash
+    if not data_hash:
+        return ""
+    try:
+        overrides_key = json.dumps(item.get("instance_overrides") or {}, sort_keys=True)
+    except Exception:
+        return ""
+    return "|".join((
+        data_hash,
+        str(item.get("selected_appearance", "") or ""),
+        str(item.get("entity_namespace", "") or ""),
+        overrides_key,
+    ))
+
+
+def _clone_entity_asset_plan_item(
+    source_root,
+    item,
+    target_collection,
+    parent_obj,
+    owner_tag,
+    item_id,
+    mode_signature,
+    kwargs,
+):
+    if source_root is None or parent_obj is None or target_collection is None:
+        return None
+    try:
+        source_objects = [source_root] + list(getattr(source_root, "children_recursive", None) or [])
+    except ReferenceError:
+        return None
+
+    clone_pairs = []
+    clone_by_id = {}
+    try:
+        for source_obj in source_objects:
+            clone_obj = source_obj.copy()
+            target_collection.objects.link(clone_obj)
+            clone_pairs.append((source_obj, clone_obj))
+            clone_by_id[_object_identity(source_obj)] = clone_obj
+
+        for source_obj, clone_obj in clone_pairs:
+            if source_obj is source_root:
+                clone_obj.parent = parent_obj
+            else:
+                clone_obj.parent = clone_by_id.get(_object_identity(getattr(source_obj, "parent", None)))
+            _set_object_local_matrix_direct(
+                clone_obj,
+                source_obj.matrix_basis.copy(),
+                source_obj.matrix_parent_inverse.copy(),
+            )
+
+        for _source_obj, clone_obj in clone_pairs:
+            for modifier in getattr(clone_obj, "modifiers", []):
+                for attr_name in ("object", "mirror_object", "offset_object"):
+                    _remap_object_reference(modifier, attr_name, clone_by_id)
+            for constraint in getattr(clone_obj, "constraints", []):
+                for attr_name in ("target", "space_object"):
+                    _remap_object_reference(constraint, attr_name, clone_by_id)
+    except Exception:
+        log.warning(
+            "Entity asset clone failed for %s, falling back to full import.",
+            item.get("name", "") or item_id,
+            exc_info=True,
+        )
+        for _source_obj, clone_obj in clone_pairs:
+            try:
+                bpy.data.objects.remove(clone_obj, do_unlink=True)
+            except Exception:
+                pass
+        return None
+
+    new_root = clone_by_id.get(_object_identity(source_root))
+    clone_objects = [clone_obj for _source_obj, clone_obj in clone_pairs]
+    _tag_object_tree_for_layer_and_plan(
+        new_root,
+        owner_tag,
+        item_id,
+        mode_signature,
+        objects=clone_objects,
+    )
+    execution_results = kwargs.get("_entity_import_execution_results")
+    if isinstance(execution_results, dict) and new_root is not None:
+        execution_results[item_id] = {
+            "root_object": new_root,
+            "main_armature": _find_entity_asset_armature(new_root),
+            "created_objects": clone_objects,
+        }
+    return new_root
+
+
+def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None, loaded_collection=None, errors=None, level_file="", preflight_item_errors=None):
     total_started = time.perf_counter()
     if target_collection is None:
         target_collection = _get_active_collection(context)
@@ -3310,6 +4423,14 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
     from ..importers import import_entity
 
     items = [item for item in plan.get("items", []) or [] if isinstance(item, dict)]
+    if preflight_item_errors is None:
+        _, preflight_item_errors = _entity_import_plan_preflight(plan, deep=False)
+    skip_ids = _entity_plan_skip_ids(items, preflight_item_errors)
+    if skip_ids:
+        items = [
+            item for item in items
+            if str(item.get("id", "") or "").strip() not in skip_ids
+        ]
     by_id = {
         str(item.get("id", "") or "").strip(): item
         for item in items
@@ -3318,7 +4439,11 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
     mode_signature = str(kwargs.get("_layer_import_mode_signature", "") or "").strip()
     if not mode_signature:
         mode_signature = _layer_load_mode_signature(False)
-    loaded_by_id = _cached_plan_loaded_item_objects(loaded_collection or target_collection, mode_signature)
+    loaded_by_id = (
+        {}
+        if bool(kwargs.get("_entity_import_disable_loaded_reuse", False))
+        else _cached_plan_loaded_item_objects(loaded_collection or target_collection, mode_signature)
+    )
     needed_ids = set()
     skipped_loaded = 0
     select_started = time.perf_counter()
@@ -3349,6 +4474,13 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
         elif kind in _CACHED_FULL_EMPTY_ITEM_KINDS:
             if not bool(kwargs.get("do_import_Entity", True)):
                 continue
+        elif kind in _CACHED_ENTITY_ASSET_ITEM_KINDS:
+            has_embedded_entity_data = isinstance(item.get("entity_data"), dict)
+            if (
+                (not repo_path_value and not has_embedded_entity_data)
+                or not bool(kwargs.get("do_import_Entity", True))
+            ):
+                continue
         else:
             continue
 
@@ -3360,6 +4492,14 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
             needed_ids.add(current_id)
             parent_id = str(current.get("parent_id", "") or "").strip()
             current = by_id.get(parent_id)
+        shared_asset_id = str(item.get("shared_armature_item_id", "") or "").strip()
+        current = by_id.get(shared_asset_id)
+        while current is not None:
+            current_id = str(current.get("id", "") or "").strip()
+            if not current_id or current_id in needed_ids:
+                break
+            needed_ids.add(current_id)
+            current = by_id.get(str(current.get("parent_id", "") or "").strip())
     select_seconds = time.perf_counter() - select_started
 
     created = dict(loaded_by_id)
@@ -3368,10 +4508,14 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
     mesh_seconds = 0.0
     cloth_seconds = 0.0
     light_seconds = 0.0
+    entity_seconds = 0.0
     parent_count = 0
     mesh_count = 0
     cloth_count = 0
     light_count = 0
+    entity_count = 0
+    entity_clone_count = 0
+    entity_clone_sources = {}
     visibility_parents = {}
 
     def queue_parent_visibility(parent_obj):
@@ -3407,11 +4551,17 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
             if kind == "entity":
                 _set_redkit_entity_metadata(
                     obj,
-                    "CEntity",
+                    str(item.get("entity_class", "") or "CEntity"),
                     entity_name=str(item.get("name", "") or ""),
                     template_path=str(item.get("repo_path", "") or ""),
                     action_name=str(item.get("action_name", "") or ""),
+                    instance_id=str(item.get("instance_id", "") or ""),
+                    entity_guid=str(item.get("entity_guid", "") or ""),
+                    entity_id=str(item.get("entity_id", "") or ""),
                 )
+                if "engine_visible" in item:
+                    obj["witcher_entity_instance_visible"] = bool(item["engine_visible"])
+                    _tag_object_tree_engine_visibility(obj, item["engine_visible"], kwargs)
             obj["witcher_cached_plan_proxy"] = True
             obj["witcher_cached_plan_kind"] = kind
         except Exception:
@@ -3426,13 +4576,82 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
     keep_lod_meshes = bool(kwargs.get("keep_lod_meshes", False))
     keep_proxy_meshes = bool(kwargs.get("keep_proxy_meshes", True))
     imported_count = 0
+    shared_snapshot = None
     for item in items:
         _raise_if_layer_import_cancelled(kwargs)
         item_id = str(item.get("id", "") or "").strip()
         if not item_id or item_id not in needed_ids or item_id in loaded_by_id:
             continue
         kind = str(item.get("kind", "") or "").strip().lower()
+        parent_count_before = parent_count
         parent_obj = ensure_parent_empty(str(item.get("parent_id", "") or "").strip())
+        if parent_count != parent_count_before or kind not in _CACHED_ENTITY_ASSET_ITEM_KINDS:
+            shared_snapshot = None
+
+        if kind in _CACHED_ENTITY_ASSET_ITEM_KINDS:
+            shared_armature = None
+            shared_asset_id = str(item.get("shared_armature_item_id", "") or "").strip()
+            if shared_asset_id:
+                execution_results = kwargs.get("_entity_import_execution_results")
+                if isinstance(execution_results, dict):
+                    shared_armature = (
+                        execution_results.get(shared_asset_id, {}) or {}
+                    ).get("main_armature")
+                if shared_armature is None:
+                    shared_armature = _find_entity_asset_armature(
+                        created.get(shared_asset_id) or loaded_by_id.get(shared_asset_id)
+                    )
+            entity_started = time.perf_counter()
+            clone_key = _entity_asset_clone_key(item) if parent_obj is not None else ""
+            root_obj = None
+            if clone_key:
+                clone_source = entity_clone_sources.get(clone_key)
+                if clone_source is None:
+                    clone_source = _entity_clone_source_lookup(clone_key)
+                if clone_source is not None:
+                    shared_snapshot = None
+                    root_obj = _clone_entity_asset_plan_item(
+                        clone_source,
+                        item,
+                        target_collection,
+                        parent_obj,
+                        owner_tag,
+                        item_id,
+                        mode_signature,
+                        kwargs,
+                    )
+                    if root_obj is not None:
+                        entity_clone_count += 1
+                        entity_clone_sources.setdefault(clone_key, clone_source)
+            if root_obj is None:
+                snapshot_out = {}
+                root_obj = _materialize_entity_asset_plan_item(
+                    item,
+                    target_collection,
+                    parent_obj,
+                    owner_tag,
+                    item_id,
+                    mode_signature,
+                    kwargs,
+                    errors,
+                    import_entity,
+                    context=context,
+                    shared_armature=shared_armature,
+                    before_snapshot=shared_snapshot,
+                    snapshot_out=snapshot_out,
+                )
+                shared_snapshot = snapshot_out.get("after")
+                if root_obj is not None and clone_key:
+                    entity_clone_sources.setdefault(clone_key, root_obj)
+                    _entity_clone_source_register(clone_key, root_obj)
+            entity_seconds += time.perf_counter() - entity_started
+            if root_obj is None:
+                continue
+            entity_count += 1
+            loaded_by_id[item_id] = root_obj
+            created[item_id] = root_obj
+            imported_count += 1
+            continue
 
         if kind in _CACHED_SECTOR_INSTANCER_KINDS:
             mesh_started = time.perf_counter()
@@ -3548,6 +4767,7 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
                 owner_tag,
                 item_id,
                 mode_signature,
+                kwargs,
             )
             parent_seconds += time.perf_counter() - parent_started
             if root_obj is None:
@@ -3620,25 +4840,41 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
             imported_count += 1
             cloth_count += 1
 
+    children_map = None
     for item_id, obj in list(created.items()):
         item = by_id.get(str(item_id or ""))
         if not isinstance(item, dict):
             continue
         if str(item.get("kind", "") or "").strip().lower() == "entity":
-            queue_parent_visibility(obj)
+            if "engine_visible" in item:
+                if children_map is None:
+                    children_map = _build_object_children_map()
+                subtree = [obj]
+                stack = [obj]
+                while stack:
+                    current = stack.pop()
+                    for child in children_map.get(_object_identity(current), []):
+                        subtree.append(child)
+                        stack.append(child)
+                _tag_object_tree_engine_visibility(obj, item["engine_visible"], kwargs, objects=subtree)
+            else:
+                queue_parent_visibility(obj)
 
     # Aggregate visibility after all children are created.
-    for parent_obj in sorted(
-        visibility_parents.values(),
-        key=_object_parent_depth,
-        reverse=True,
-    ):
-        _tag_entity_empty_engine_visibility_from_children(parent_obj, kwargs)
+    if visibility_parents:
+        if children_map is None:
+            children_map = _build_object_children_map()
+        for parent_obj in sorted(
+            visibility_parents.values(),
+            key=_object_parent_depth,
+            reverse=True,
+        ):
+            _tag_entity_empty_engine_visibility_from_children(parent_obj, kwargs, children_map=children_map)
 
     total_seconds = time.perf_counter() - total_started
     if total_seconds >= _LAYER_IMPORT_PROFILE_WARN_THRESHOLD:
         _log_layer_import_profile_warning(
-            "cached plan full %s total %.3fs (select %.3fs, parents %.3fs/%d, mesh dispatch %.3fs/%d, cloth dispatch %.3fs/%d, light dispatch %.3fs/%d, imported %d, loaded skips %d, source items %d, needed ids %d)",
+            "cached plan full %s total %.3fs (select %.3fs, parents %.3fs/%d, mesh dispatch %.3fs/%d, cloth dispatch %.3fs/%d, light dispatch %.3fs/%d, entity %.3fs/%d (%d cloned), imported %d, loaded skips %d, source items %d, needed ids %d)",
             level_file or "<cached-plan>",
             total_seconds,
             select_seconds,
@@ -3650,6 +4886,9 @@ def _import_cached_plan_full_items(plan, target_collection, kwargs, context=None
             cloth_count,
             light_seconds,
             light_count,
+            entity_seconds,
+            entity_count,
+            entity_clone_count,
             imported_count,
             skipped_loaded,
             len(items),
@@ -3978,12 +5217,141 @@ def _resolve_component_import_plan(
     return None
 
 
+def _embedded_entity_asset_has_materializable_content(entity_data):
+    if not isinstance(entity_data, dict):
+        return False
+    static_meshes = entity_data.get("staticMeshes") or {}
+    if isinstance(static_meshes, dict) and (static_meshes.get("chunks") or []):
+        return True
+    if entity_data.get("MovingPhysicalAgentComponent"):
+        return True
+    return bool(
+        entity_data.get("appearances")
+        or entity_data.get("coloringEntries")
+        or entity_data.get("cookedEffects")
+        or entity_data.get("CAnimAnimsetsParam")
+        or entity_data.get("CAnimMimicParam")
+        or entity_data.get("slots")
+    )
+
+
+def _streaming_entity_asset(entity_object):
+    direct_asset = getattr(entity_object, "entityAsset", None)
+    direct_error = str(getattr(entity_object, "entityAssetError", "") or "").strip()
+    if direct_asset is not None or direct_error:
+        return direct_asset, direct_error
+    streaming_data = getattr(entity_object, "streamingDataBuffer", None)
+    if not streaming_data:
+        return None, ""
+    return (
+        getattr(streaming_data, "entityAsset", None),
+        str(getattr(streaming_data, "entityAssetError", "") or "").strip(),
+    )
+
+
+def _augment_entity_asset_for_plan(entity, source_path):
+    source_path = str(source_path or "").strip()
+    if entity is None or not source_path:
+        return
+    from .dlc_mounters import (
+        append_dlc_entity_template_params,
+        append_dlc_external_appearances,
+    )
+
+    append_dlc_external_appearances(
+        entity,
+        source_path,
+        load_appearances=True,
+    )
+    append_dlc_entity_template_params(entity, source_path)
+
+
+def _add_embedded_entity_plan_components(
+    plan,
+    components,
+    *,
+    parent_id,
+    world_position=None,
+):
+    added = 0
+    for component in components or []:
+        if not isinstance(component, dict):
+            plan.setdefault("unsupported", []).append(
+                "embedded entity plan component is not an object"
+            )
+            continue
+        kind = str(component.get("kind", "") or "").strip().lower()
+        component_type = str(component.get("component_type", "") or "").strip()
+        repo_path = str(component.get("repo_path", "") or "").strip()
+        if kind not in {"component_mesh", "cloth"} or not repo_path:
+            plan.setdefault("unsupported", []).append(
+                f"unsupported embedded entity plan component {component_type or kind or '<unknown>'}"
+            )
+            continue
+        drawable_flags = component.get("drawable_flags")
+        _add_level_import_plan_item(
+            plan,
+            kind,
+            str(component.get("name", "") or "").strip()
+            or Path(repo_path.replace("\\", "/")).stem
+            or component_type,
+            parent_id=parent_id,
+            repo_path=repo_path,
+            transform=component.get("transform"),
+            matrix=component.get("matrix"),
+            translation=component.get("translation"),
+            world_position=world_position,
+            drawable_flags=drawable_flags,
+            engine_visible=_drawable_flags_visible_from_value(drawable_flags, default=True),
+            component_type=component_type,
+            component_name=str(component.get("component_name", "") or "").strip(),
+            action_name=str(component.get("action_name", "") or "").strip(),
+        )
+        added += 1
+    return added
+
+
+def _hash_plan_entity_data(entity_data):
+    try:
+        payload = json.dumps(entity_data, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return ""
+    return hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest()
+
+
+def _serialize_entity_asset_for_plan(entity, serialized_assets, source_path):
+    serialized_key = id(entity)
+    cached = (
+        serialized_assets.get(serialized_key)
+        if isinstance(serialized_assets, dict)
+        else None
+    )
+    if cached is None:
+        entity_data = _json_safe_plan_value(entity)
+        if not isinstance(entity_data, dict):
+            raise ValueError(f"Entity template did not produce JSON-safe data: {source_path}")
+        try:
+            payload = json.dumps(entity_data, sort_keys=True, separators=(",", ":"))
+        except Exception as exc:
+            raise ValueError(
+                f"Entity template data is not JSON-safe ({source_path}): {exc}"
+            ) from exc
+        cached = (entity_data, hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest())
+        if isinstance(serialized_assets, dict):
+            serialized_assets[serialized_key] = cached
+    entity_data, entity_data_hash = cached
+    entity_data = dict(entity_data)
+    plan_components = list(entity_data.pop("plan_components", []) or [])
+    return entity_data, plan_components, entity_data_hash
+
+
 def _resolve_gameplay_entity_import_plan(
     plan,
     ENTITY_OBJECT,
     *,
     parent_id="",
     parent_position=None,
+    instance_world_position=None,
     flatten_entity_into_parent=False,
     keep_lod_meshes=False,
     mesh_fbx_uncook_path=None,
@@ -3991,21 +5359,44 @@ def _resolve_gameplay_entity_import_plan(
     source_context_path="",
     **kwargs,
 ):
-    try:
+    inline_rich_entity, inline_rich_error = _streaming_entity_asset(ENTITY_OBJECT)
+    if inline_rich_error:
+        plan.setdefault("unsupported", []).append(
+            f"{source_context_path or getattr(ENTITY_OBJECT, 'name', '<inline entity>')}: "
+            f"{inline_rich_error}"
+        )
+    if inline_rich_entity is None:
         mesh_list, cloth_list = getDataBufferMesh(
             ENTITY_OBJECT,
             mesh_fbx_uncook_path=mesh_fbx_uncook_path,
             mesh_uncook_path=mesh_uncook_path,
         )
-    except Exception as exc:
-        raise exc
+    else:
+        mesh_list, cloth_list = [], []
 
     source_mesh_count = len(mesh_list or [])
     source_cloth_count = len(cloth_list or [])
     nearby_filter = _get_nearby_import_filter(kwargs)
     nearby_stats = _get_nearby_import_stats(kwargs)
-    entity_world_position = _entity_world_position(ENTITY_OBJECT, parent_position)
+    entity_world_position = (
+        _copy_world_position(instance_world_position)
+        if instance_world_position is not None
+        else _entity_world_position(ENTITY_OBJECT, parent_position)
+    )
     anchor_position = entity_world_position or parent_position
+    instance_spec = EntityInstanceSpec.from_layer_entity(
+        ENTITY_OBJECT,
+        source_path=source_context_path,
+        parent_id=parent_id,
+        world_position=entity_world_position,
+    )
+    for unsupported_component in (
+        getattr(ENTITY_OBJECT, "unsupportedComponents", None) or []
+    ):
+        plan.setdefault("unsupported", []).append(
+            f"{source_context_path or instance_spec.name}: unsupported entity component "
+            f"{unsupported_component}"
+        )
 
     supported_component_names = {
         "CMeshComponent",
@@ -4039,9 +5430,35 @@ def _resolve_gameplay_entity_import_plan(
 
     eligible_components = []
     supported_component_source_count = 0
-    for component in (getattr(ENTITY_OBJECT, "Components", None) or []):
-        component_name = getattr(component, "name", getattr(component, "Type", ""))
+    component_sources = list(getattr(ENTITY_OBJECT, "Components", None) or [])
+    if inline_rich_entity is None:
+        component_sources.extend(
+            chunk
+            for chunk in (
+                getattr(
+                    getattr(getattr(ENTITY_OBJECT, "streamingDataBuffer", None), "CHUNKS", None),
+                    "CHUNKS",
+                    None,
+                )
+                or []
+            )
+            if str(getattr(chunk, "name", "") or getattr(chunk, "Type", "") or "")
+            in {"CPointLightComponent", "CSpotLightComponent"}
+        )
+    for component in component_sources:
+        component_name = getattr(component, "name", None) or getattr(component, "Type", "")
+        if component_name in {"CClothComponent", "CDestructionSystemComponent"}:
+            supported_component_source_count += 1
+            if not _position_within_nearby_filter(_chunk_world_position(component, anchor_position), nearby_filter):
+                _note_nearby_filter_skip(nearby_stats)
+                continue
+            cloth_list.append(component)
+            continue
         if component_name not in supported_component_names:
+            plan.setdefault("unsupported", []).append(
+                f"{source_context_path or instance_spec.name}: unsupported direct entity component "
+                f"{component_name or '<unknown>'}"
+            )
             continue
         supported_component_source_count += 1
         if not _position_within_nearby_filter(_chunk_world_position(component, anchor_position), nearby_filter):
@@ -4050,13 +5467,121 @@ def _resolve_gameplay_entity_import_plan(
         eligible_components.append(component)
 
     template = getattr(ENTITY_OBJECT, "template", None)
-    template_mesh_list = _static_mesh_component_paths_from_template_source(
-        template,
-        getattr(ENTITY_OBJECT, "templatePath", "") if getattr(ENTITY_OBJECT, "isCreatedFromTemplate", False) else "",
-        mesh_fbx_uncook_path=mesh_fbx_uncook_path,
-        mesh_uncook_path=mesh_uncook_path,
-        source_context_path=source_context_path,
-    ) if template is not None else []
+    instance_rich_entity = inline_rich_entity
+    rich_template_entity = instance_rich_entity
+    rich_asset_source_path = source_context_path
+    if getattr(ENTITY_OBJECT, "isCreatedFromTemplate", False):
+        rich_template_entity = getattr(template, "entityAsset", None)
+        rich_asset_source_path = instance_spec.template_path
+        if rich_template_entity is None and (
+            template is not None
+            and (
+                template.__class__.__name__ == "Entity"
+                or hasattr(template, "appearances")
+            )
+        ):
+            rich_template_entity = template
+    instance_rich_source_path = (
+        f"{source_context_path or instance_spec.source_path or '<layer>'}"
+        f"#entity={instance_spec.identity or instance_spec.name or instance_spec.entity_class}"
+    )
+    secondary_instance_rich_entity = (
+        instance_rich_entity
+        if (
+            getattr(ENTITY_OBJECT, "isCreatedFromTemplate", False)
+            and instance_rich_entity is not None
+            and instance_rich_entity is not rich_template_entity
+        )
+        else None
+    )
+    materialized_entity_class = str(
+        getattr(rich_template_entity, "type", "")
+        or instance_spec.entity_class
+        or "CEntity"
+    )
+    rich_template_data = None
+    rich_template_data_hash = ""
+    embedded_plan_components = []
+    instance_rich_data = None
+    instance_plan_components = []
+    if rich_template_entity is not None:
+        if not _position_within_nearby_filter(entity_world_position, nearby_filter):
+            _note_nearby_filter_skip(nearby_stats)
+            return None
+        if getattr(ENTITY_OBJECT, "isCreatedFromTemplate", False):
+            prepared_assets = kwargs.get("_entity_plan_prepared_assets")
+            prepared_key = id(rich_template_entity)
+            if not isinstance(prepared_assets, set) or prepared_key not in prepared_assets:
+                _augment_entity_asset_for_plan(
+                    rich_template_entity,
+                    getattr(template, "layerNode", "") or rich_asset_source_path,
+                )
+                if isinstance(prepared_assets, set):
+                    prepared_assets.add(prepared_key)
+        rich_template_data, embedded_plan_components, rich_template_data_hash = _serialize_entity_asset_for_plan(
+            rich_template_entity,
+            kwargs.get("_entity_plan_serialized_assets"),
+            rich_asset_source_path or instance_spec.template_path,
+        )
+        for unsupported_component in rich_template_data.get("unsupported_components", []) or []:
+            plan.setdefault("unsupported", []).append(
+                f"{rich_asset_source_path or instance_spec.name}: unsupported entity component "
+                f"{unsupported_component}"
+            )
+
+    instance_rich_hash = ""
+    if secondary_instance_rich_entity is not None:
+        instance_rich_data, instance_plan_components, instance_rich_hash = _serialize_entity_asset_for_plan(
+            secondary_instance_rich_entity,
+            kwargs.get("_entity_plan_serialized_assets"),
+            instance_rich_source_path,
+        )
+        for unsupported_component in instance_rich_data.get("unsupported_components", []) or []:
+            plan.setdefault("unsupported", []).append(
+                f"{instance_rich_source_path}: unsupported entity component "
+                f"{unsupported_component}"
+            )
+
+    rich_template_data, instance_rich_data = _merge_instance_entity_metadata(
+        rich_template_data,
+        instance_rich_data,
+    )
+    if instance_rich_data is not None:
+        # Combine cached inputs instead of serializing the merged payload.
+        rich_template_data_hash = (
+            _hash_plan_entity_data([rich_template_data_hash, instance_rich_hash])
+            if rich_template_data_hash and instance_rich_hash
+            else ""
+        )
+    override_partitions, override_partition_errors = _partition_entity_instance_overrides(
+        instance_spec.instance_overrides,
+        rich_template_data,
+        instance_rich_data,
+    )
+    rich_template_overrides, instance_rich_overrides = override_partitions
+    for override_error in override_partition_errors:
+        plan.setdefault("unsupported", []).append(
+            f"{source_context_path or instance_spec.name}: {override_error}"
+        )
+
+    rich_template_has_content = _embedded_entity_asset_has_materializable_content(
+        rich_template_data
+    )
+    instance_rich_has_content = _embedded_entity_asset_has_materializable_content(
+        instance_rich_data
+    )
+
+    template_mesh_list = (
+        []
+        if rich_template_data is not None
+        else _static_mesh_component_paths_from_template_source(
+            template,
+            getattr(ENTITY_OBJECT, "templatePath", "") if getattr(ENTITY_OBJECT, "isCreatedFromTemplate", False) else "",
+            mesh_fbx_uncook_path=mesh_fbx_uncook_path,
+            mesh_uncook_path=mesh_uncook_path,
+            source_context_path=source_context_path,
+        ) if template is not None else []
+    )
     source_template_mesh_count = len(template_mesh_list or [])
     filtered_template_mesh_list = []
     for mesh in template_mesh_list:
@@ -4070,8 +5595,11 @@ def _resolve_gameplay_entity_import_plan(
         and (getattr(template, "includes", None) or getattr(template, "Entities", None))
     )
     has_template_content = bool(
-        template is not None
-        and (template_mesh_list or has_template_child_content)
+        rich_template_has_content
+        or embedded_plan_components
+        or instance_rich_has_content
+        or instance_plan_components
+        or (template is not None and (template_mesh_list or has_template_child_content))
     )
     if not mesh_list and not cloth_list and not eligible_components and not has_template_content:
         if flatten_entity_into_parent:
@@ -4085,10 +5613,19 @@ def _resolve_gameplay_entity_import_plan(
             return _add_level_import_plan_item(
                 plan,
                 "entity_empty",
-                getattr(ENTITY_OBJECT, "name", "") or getattr(ENTITY_OBJECT, "type", "") or "Entity",
+                instance_spec.name or instance_spec.entity_class or "Entity",
                 parent_id=parent_id,
-                transform=getattr(ENTITY_OBJECT, "transform", None),
+                repo_path=instance_spec.template_path,
+                transform=instance_spec.transform,
                 world_position=entity_world_position,
+                action_name=instance_spec.action_name,
+                entity_class=materialized_entity_class,
+                instance_id=instance_spec.identity,
+                entity_guid=instance_spec.guid,
+                entity_id=instance_spec.entity_id,
+                instance_overrides=instance_spec.instance_overrides,
+                source_path=instance_spec.source_path,
+                engine_visible=instance_spec.engine_visible,
             )
         return None
 
@@ -4098,14 +5635,90 @@ def _resolve_gameplay_entity_import_plan(
         entity_id = _add_level_import_plan_item(
             plan,
             "entity",
-            getattr(ENTITY_OBJECT, "name", "") or getattr(ENTITY_OBJECT, "type", "") or "Entity",
+            instance_spec.name or instance_spec.entity_class or "Entity",
             parent_id=parent_id,
-            repo_path=getattr(ENTITY_OBJECT, "templatePath", "") if getattr(ENTITY_OBJECT, "isCreatedFromTemplate", False) else "",
-            transform=getattr(ENTITY_OBJECT, "transform", None),
+            repo_path=instance_spec.template_path,
+            transform=instance_spec.transform,
             world_position=entity_world_position,
-            action_name=_entity_prop_string(ENTITY_OBJECT, "actionName"),
+            action_name=instance_spec.action_name,
+            entity_class=materialized_entity_class,
+            instance_id=instance_spec.identity,
+            entity_guid=instance_spec.guid,
+            entity_id=instance_spec.entity_id,
+            instance_overrides=instance_spec.instance_overrides,
+            source_path=instance_spec.source_path,
+            engine_visible=instance_spec.engine_visible,
         )
     items_before_children = len(plan["items"])
+
+    rich_template_item_id = ""
+    if rich_template_data is not None and rich_template_has_content:
+        rich_template_item_id = _add_level_import_plan_item(
+            plan,
+            "entity_asset",
+            str(getattr(rich_template_entity, "name", "") or "").strip()
+            or Path((rich_asset_source_path or instance_spec.name).replace("\\", "/")).stem
+            or "Entity",
+            parent_id=entity_id,
+            repo_path=rich_asset_source_path,
+            source_path=rich_asset_source_path,
+            world_position=entity_world_position,
+            entity_class=str(getattr(rich_template_entity, "type", "") or instance_spec.entity_class or "CEntity"),
+            instance_id=instance_spec.identity,
+            entity_guid=instance_spec.guid,
+            entity_id=instance_spec.entity_id,
+            instance_overrides=rich_template_overrides,
+            selected_appearance=str(kwargs.get("selected_appearance", "") or ""),
+            entity_data=rich_template_data,
+            entity_data_hash=rich_template_data_hash,
+        )
+
+    instance_rich_item_id = ""
+    if instance_rich_data is not None and instance_rich_has_content:
+        instance_rich_item_id = _add_level_import_plan_item(
+            plan,
+            "entity_asset",
+            str(getattr(secondary_instance_rich_entity, "name", "") or "").strip()
+            or f"{instance_spec.name or instance_spec.entity_class} instance graph",
+            parent_id=entity_id,
+            repo_path=instance_rich_source_path,
+            source_path=instance_rich_source_path,
+            world_position=entity_world_position,
+            entity_class=str(
+                getattr(secondary_instance_rich_entity, "type", "")
+                or instance_spec.entity_class
+                or "CEntity"
+            ),
+            instance_id=instance_spec.identity,
+            entity_guid=instance_spec.guid,
+            entity_id=instance_spec.entity_id,
+            instance_overrides=instance_rich_overrides,
+            entity_asset_overlay=bool(rich_template_item_id),
+            shared_armature_item_id=rich_template_item_id,
+            entity_data=instance_rich_data,
+            entity_data_hash="" if rich_template_item_id else instance_rich_hash,
+        )
+
+    if not flatten_entity_into_parent and (rich_template_item_id or instance_rich_item_id):
+        entity_item = next(
+            (item for item in plan["items"] if item.get("id") == entity_id),
+            None,
+        )
+        if entity_item is not None:
+            entity_item.pop("instance_overrides", None)
+
+    _add_embedded_entity_plan_components(
+        plan,
+        embedded_plan_components,
+        parent_id=entity_id,
+        world_position=anchor_position,
+    )
+    _add_embedded_entity_plan_components(
+        plan,
+        instance_plan_components,
+        parent_id=entity_id,
+        world_position=anchor_position,
+    )
 
     for mesh in template_mesh_list:
         mesh_path = _mesh_repo_path(mesh)
@@ -4212,60 +5825,50 @@ def _resolve_gameplay_entity_import_plan(
             mesh_uncook_path=mesh_uncook_path,
         )
 
-    if getattr(ENTITY_OBJECT, "isCreatedFromTemplate", False):
-        if '(CDoor)' in getattr(ENTITY_OBJECT, "name", ""):
-            if _position_within_nearby_filter(entity_world_position, nearby_filter):
-                template_path = getattr(getattr(ENTITY_OBJECT, "template", None), "layerNode", "")
-                _add_level_import_plan_item(
-                    plan,
-                    "entity_template",
-                    Path(template_path).stem or "Template",
-                    parent_id=entity_id,
-                    repo_path=template_path,
-                    world_position=entity_world_position,
-                )
-            else:
-                _note_nearby_filter_skip(nearby_stats)
-        else:
-            include_root_id = ""
-            include_items_before = len(plan["items"])
-            if template and getattr(template, "includes", None):
-                include_root_id = _add_level_import_plan_item(
-                    plan,
-                    "group",
-                    "INCLUDES",
-                    parent_id=entity_id,
-                    world_position=anchor_position,
-                )
-                for INCLUDE_OBJECT in template.includes:
-                    for inc_entity in getattr(INCLUDE_OBJECT, "Entities", []) or []:
-                        if is_entity_chunk(inc_entity):
-                            _resolve_gameplay_entity_import_plan(
-                                plan,
-                                inc_entity,
-                                parent_id=include_root_id,
-                                parent_position=anchor_position,
-                                keep_lod_meshes=keep_lod_meshes,
-                                mesh_fbx_uncook_path=mesh_fbx_uncook_path,
-                                mesh_uncook_path=mesh_uncook_path,
-                                source_context_path=source_context_path,
-                                **kwargs,
-                            )
-                if len(plan["items"]) == include_items_before + 1:
-                    _remove_level_import_plan_item(plan, include_root_id)
-            for entity in getattr(template, "Entities", []) or []:
-                _resolve_gameplay_entity_import_plan(
-                    plan,
-                    entity,
-                    parent_id=entity_id,
-                    parent_position=anchor_position,
-                    flatten_entity_into_parent=_is_template_preview_entity(entity),
-                    keep_lod_meshes=keep_lod_meshes,
-                    mesh_fbx_uncook_path=mesh_fbx_uncook_path,
-                    mesh_uncook_path=mesh_uncook_path,
-                    source_context_path=source_context_path,
-                    **kwargs,
-                )
+    if getattr(ENTITY_OBJECT, "isCreatedFromTemplate", False) and rich_template_data is None:
+        include_root_id = ""
+        include_items_before = len(plan["items"])
+        if template and getattr(template, "includes", None):
+            include_root_id = _add_level_import_plan_item(
+                plan,
+                "group",
+                "INCLUDES",
+                parent_id=entity_id,
+                world_position=anchor_position,
+            )
+            for INCLUDE_OBJECT in template.includes:
+                for inc_entity in getattr(INCLUDE_OBJECT, "Entities", []) or []:
+                    if is_entity_chunk(inc_entity):
+                        _resolve_gameplay_entity_import_plan(
+                            plan,
+                            inc_entity,
+                            parent_id=include_root_id,
+                            parent_position=anchor_position,
+                            keep_lod_meshes=keep_lod_meshes,
+                            mesh_fbx_uncook_path=mesh_fbx_uncook_path,
+                            mesh_uncook_path=mesh_uncook_path,
+                            source_context_path=(
+                                getattr(INCLUDE_OBJECT, "layerNode", "")
+                                or getattr(template, "layerNode", "")
+                                or source_context_path
+                            ),
+                            **kwargs,
+                        )
+            if len(plan["items"]) == include_items_before + 1:
+                _remove_level_import_plan_item(plan, include_root_id)
+        for entity in getattr(template, "Entities", []) or []:
+            _resolve_gameplay_entity_import_plan(
+                plan,
+                entity,
+                parent_id=entity_id,
+                parent_position=anchor_position,
+                flatten_entity_into_parent=_is_template_preview_entity(entity),
+                keep_lod_meshes=keep_lod_meshes,
+                mesh_fbx_uncook_path=mesh_fbx_uncook_path,
+                mesh_uncook_path=mesh_uncook_path,
+                source_context_path=getattr(template, "layerNode", "") or source_context_path,
+                **kwargs,
+            )
 
     if len(plan["items"]) == items_before_children:
         if flatten_entity_into_parent:
@@ -4273,6 +5876,42 @@ def _resolve_gameplay_entity_import_plan(
         _remove_level_import_plan_item(plan, entity_id)
         return None
     return entity_id
+
+
+def level_entity_resolution_errors(level_data):
+    errors = []
+    seen_errors = set()
+    visited = set()
+
+    def add(message):
+        message = str(message or "").strip()
+        if message and message not in seen_errors:
+            seen_errors.add(message)
+            errors.append(message)
+
+    def visit(level):
+        if level is None or id(level) in visited:
+            return
+        visited.add(id(level))
+        source_path = str(getattr(level, "layerNode", "") or "<memory>")
+        expected = getattr(level, "expectedEntityCount", None)
+        parsed = getattr(level, "parsedEntityCount", None)
+        if expected is not None and parsed is not None and int(expected) != int(parsed):
+            add(f"{source_path}: parsed {int(parsed)}/{int(expected)} entity chunks")
+        for record in getattr(level, "unresolvedDependencies", None) or []:
+            if isinstance(record, dict):
+                path = str(record.get("path", "") or "<missing path>")
+                reason = str(record.get("reason", "") or "dependency could not be loaded")
+                add(f"{source_path}: {path}: {reason}")
+            else:
+                add(f"{source_path}: {record}")
+        for include in getattr(level, "includes", None) or []:
+            visit(include)
+        for entity in getattr(level, "Entities", None) or []:
+            visit(getattr(entity, "template", None))
+
+    visit(level_data)
+    return errors
 
 
 def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = False, **kwargs):
@@ -4290,7 +5929,13 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
     nearby_filter = _get_nearby_import_filter(kwargs)
     nearby_stats = _get_nearby_import_stats(kwargs)
     nearby_stats["filtered"] = 0
+    kwargs.setdefault("_entity_plan_serialized_assets", {})
+    kwargs.setdefault("_entity_plan_prepared_assets", set())
     plan = _new_level_import_plan()
+    if do_import_Entity:
+        resolution_errors = level_entity_resolution_errors(levelData)
+        if resolution_errors:
+            plan["unsupported"] = resolution_errors
     level_version = getattr(levelData, "version", 999)
     mesh_fbx_uncook_path = kwargs.get("_mesh_fbx_uncook_path") or kwargs.get("mesh_fbx_uncook_path")
     mesh_uncook_path = kwargs.get("_mesh_uncook_path") or kwargs.get("mesh_uncook_path")
@@ -4506,7 +6151,7 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
                         keep_lod_meshes=keep_lod_meshes,
                         mesh_fbx_uncook_path=mesh_fbx_uncook_path,
                         mesh_uncook_path=mesh_uncook_path,
-                        source_context_path=source_context_path,
+                        source_context_path=getattr(INCLUDE_OBJECT, "layerNode", "") or source_context_path,
                         **kwargs,
                     )
 
@@ -4527,10 +6172,217 @@ def resolve_level_import_plan(levelData, context = None, keep_lod_meshes:bool = 
     return plan
 
 
+def build_entity_import_plan(
+    asset=None,
+    *,
+    instance=None,
+    selected_appearance="",
+    source_path="",
+    options=None,
+):
+    options = dict(options or {})
+    if selected_appearance:
+        options.setdefault("selected_appearance", selected_appearance)
+    source_path = str(source_path or "").strip()
+    source = instance if instance is not None else asset
+    if source is None:
+        raise ValueError("Entity import requires an asset or instance")
+    is_level_source = bool(
+        hasattr(source, "Foliage")
+        and hasattr(source, "Entities")
+        and hasattr(source, "includes")
+    )
+    is_rich_entity_asset = bool(
+        instance is None
+        and not is_level_source
+        and (
+            source.__class__.__name__ == "Entity"
+            or hasattr(source, "appearances")
+        )
+    )
+
+    if is_rich_entity_asset:
+        plan = _new_level_import_plan("direct")
+        plan["source_path"] = source_path
+        item_id = _add_level_import_plan_item(
+            plan,
+            "entity_asset",
+            Path(source_path.replace("\\", "/")).stem
+            or str(getattr(source, "name", "") or "Entity"),
+            repo_path=source_path,
+            selected_appearance=selected_appearance,
+            entity_class=str(getattr(source, "type", "") or options.get("entity_class", "") or "CEntity"),
+        )
+        item = next(item for item in plan["items"] if item.get("id") == item_id)
+        item["source_path"] = source_path
+        entity_data = _json_safe_plan_value(source)
+        plan_components = []
+        if isinstance(entity_data, dict):
+            entity_data = dict(entity_data)
+            plan_components = list(entity_data.pop("plan_components", []) or [])
+        item["entity_data"] = entity_data
+        if plan_components:
+            entity_root_id = _add_level_import_plan_item(
+                plan,
+                "entity",
+                str(getattr(source, "name", "") or "").strip()
+                or Path(source_path.replace("\\", "/")).stem
+                or "Entity",
+                repo_path=source_path,
+                entity_class=str(
+                    getattr(source, "type", "")
+                    or options.get("entity_class", "")
+                    or "CEntity"
+                ),
+                source_path=source_path,
+            )
+            item["parent_id"] = entity_root_id
+            _add_embedded_entity_plan_components(
+                plan,
+                plan_components,
+                parent_id=entity_root_id,
+            )
+        entity_namespace = str(options.get("entity_namespace", "") or "").strip()
+        if entity_namespace:
+            item["entity_namespace"] = entity_namespace
+        return plan
+
+    if is_level_source:
+        plan = resolve_level_import_plan(
+            source,
+            options.pop("context", None),
+            bool(options.pop("keep_lod_meshes", False)),
+            **options,
+        )
+    else:
+        plan = _new_level_import_plan()
+        _resolve_gameplay_entity_import_plan(
+            plan,
+            source,
+            parent_id=str(options.pop("parent_id", "") or ""),
+            parent_position=options.pop("parent_position", None),
+            instance_world_position=options.pop("instance_world_position", None),
+            flatten_entity_into_parent=bool(options.pop("flatten_entity_into_parent", False)),
+            keep_lod_meshes=bool(options.pop("keep_lod_meshes", False)),
+            mesh_fbx_uncook_path=options.pop("mesh_fbx_uncook_path", None),
+            mesh_uncook_path=options.pop("mesh_uncook_path", None),
+            source_context_path=source_path,
+            **options,
+        )
+    if source_path:
+        plan["source_path"] = source_path
+    return plan
+
+
+def materialize_entity_import_plan(
+    plan,
+    *,
+    context=None,
+    target_collection=None,
+    options=None,
+    layer_context=None,
+    preflight=None,
+):
+    options = dict(options or {})
+    execution_results = options.setdefault("_entity_import_execution_results", {})
+    if str(plan.get("mode", "") or "").strip().lower() == "direct":
+        options["_entity_import_disable_loaded_reuse"] = True
+        options.setdefault("_layer_import_mode_signature", "direct")
+    layer_context = dict(layer_context or {})
+    errors = layer_context.get("errors")
+    if errors is None:
+        errors = []
+
+    preflight_fatal, preflight_item_errors = (
+        preflight if preflight is not None else _entity_import_plan_preflight(plan, deep=False)
+    )
+    if preflight_fatal:
+        errors.extend(preflight_fatal)
+        return EntityImportResult(errors=list(errors))
+    if preflight_item_errors:
+        for messages in preflight_item_errors.values():
+            errors.extend(messages)
+        log.warning(
+            "Skipping %d invalid entity plan item(s): %s",
+            len(preflight_item_errors),
+            _preview_list([m for msgs in preflight_item_errors.values() for m in msgs], limit=4),
+        )
+
+    if context is None:
+        context = bpy.context
+    if target_collection is None:
+        target_collection = _get_active_collection(context)
+    if target_collection is not None:
+        _activate_collection(context, target_collection)
+
+    before = _snapshot_blender_objects()
+    _import_cached_plan_full_items(
+        plan,
+        target_collection,
+        options,
+        context=context,
+        loaded_collection=layer_context.get("loaded_collection"),
+        errors=errors,
+        level_file=str(layer_context.get("level_file", "") or plan.get("source_path", "") or ""),
+        preflight_item_errors=preflight_item_errors,
+    )
+    after = _snapshot_blender_objects()
+    created_objects = [obj for key, obj in after.items() if key not in before]
+    created_ids = set(after).difference(before)
+    root_object = next(
+        (
+            obj for obj in created_objects
+            if getattr(obj, "parent", None) is None
+            or _object_identity(getattr(obj, "parent", None)) not in created_ids
+        ),
+        created_objects[0] if created_objects else None,
+    )
+    direct_result = None
+    if str(plan.get("mode", "") or "").strip().lower() == "direct":
+        direct_result = next(iter(execution_results.values()), None)
+    if isinstance(direct_result, dict):
+        direct_root = direct_result.get("root_object")
+        while direct_root is not None:
+            parent = getattr(direct_root, "parent", None)
+            if parent is None or _object_identity(parent) not in created_ids:
+                break
+            direct_root = parent
+        root_object = direct_root or root_object
+        main_armature = direct_result.get("main_armature")
+    else:
+        main_armature = None
+    if main_armature is None:
+        main_armature = next(
+            (obj for obj in created_objects if str(getattr(obj, "type", "") or "") == "ARMATURE"),
+            None,
+        )
+    created_plan_ids = set()
+    for obj in created_objects:
+        try:
+            item_id = str(obj.get(_LAYER_IMPORT_PLAN_ITEM_PROP, "") or "").strip()
+        except Exception:
+            item_id = ""
+        if item_id:
+            created_plan_ids.add(item_id)
+    materialized_item_ids = [
+        str(item.get("id", "") or "")
+        for item in plan.get("items", []) or []
+        if str(item.get("id", "") or "") in created_plan_ids
+    ]
+    return EntityImportResult(
+        root_object=root_object,
+        main_armature=main_armature,
+        created_objects=created_objects,
+        materialized_item_ids=materialized_item_ids,
+        errors=list(errors),
+    )
+
+
 _REPO_DUPLICATE_CACHE = {
     "scene_key": None,
     "object_count": -1,
     "roots": {},
+    "subtrees": {},
 }
 
 
@@ -4538,6 +6390,7 @@ def _invalidate_duplicate_root_index():
     _REPO_DUPLICATE_CACHE["scene_key"] = None
     _REPO_DUPLICATE_CACHE["object_count"] = -1
     _REPO_DUPLICATE_CACHE["roots"] = {}
+    _REPO_DUPLICATE_CACHE["subtrees"] = {}
 
 
 def _scene_identity(scene):
@@ -4643,13 +6496,14 @@ def _tag_object_tree_for_layer_and_plan(
     owner_tag=None,
     item_id="",
     mode_signature="",
+    objects=None,
 ):
     owner_tag = str(owner_tag or "").strip()
     item_id = str(item_id or "").strip()
     mode_signature = str(mode_signature or "").strip()
     if root_obj is None or (not owner_tag and not item_id):
         return
-    for obj in _iter_object_tree(root_obj):
+    for obj in (objects if objects is not None else _iter_object_tree(root_obj)):
         try:
             if owner_tag:
                 obj[_LAYER_IMPORT_OWNER_PROP] = owner_tag
@@ -4665,10 +6519,10 @@ def _tag_object_tree_for_layer(root_obj, owner_tag=None):
     _tag_object_tree_for_layer_and_plan(root_obj, owner_tag)
 
 
-def _tag_object_tree_as_proxy_mesh(root_obj):
+def _tag_object_tree_as_proxy_mesh(root_obj, objects=None):
     if root_obj is None:
         return
-    for obj in _iter_object_tree(root_obj):
+    for obj in (objects if objects is not None else _iter_object_tree(root_obj)):
         try:
             obj["witcher_layer_proxy_mesh"] = True
             obj["witcher_layer_visibility_kind"] = "proxy_mesh"
@@ -4676,10 +6530,17 @@ def _tag_object_tree_as_proxy_mesh(root_obj):
             continue
 
 
-def _clear_object_tree_proxy_mesh_tags(root_obj):
+def _set_hide_flags(obj, hidden):
+    if obj.hide_viewport != hidden:
+        obj.hide_viewport = hidden
+    if obj.hide_render != hidden:
+        obj.hide_render = hidden
+
+
+def _clear_object_tree_proxy_mesh_tags(root_obj, objects=None):
     if root_obj is None:
         return
-    for obj in _iter_object_tree(root_obj):
+    for obj in (objects if objects is not None else _iter_object_tree(root_obj)):
         try:
             if "witcher_layer_proxy_mesh" in obj:
                 del obj["witcher_layer_proxy_mesh"]
@@ -4689,8 +6550,7 @@ def _clear_object_tree_proxy_mesh_tags(root_obj):
                 del obj["witcher_sector_flags"]
             if "witcher_layer_engine_visible" in obj:
                 del obj["witcher_layer_engine_visible"]
-            obj.hide_viewport = False
-            obj.hide_render = False
+            _set_hide_flags(obj, False)
         except Exception:
             continue
 
@@ -4703,18 +6563,17 @@ def _apply_requested_proxy_helper_visibility(root_obj, kwargs=None):
         try:
             if not bool(obj.get("witcher_apx_collision_proxy", False)):
                 continue
-            obj.hide_viewport = hidden
-            obj.hide_render = hidden
+            _set_hide_flags(obj, hidden)
         except Exception:
             continue
 
 
-def _tag_object_tree_engine_visibility(root_obj, visible, kwargs=None, *, drawable_flags=None, sector_flags=None):
+def _tag_object_tree_engine_visibility(root_obj, visible, kwargs=None, *, drawable_flags=None, sector_flags=None, objects=None):
     if root_obj is None:
         return
     visible = bool(visible)
     drawable_flags_text = _drawable_flags_display_value(drawable_flags) if drawable_flags is not None else None
-    for obj in _iter_object_tree(root_obj):
+    for obj in (objects if objects is not None else _iter_object_tree(root_obj)):
         try:
             obj["witcher_layer_engine_visible"] = visible
             if sector_flags is not None:
@@ -4723,12 +6582,8 @@ def _tag_object_tree_engine_visibility(root_obj, visible, kwargs=None, *, drawab
                 obj["witcher_drawableFlags"] = drawable_flags_text
                 obj["witcher_redkit_drawableFlags"] = drawable_flags_text
                 obj["witcher_drawableFlags_has_DF_IsVisible"] = visible
-            if not visible and _hide_engine_hidden_meshes_enabled(kwargs):
-                obj.hide_viewport = True
-                obj.hide_render = True
-            elif visible and _hide_engine_hidden_meshes_enabled(kwargs):
-                obj.hide_viewport = False
-                obj.hide_render = False
+            if _hide_engine_hidden_meshes_enabled(kwargs):
+                _set_hide_flags(obj, not visible)
         except Exception:
             continue
 
@@ -4850,6 +6705,8 @@ def _ensure_layer_reload_tracking(collection, level_file, context, nearby_filter
         owner_tag,
         fallback_to_all=fallback_to_all,
     )
+    if kwargs["_layer_import_previous_ids"]:
+        kwargs["_entity_import_disable_loaded_reuse"] = True
 
 
 def _finalize_layer_reload_cleanup(collection, kwargs):
@@ -4861,6 +6718,33 @@ def _finalize_layer_reload_cleanup(collection, kwargs):
         _invalidate_duplicate_root_index()
     kwargs["_layer_import_previous_ids"] = set()
     return removed_count
+
+
+def _ensure_resolved_plan_reload_tracking(
+    plan,
+    collection,
+    level_file,
+    context,
+    nearby_filter,
+    dev_empty_only,
+    kwargs,
+):
+    if not str(kwargs.get("_layer_import_plan_hash", "") or "").strip():
+        kwargs["_layer_import_plan_hash"] = entity_import_plan_hash(plan)
+    if kwargs.get("_layer_import_previous_ids"):
+        return
+    kwargs.pop("_layer_import_previous_ids", None)
+    kwargs.pop("_layer_import_incremental", None)
+    mode_signature = str(kwargs.get("_layer_import_mode_signature", "") or "").strip()
+    if not mode_signature:
+        mode_signature = _layer_load_mode_signature(dev_empty_only)
+    if (
+        not dev_empty_only
+        and not _layer_reload_signature_changed(collection, kwargs)
+        and _cached_plan_loaded_item_ids(collection, mode_signature)
+    ):
+        kwargs["_layer_import_incremental"] = True
+    _ensure_layer_reload_tracking(collection, level_file, context, nearby_filter, kwargs)
 
 
 def _find_level_collection(level_path, context=None):
@@ -5001,16 +6885,8 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
     do_import_Mesh = kwargs.get('do_import_Mesh', True)
     do_import_Collision = kwargs.get('do_import_Collision', True)
     do_import_RigidBody = kwargs.get('do_import_RigidBody', True)
-    do_import_PointLight = kwargs.get('do_import_PointLight', True)
-    do_import_SpotLight = kwargs.get('do_import_SpotLight', True)
-    do_import_Entity = kwargs.get('do_import_Entity', True)
-    do_import_ProxyMesh = kwargs.get('do_import_ProxyMesh', False)
-    proxy_filter_active = _proxy_mesh_filter_active(kwargs)
-    do_enable_name_filter = kwargs.get('do_enable_name_filter', False)
-    do_name_filter_regex = kwargs.get('do_name_filter_regex', '')
     dev_empty_only = bool(kwargs.get("_dev_empty_only", False))
     kwargs["_layer_import_profile"] = _new_layer_import_profile()
-    kwargs["_layer_entity_skip_reasons"] = []
 
     if context == None:
         context = bpy.context
@@ -5037,6 +6913,15 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
     if target_collection is None:
         target_collection = _ensure_level_collection(levelFile, context)
     kwargs["_level_target_collection"] = target_collection
+    mode_signature = str(kwargs.get("_layer_import_mode_signature", "") or "").strip()
+    if not mode_signature:
+        mode_signature = _layer_load_mode_signature(dev_empty_only)
+    if (
+        not dev_empty_only
+        and not _layer_reload_signature_changed(target_collection, kwargs)
+        and _cached_plan_loaded_item_ids(target_collection, mode_signature)
+    ):
+        kwargs["_layer_import_incremental"] = True
     _ensure_layer_reload_tracking(target_collection, levelFile, context, nearby_filter, kwargs)
 
     if import_isolation.needs_isolation_session(context):
@@ -5053,9 +6938,6 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
 
     errors = []
     progress_count = 0
-    top_level_entity_total = 0
-    top_level_entity_imported = 0
-    top_level_entity_skipped = []
     _log_layer_import_start(levelFile)
     _set_layer_import_state(target_collection, levelFile, "in_progress")
     _raise_if_layer_import_cancelled(kwargs)
@@ -5084,330 +6966,122 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
                     int(resolved_plan.get("stats", {}).get("total", 0) or 0),
                     time.time() - resolve_started,
                 )
+                _ensure_resolved_plan_reload_tracking(
+                    resolved_plan,
+                    target_collection,
+                    levelFile,
+                    context,
+                    nearby_filter,
+                    True,
+                    kwargs,
+                )
+                _log_entity_plan_unsupported(levelFile, resolved_plan)
+                preflight_fatal, _ = _entity_import_plan_preflight(resolved_plan, deep=False)
+                if preflight_fatal:
+                    raise RuntimeError(
+                        f"Entity plan is not materializable for {levelFile}: "
+                        f"{_preview_list(preflight_fatal, limit=4)}"
+                    )
                 dev_target_collection = (
                     _get_active_collection(context)
                     if import_isolation.is_isolated_import_context(context)
                     else collection
                 )
                 progress_count = _import_plan_as_dev_empties(resolved_plan, dev_target_collection, kwargs)
-            else:
-                if levelData.Foliage:
-                    for treeCollection in (levelData.Foliage.Trees.elements if hasattr(levelData.Foliage, 'Trees') else []):
-                        _raise_if_layer_import_cancelled(kwargs)
-                        treeFilePath = treeCollection.TreeType.DepotPath
-                        for treeTransform in treeCollection.TreeCollection.elements:
-                            _raise_if_layer_import_cancelled(kwargs)
-                            if not _position_within_nearby_filter(
-                                _extract_transform_position(treeTransform),
-                                nearby_filter,
-                            ):
-                                _note_nearby_filter_skip(nearby_stats)
-                                continue
-                            tree_mesh = meshPath(fbx_uncook_path = get_W3_FOLIAGE_PATH(bpy.context))
-                            tree_mesh.meshName = treeFilePath
-                            tree_mesh.transform = treeTransform
-                            tree_mesh.type = "mesh_foliage"
-                            import_single_mesh(tree_mesh, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                            progress_count += 1
-                    for treeCollection in (levelData.Foliage.Grasses.elements if hasattr(levelData.Foliage, 'Grasses') else []):
-                        _raise_if_layer_import_cancelled(kwargs)
-                        treeFilePath = treeCollection.TreeType.DepotPath
-                        for treeTransform in treeCollection.TreeCollection.elements:
-                            _raise_if_layer_import_cancelled(kwargs)
-                            if not _position_within_nearby_filter(
-                                _extract_transform_position(treeTransform),
-                                nearby_filter,
-                            ):
-                                _note_nearby_filter_skip(nearby_stats)
-                                continue
-                            tree_mesh = meshPath(fbx_uncook_path = get_W3_FOLIAGE_PATH(bpy.context))
-                            tree_mesh.meshName = treeFilePath
-                            tree_mesh.transform = treeTransform
-                            tree_mesh.type = "mesh_foliage"
-                            import_single_mesh(tree_mesh, errors, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                            progress_count += 1
-
-                mesh_list = get_CSectorData(
-                    levelData,
-                    mesh_fbx_uncook_path=mesh_fbx_uncook_path,
-                    mesh_uncook_path=mesh_uncook_path or None,
+                _finalize_layer_reload_cleanup(target_collection, kwargs)
+                filtered_count = int(nearby_stats.get("filtered", 0) or 0)
+                _log_layer_import_complete(levelFile, progress_count, errors)
+                mode_signature = str(kwargs.get("_layer_import_mode_signature", "") or "").strip()
+                if not mode_signature:
+                    mode_signature = _layer_load_mode_signature(True)
+                _set_layer_import_state(
+                    target_collection,
+                    levelFile,
+                    "proxy_complete" if not errors and filtered_count <= 0 else "proxy_partial",
+                    progress_count,
+                    len(errors),
+                    filtered_count,
+                    nearby_filter=nearby_filter,
+                    mode_signature=mode_signature,
+                    plan_hash=kwargs.get("_layer_import_plan_hash"),
                 )
-                if mesh_list:
-                    mesh_candidates = []
-                    for mesh in mesh_list:
-                        _raise_if_layer_import_cancelled(kwargs)
-                        mesh_path = _mesh_repo_path(mesh)
-                        if not mesh_path:
-                            raise ValueError("CSectorData item resolved to an empty mesh path")
-                        if not _position_within_nearby_filter(_mesh_world_position(mesh), nearby_filter):
-                            _note_nearby_filter_skip(nearby_stats)
-                            continue
-                        if not (re.search(do_name_filter_regex, mesh.fileName()) if do_enable_name_filter else True):
-                            continue
-                        mesh_candidates.append(mesh)
-
-                    if mesh_candidates:
-                        bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-                        empty_transform = bpy.context.object
-                        empty_transform.name = "CSectorData"
-
-                        bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-                        Collision_transform = bpy.context.object
-                        Collision_transform.name = "Collision"
-                        Collision_transform.parent = empty_transform
-                        bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-                        Rigid_transform = bpy.context.object
-                        Rigid_transform.name = "Rigid"
-                        Rigid_transform.parent = empty_transform
-                        bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-                        Mesh_transform = bpy.context.object
-                        Mesh_transform.name = "Mesh"
-                        Mesh_transform.parent = empty_transform
-                        bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-                        PointLight_transform = bpy.context.object
-                        PointLight_transform.name = "PointLight"
-                        PointLight_transform.parent = empty_transform
-                        bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-                        SpotLight_transform = bpy.context.object
-                        SpotLight_transform.name = "SpotLight"
-                        SpotLight_transform.parent = empty_transform
-
-                        total_loops = len(mesh_candidates)
-                        instanced_sector = bool(kwargs.get("instanced_sector", False))
-
-                        if instanced_sector:
-                            # Group Mesh/RigidBody placements by repo_path, build one instancer per type.
-                            # Lights and proxy meshes are still imported individually.
-                            # Key: (kind_str, repo_path) → list of transforms + source_kind tag.
-                            instancer_groups = {}
-                            mesh: meshPath
-                            for idx, mesh in enumerate(mesh_candidates):
-                                _raise_if_layer_import_cancelled(kwargs)
-                                mesh_path = _mesh_repo_path(mesh)
-                                if not mesh_path:
-                                    raise ValueError("CSectorData item resolved to an empty mesh path")
-                                is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(mesh_path, "")
-                                selected_cmesh_chunk_index = _embedded_cmesh_chunk_index(mesh)
-                                if (
-                                    mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
-                                    and not is_proxy_mesh and do_import_Mesh
-                                    and selected_cmesh_chunk_index is None
-                                ):
-                                    rp = mesh_path
-                                    if rp:
-                                        tv = _extract_vector_position(getattr(mesh, "translation", None))
-                                        t = list(tv) if tv else [0.0, 0.0, 0.0]
-                                        m = _copy_matrix_array(getattr(mesh, "matrix", None))
-                                        m = [list(r) for r in m] if m else None
-                                        vis_key = _sector_visibility_key_from_flags(getattr(mesh, "sector_flags", None), default=True)
-                                        instancer_groups.setdefault(("mesh", rp, vis_key), []).append({"t": t, "m": m})
-                                elif (
-                                    mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
-                                    and not is_proxy_mesh and do_import_Mesh
-                                ):
-                                    import_single_mesh(
-                                        mesh,
-                                        errors,
-                                        Mesh_transform,
-                                        keep_lod_meshes=keep_lod_meshes,
-                                        **kwargs,
-                                    )
-                                elif (
-                                    mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
-                                    and is_proxy_mesh and proxy_filter_active and do_import_ProxyMesh
-                                ):
-                                    import_single_mesh(
-                                        mesh, errors, Mesh_transform,
-                                        keep_lod_meshes=keep_lod_meshes or bool(kwargs.get("keep_proxy_meshes", True)),
-                                        **kwargs,
-                                    )
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody and selected_cmesh_chunk_index is None:
-                                    rp = mesh_path
-                                    if rp:
-                                        tv = _extract_vector_position(getattr(mesh, "translation", None))
-                                        t = list(tv) if tv else [0.0, 0.0, 0.0]
-                                        m = _copy_matrix_array(getattr(mesh, "matrix", None))
-                                        m = [list(r) for r in m] if m else None
-                                        vis_key = _sector_visibility_key_from_flags(getattr(mesh, "sector_flags", None), default=True)
-                                        instancer_groups.setdefault(("rigid", rp, vis_key), []).append({"t": t, "m": m})
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
-                                    import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision and selected_cmesh_chunk_index is None:
-                                    rp = mesh_path
-                                    if rp:
-                                        tv = _extract_vector_position(getattr(mesh, "translation", None))
-                                        t = list(tv) if tv else [0.0, 0.0, 0.0]
-                                        m = _copy_matrix_array(getattr(mesh, "matrix", None))
-                                        m = [list(r) for r in m] if m else None
-                                        instancer_groups.setdefault(("collision", rp, ""), []).append({"t": t, "m": m})
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
-                                    _import_sector_collision_from_cache(mesh, errors, Collision_transform, **kwargs)
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
-                                    import_light(mesh, PointLight_transform)
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.SpotLight and do_import_SpotLight:
-                                    import_light(mesh, SpotLight_transform)
-                                progress_count += 1
-
-                            active_coll = getattr(bpy.context, "collection", None) or collection
-                            owner_tag = kwargs.get("_layer_import_owner")
-                            mode_sig = str(kwargs.get("_layer_import_mode_signature", "") or "")
-                            instancer_parent_by_kind = {
-                                "mesh": Mesh_transform,
-                                "rigid": Rigid_transform,
-                                "rigid_body": Rigid_transform,
-                                "collision": Collision_transform,
-                            }
-                            for si_idx, ((si_kind, rp, vis_key), transforms) in enumerate(instancer_groups.items()):
-                                _raise_if_layer_import_cancelled(kwargs)
-                                synthetic_item = {
-                                    "id": f"si_{si_idx}",
-                                    "repo_path": rp,
-                                    "sector_transforms": transforms,
-                                    "_source_kind": si_kind,
-                                    "sector_visibility_key": vis_key,
-                                    "sector_visible": vis_key != "hidden",
-                                }
-                                _import_cached_plan_sector_instancer_item(
-                                    synthetic_item,
-                                    active_coll,
-                                    instancer_parent_by_kind.get(si_kind, Mesh_transform),
-                                    owner_tag,
-                                    f"si_{si_idx}", mode_sig,
-                                    kwargs, errors, context=context,
-                                )
-                        else:
-                            mesh: meshPath
-                            for idx, mesh in enumerate(mesh_candidates):
-                                _raise_if_layer_import_cancelled(kwargs)
-                                mesh_path = _mesh_repo_path(mesh)
-                                if not mesh_path:
-                                    raise ValueError("CSectorData item resolved to an empty mesh path")
-                                progress_msg = f"{idx+1}/{total_loops} - {os.path.basename(mesh_path)}"
-                                is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(mesh_path, "")
-                                if (
-                                    mesh.BlockDataObjectType == Enums.BlockDataObjectType.Mesh
-                                    and ((is_proxy_mesh and proxy_filter_active and do_import_ProxyMesh) or ((not is_proxy_mesh or not proxy_filter_active) and do_import_Mesh))
-                                ):
-                                    import_single_mesh(
-                                        mesh,
-                                        errors,
-                                        Mesh_transform,
-                                        keep_lod_meshes=keep_lod_meshes or (is_proxy_mesh and bool(kwargs.get("keep_proxy_meshes", True))),
-                                        **kwargs,
-                                    )
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.Collision and do_import_Collision:
-                                    _import_sector_collision_from_cache(mesh, errors, Collision_transform, **kwargs)
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.RigidBody and do_import_RigidBody:
-                                    import_single_mesh(mesh, errors, Rigid_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.PointLight and do_import_PointLight:
-                                    import_light(mesh, PointLight_transform)
-                                elif mesh.BlockDataObjectType == Enums.BlockDataObjectType.SpotLight and do_import_SpotLight:
-                                    import_light(mesh, SpotLight_transform)
-                                progress_count += 1
-                                progress_msg += " " * (80 - len(progress_msg))
-                                log.info(progress_msg)
-
-                        _tag_object_tree_for_layer(
-                            empty_transform,
-                            kwargs.get("_layer_import_owner"),
-                        )
-
-                if do_import_Entity:
-                    for INCLUDE_OBJECT in levelData.includes:
-                        _raise_if_layer_import_cancelled(kwargs)
-                        for ENTITY_OBJECT in INCLUDE_OBJECT.Entities:
-                            _raise_if_layer_import_cancelled(kwargs)
-                            if is_entity_chunk(ENTITY_OBJECT):
-                                imported_entity = import_gameplay_entity(
-                                    ENTITY_OBJECT,
-                                    errors,
-                                    keep_lod_meshes = keep_lod_meshes,
-                                    **kwargs,
-                                )
-                                if imported_entity is not None:
-                                    progress_count += 1
-
-                    top_level_entity_total = sum(
-                        1 for entity in levelData.Entities
-                        if is_entity_chunk(entity)
+                return {'FINISHED'}
+            else:
+                shared_plan = None
+                try:
+                    plan_options = dict(kwargs)
+                    plan_options["context"] = context
+                    plan_options["keep_lod_meshes"] = keep_lod_meshes
+                    shared_plan = build_entity_import_plan(
+                        levelData,
+                        source_path=levelFile,
+                        options=plan_options,
                     )
-                    total_loops = len(levelData.Entities)
-                    for idx, ENTITY_OBJECT in enumerate(levelData.Entities):
-                        _raise_if_layer_import_cancelled(kwargs)
-                        name_matches = (
-                            bool(re.search(do_name_filter_regex, ENTITY_OBJECT.name))
-                            if do_enable_name_filter else True
+                except LayerImportCancelled:
+                    raise
+                except Exception as exc:
+                    raise RuntimeError(f"Could not build entity import plan for {levelFile}: {exc}") from exc
+
+                _ensure_resolved_plan_reload_tracking(
+                    shared_plan,
+                    target_collection,
+                    levelFile,
+                    context,
+                    nearby_filter,
+                    False,
+                    kwargs,
+                )
+                _log_entity_plan_unsupported(levelFile, shared_plan)
+                plan_preflight = _entity_import_plan_preflight(shared_plan, deep=False)
+                preflight_fatal = plan_preflight[0]
+                if not preflight_fatal:
+                    import_target_collection = (
+                        _get_active_collection(context)
+                        if import_isolation.is_isolated_import_context(context)
+                        else collection
+                    )
+                    result = materialize_entity_import_plan(
+                        shared_plan,
+                        context=context,
+                        target_collection=import_target_collection,
+                        options=kwargs,
+                        layer_context={
+                            "loaded_collection": target_collection,
+                            "errors": errors,
+                            "level_file": levelFile,
+                        },
+                        preflight=plan_preflight,
+                    )
+                    progress_count = len(result.materialized_item_ids)
+                    if result.errors and not result.created_objects:
+                        raise RuntimeError(
+                            f"Entity plan materialization failed for {levelFile}: "
+                            f"{_preview_list(result.errors, limit=4)}"
                         )
-                        if name_matches:
-                            progress_msg = f"{idx+1}/{total_loops} - {ENTITY_OBJECT.name}"
-                            if is_entity_chunk(ENTITY_OBJECT):
-                                imported_entity = import_gameplay_entity(
-                                    ENTITY_OBJECT,
-                                    errors,
-                                    keep_lod_meshes = keep_lod_meshes,
-                                    **kwargs,
-                                )
-                                if imported_entity is not None:
-                                    top_level_entity_imported += 1
-                                    progress_count += 1
-                                    progress_msg += " " * (80 - len(progress_msg))
-                                    log.info(progress_msg)
-                                else:
-                                    top_level_entity_skipped.append(_layer_entity_label(ENTITY_OBJECT))
-        _finalize_layer_reload_cleanup(target_collection, kwargs)
-        filtered_count = int(nearby_stats.get("filtered", 0) or 0)
-        if (
-            do_import_Entity
-            and not dev_empty_only
-            and top_level_entity_total > 0
-            and top_level_entity_imported < top_level_entity_total
-        ):
-            skipped_preview = _preview_list(top_level_entity_skipped) or "none recorded"
-            skip_reasons = kwargs.get("_layer_entity_skip_reasons") or []
-            if do_enable_name_filter or nearby_filter:
-                log.info(
-                    "Layer entity import filtered for %s: imported %d/%d top-level entities. Not imported: %s",
-                    levelFile,
-                    top_level_entity_imported,
-                    top_level_entity_total,
-                    skipped_preview,
-                )
-            else:
-                log.warning(
-                    "Layer entity import incomplete for %s: imported %d/%d top-level entities. Not imported: %s",
-                    levelFile,
-                    top_level_entity_imported,
-                    top_level_entity_total,
-                    skipped_preview,
-                )
-                if skip_reasons:
-                    log.warning(
-                        "Layer entity import skip reasons for %s: %s",
+                    _finalize_layer_reload_cleanup(target_collection, kwargs)
+                    filtered_count = int(nearby_stats.get("filtered", 0) or 0)
+                    _log_layer_import_complete(levelFile, progress_count, result.errors)
+                    _log_layer_import_profile_summary(levelFile, kwargs)
+                    mode_signature = str(kwargs.get("_layer_import_mode_signature", "") or "").strip()
+                    if not mode_signature:
+                        mode_signature = _layer_load_mode_signature(False)
+                    _set_layer_import_state(
+                        target_collection,
                         levelFile,
-                        _preview_list(skip_reasons, limit=8),
+                        "complete" if not result.errors and filtered_count <= 0 else "partial",
+                        progress_count,
+                        len(result.errors),
+                        filtered_count,
+                        nearby_filter=nearby_filter,
+                        mode_signature=mode_signature,
+                        plan_hash=kwargs.get("_layer_import_plan_hash"),
                     )
-        _log_layer_import_complete(levelFile, progress_count, errors)
-        if not dev_empty_only:
-            _log_layer_import_profile_summary(levelFile, kwargs)
-        mode_signature = str(kwargs.get("_layer_import_mode_signature", "") or "").strip()
-        if not mode_signature:
-            mode_signature = _layer_load_mode_signature(dev_empty_only)
-        _set_layer_import_state(
-            target_collection,
-            levelFile,
-            (
-                "proxy_complete" if dev_empty_only and not errors and filtered_count <= 0
-                else "proxy_partial" if dev_empty_only
-                else "complete" if not errors and filtered_count <= 0
-                else "partial"
-            ),
-            progress_count,
-            len(errors),
-            filtered_count,
-            nearby_filter=nearby_filter,
-            mode_signature=mode_signature,
-            plan_hash=kwargs.get("_layer_import_plan_hash"),
-        )
+                    return {'FINISHED'}
+                raise RuntimeError(
+                    f"Entity plan is not materializable for {levelFile}: "
+                    f"{_preview_list(preflight_fatal, limit=4)}"
+                )
+
     except LayerImportCancelled:
         filtered_count = int(nearby_stats.get("filtered", 0) or 0)
         _set_layer_import_state(
@@ -5430,21 +7104,7 @@ def loadLevel(levelData, context = None, keep_lod_meshes:bool = False, **kwargs)
             filtered_count,
         )
         raise
-        # for idx, ENTITY_OBJECT in enumerate(levelData.meshes):
-        #     if ENTITY_OBJECT.type == "Mesh": #A SINGLE MESH WITH NO COMPONENTS
-        #         import_single_mesh(ENTITY_OBJECT, errors, **kwargs)
-        #         #log.info(idx, ENTITY_OBJECT.translation.x,ENTITY_OBJECT.translation.y,ENTITY_OBJECT.translation.z)
-        #     if ENTITY_OBJECT.type == "CGameplayEntity" or ENTITY_OBJECT.type == "CSectorData": #A ENTITY WITH A TRANSFORM AND LIST OF MESH/LIGHTS
-        #         import_gameplay_entity(ENTITY_OBJECT, errors)
-        #     if ENTITY_OBJECT.type == "CEntity": # A MESH WITH COMPONENTS
-        #         bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-        #         Entity_transform = bpy.context.object
-        #         Entity_transform.name = ENTITY_OBJECT.meshName #"CGameplayEntity_empty_transform"
-        #         for comp in ENTITY_OBJECT.components:
-        #             import_gameplay_entity(comp, errors, Entity_transform)
-        #         set_blender_object_transform(Entity_transform, ENTITY_OBJECT.transform)
-    
-        
+
     #! #################
     #!     #PROFILER
     #! #################
@@ -5534,24 +7194,36 @@ def loadLevelFromCachedPlan(level_file, plan_items, context=None, **kwargs):
             nearby_stats,
         )
         plan = {
+            "mode": "cached_layer",
             "items": filtered_items,
             "stats": {"total": len(filtered_items), "filtered": 0, "by_kind": {}},
         }
+        plan_preflight = _entity_import_plan_preflight(plan, deep=False)
+        preflight_fatal = plan_preflight[0]
+        if preflight_fatal:
+            raise RuntimeError(
+                f"Cached entity plan is not materializable for {level_file}: "
+                f"{_preview_list(preflight_fatal, limit=4)}"
+            )
         import_target_collection = (
             _get_active_collection(context)
             if import_isolation.is_isolated_import_context(context)
             else target_collection
         )
         if not dev_empty_only:
-            progress_count = _import_cached_plan_full_items(
+            result = materialize_entity_import_plan(
                 plan,
-                import_target_collection,
-                kwargs,
                 context=context,
-                loaded_collection=target_collection,
-                errors=errors,
-                level_file=level_file,
+                target_collection=import_target_collection,
+                options=kwargs,
+                layer_context={
+                    "loaded_collection": target_collection,
+                    "errors": errors,
+                    "level_file": level_file,
+                },
+                preflight=plan_preflight,
             )
+            progress_count = len(result.materialized_item_ids)
         else:
             progress_count = _import_plan_as_dev_empties(plan, import_target_collection, kwargs)
 
@@ -5606,6 +7278,25 @@ _DEFERRED_MATERIALS_PAUSED = False
 _DEFERRED_MATERIAL_MAX_ATTEMPTS = 10
 _DEFERRED_MATERIAL_ERROR_PROP = "witcher_materials_deferred_error"
 _DEFERRED_MATERIAL_EXHAUSTED_PROP = "witcher_materials_retry_exhausted"
+_DEFERRED_MATERIAL_BURST = False
+_DEFERRED_MATERIAL_TICK_BUDGET = 0.3
+_DEFERRED_MATERIAL_BURST_BUDGET = 1.5
+_DEFERRED_MATERIAL_STATS = {"entries_done": 0, "objects_done": 0, "seconds": 0.0, "slowest_path": "", "slowest_seconds": 0.0}
+
+
+def set_deferred_material_burst(enabled):
+    global _DEFERRED_MATERIAL_BURST
+    _DEFERRED_MATERIAL_BURST = bool(enabled)
+
+
+def reset_deferred_material_stats():
+    _DEFERRED_MATERIAL_STATS.update(
+        {"entries_done": 0, "objects_done": 0, "seconds": 0.0, "slowest_path": "", "slowest_seconds": 0.0}
+    )
+
+
+def deferred_material_stats():
+    return dict(_DEFERRED_MATERIAL_STATS)
 
 
 def set_deferred_materials_paused(paused):
@@ -5672,6 +7363,10 @@ def _resolve_deferred_mesh_path(path, repo_path):
 
 def deferred_material_queue_size():
     return sum(len(entry[2]) for entry in _DEFERRED_MATERIAL_QUEUE)
+
+
+def deferred_material_entry_count():
+    return len(_DEFERRED_MATERIAL_QUEUE)
 
 
 def replace_deferred_queue_objects(old_names, new_name):
@@ -5769,9 +7464,11 @@ def _deferred_material_tick():
         return 0.5
     from ..materials.nodes.domain import suspend_witcher_include_layout
     started = time.perf_counter()
+    budget = _DEFERRED_MATERIAL_BURST_BUDGET if _DEFERRED_MATERIAL_BURST else _DEFERRED_MATERIAL_TICK_BUDGET
     retry_delay = False
     with suspend_witcher_include_layout():
-        while _DEFERRED_MATERIAL_QUEUE and time.perf_counter() - started < 0.3:
+        while _DEFERRED_MATERIAL_QUEUE and time.perf_counter() - started < budget:
+            entry_started = time.perf_counter()
             entry = _DEFERRED_MATERIAL_QUEUE[0]
             path, chunk_idx, names = entry[0], entry[1], entry[2]
             repo_path = entry[3] if len(entry) > 3 else ""
@@ -5818,6 +7515,20 @@ def _deferred_material_tick():
                 obj.pop(_DEFERRED_MATERIAL_ERROR_PROP, None)
                 obj.pop(_DEFERRED_MATERIAL_EXHAUSTED_PROP, None)
             _DEFERRED_MATERIAL_DONE += 1
+            entry_seconds = time.perf_counter() - entry_started
+            _DEFERRED_MATERIAL_STATS["entries_done"] += 1
+            _DEFERRED_MATERIAL_STATS["objects_done"] += len(objs)
+            _DEFERRED_MATERIAL_STATS["seconds"] += entry_seconds
+            if entry_seconds > _DEFERRED_MATERIAL_STATS["slowest_seconds"]:
+                _DEFERRED_MATERIAL_STATS["slowest_seconds"] = entry_seconds
+                _DEFERRED_MATERIAL_STATS["slowest_path"] = str(repo_path or resolved or path)
+            if entry_seconds >= 1.0:
+                log.info(
+                    "[deferred-material-profile] %s took %.3fs (%d objects)",
+                    repo_path or resolved or path,
+                    entry_seconds,
+                    len(objs),
+                )
     remaining = len(_DEFERRED_MATERIAL_QUEUE)
     _tag_view3d_redraw()
     if not remaining:
@@ -5843,40 +7554,32 @@ def _deferred_material_tick():
     _set_deferred_status(f"Witcher: streaming materials — {target_count} meshes remaining")
     if _DEFERRED_MATERIAL_DONE % 100 == 0:
         log.info("Deferred material streaming: %d done, %d targets remaining", _DEFERRED_MATERIAL_DONE, target_count)
-    return 0.5 if retry_delay else 0.05
+    if retry_delay:
+        return 0.5
+    return 0.01 if _DEFERRED_MATERIAL_BURST else 0.05
 
 
-def queue_missing_scene_materials():
-    groups = {}
-    for obj in bpy.data.objects:
-        if getattr(obj, "type", "") != 'MESH':
-            continue
-        ready = import_mesh.witcher_mesh_materials_ready(obj, repair_vertex_color=True)
-        if not obj.get("witcher_materials_pending", False):
-            continue
-        if obj.get(_DEFERRED_MATERIAL_EXHAUSTED_PROP, False):
-            continue
-        if ready:
-            obj.pop("witcher_materials_pending", None)
-            continue
-        mat = next((
-            candidate for candidate in obj.data.materials
-            if candidate is not None and candidate.get("w3_source_material_name") is not None
-        ), None)
-        src = str(
-            obj.get("witcher_resolved_mesh_path", "")
-            or obj.get("repo_path", "")
-            or (obj.parent.get("repo_path", "") if obj.parent is not None else "")
-            or (mat.get("w3_source_mesh_path", "") if mat is not None else "")
-            or ""
-        )
-        if not src:
-            continue
-        chunk = obj.get("witcher_embedded_cmesh_chunk_index")
-        if chunk is None and obj.parent is not None:
-            chunk = obj.parent.get("witcher_embedded_cmesh_chunk_index")
-        key = (src, int(chunk) if chunk is not None else None)
-        groups.setdefault(key, []).append(obj)
+def _deferred_material_source_for_object(obj):
+    mat = next((
+        candidate for candidate in obj.data.materials
+        if candidate is not None and candidate.get("w3_source_material_name") is not None
+    ), None)
+    src = str(
+        obj.get("witcher_resolved_mesh_path", "")
+        or obj.get("repo_path", "")
+        or (obj.parent.get("repo_path", "") if obj.parent is not None else "")
+        or (mat.get("w3_source_mesh_path", "") if mat is not None else "")
+        or ""
+    )
+    if not src:
+        return None
+    chunk = obj.get("witcher_embedded_cmesh_chunk_index")
+    if chunk is None and obj.parent is not None:
+        chunk = obj.parent.get("witcher_embedded_cmesh_chunk_index")
+    return (src, int(chunk) if chunk is not None else None)
+
+
+def _queue_deferred_material_groups(groups):
     queued = 0
     for (src, chunk), objs in groups.items():
         src_clean = _strip_win_prefix(src)
@@ -5888,6 +7591,40 @@ def queue_missing_scene_materials():
         queue_deferred_mesh_materials(resolved, chunk, objs, repo_path=src_clean)
         queued += len(_DEFERRED_MATERIAL_QUEUE) - before
     return queued
+
+
+def queue_deferred_materials_for_objects(objects):
+    groups = {}
+    for obj in objects or []:
+        if getattr(obj, "type", "") != 'MESH':
+            continue
+        if import_mesh.witcher_mesh_materials_ready(obj, repair_vertex_color=False):
+            continue
+        key = _deferred_material_source_for_object(obj)
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(obj)
+    return _queue_deferred_material_groups(groups)
+
+
+def queue_missing_scene_materials():
+    groups = {}
+    for obj in bpy.data.objects:
+        if getattr(obj, "type", "") != 'MESH':
+            continue
+        if not obj.get("witcher_materials_pending", False):
+            continue
+        if obj.get(_DEFERRED_MATERIAL_EXHAUSTED_PROP, False):
+            continue
+        ready = import_mesh.witcher_mesh_materials_ready(obj, repair_vertex_color=True)
+        if ready:
+            obj.pop("witcher_materials_pending", None)
+            continue
+        key = _deferred_material_source_for_object(obj)
+        if key is None:
+            continue
+        groups.setdefault(key, []).append(obj)
+    return _queue_deferred_material_groups(groups)
 
 
 def ensure_deferred_material_timer():
@@ -5915,6 +7652,11 @@ def _resume_deferred_materials_on_load(_filepath):
     _DEFERRED_MATERIAL_QUEUE.clear()
     _DEFERRED_MATERIAL_DONE = 0
     _DEFERRED_MATERIALS_PAUSED = False
+    try:
+        from ..materials.material import invalidate_find_material_index
+        invalidate_find_material_index()
+    except Exception:
+        pass
     for obj in getattr(bpy.data, "objects", ()):
         if getattr(obj, "type", "") == 'MESH' and obj.get("witcher_materials_pending", False):
             obj.pop(_DEFERRED_MATERIAL_ERROR_PROP, None)
@@ -6004,7 +7746,40 @@ def _rebuild_duplicate_root_index(scene=None):
     _REPO_DUPLICATE_CACHE["scene_key"] = _scene_identity(scene)
     _REPO_DUPLICATE_CACHE["object_count"] = len(scene.objects) if scene is not None else -1
     _REPO_DUPLICATE_CACHE["roots"] = roots
+    _REPO_DUPLICATE_CACHE["subtrees"] = {}
     return roots
+
+
+def _record_duplicate_root_subtree(root_obj, subtree):
+    root_id = _object_identity(root_obj)
+    if root_id is None or not subtree:
+        return
+    ordered = [root_obj] + [obj for obj in subtree if obj is not root_obj]
+    _REPO_DUPLICATE_CACHE["subtrees"][root_id] = ordered
+
+
+def _duplicate_root_subtree(source_root):
+    root_id = _object_identity(source_root)
+    cached = _REPO_DUPLICATE_CACHE["subtrees"].get(root_id)
+    if cached is not None:
+        ids = {root_id}
+        valid = True
+        for obj in cached:
+            if not _is_live_blender_object(obj):
+                valid = False
+                break
+            ids.add(_object_identity(obj))
+        if valid:
+            for obj in cached[1:]:
+                if _object_identity(getattr(obj, "parent", None)) not in ids:
+                    valid = False
+                    break
+        if valid:
+            return list(cached)
+        _REPO_DUPLICATE_CACHE["subtrees"].pop(root_id, None)
+    subtree = [source_root] + list(getattr(source_root, "children_recursive", None) or [])
+    _REPO_DUPLICATE_CACHE["subtrees"][root_id] = list(subtree)
+    return subtree
 
 
 def _get_duplicate_root_index(scene=None):
@@ -6029,12 +7804,16 @@ def _touch_duplicate_root_index(scene=None):
         _REPO_DUPLICATE_CACHE["object_count"] = max(cached_object_count, object_count)
 
 
-def _record_duplicate_root(obj, scene=None):
+def _record_duplicate_root(obj, scene=None, subtree=None):
+    if subtree is not None:
+        _record_duplicate_root_subtree(obj, subtree)
     scene = scene or _get_scene()
     if scene is None:
         return
     if _REPO_DUPLICATE_CACHE["scene_key"] != _scene_identity(scene):
         _rebuild_duplicate_root_index(scene)
+        if subtree is not None:
+            _record_duplicate_root_subtree(obj, subtree)
         return
     object_count = len(scene.objects)
     cached_object_count = int(_REPO_DUPLICATE_CACHE.get("object_count", -1))
@@ -6062,7 +7841,7 @@ def _remap_object_reference(owner, attr_name, clone_by_id):
         return
 
 
-def _clone_duplicate_hierarchy(source_root, target_collection=None, *, remap_links=True):
+def _clone_duplicate_hierarchy(source_root, target_collection=None, *, remap_links=True, collect=None):
     if not _is_duplicate_root_candidate(source_root):
         return None
     target_collection = target_collection or _get_active_collection()
@@ -6074,7 +7853,7 @@ def _clone_duplicate_hierarchy(source_root, target_collection=None, *, remap_lin
     source_basis_matrices = {}
     source_parent_inverses = {}
     try:
-        source_objects = [source_root] + list(getattr(source_root, "children_recursive", []) or [])
+        source_objects = _duplicate_root_subtree(source_root)
     except ReferenceError:
         return None
     for source_obj in source_objects:
@@ -6134,10 +7913,12 @@ def _clone_duplicate_hierarchy(source_root, target_collection=None, *, remap_lin
                 local_matrix,
                 source_parent_inverses.get(source_id),
             )
+    if collect is not None:
+        collect.extend(clone_obj for _source_obj, clone_obj in clone_pairs)
     return new_root
 
 
-def check_if_empty_already_in_scene(repo_path, *, fast_static_clone=False):
+def check_if_empty_already_in_scene(repo_path, *, fast_static_clone=False, collect=None):
     scene = _get_scene()
     repo_path = str(repo_path or "").strip()
     if not repo_path:
@@ -6158,6 +7939,7 @@ def check_if_empty_already_in_scene(repo_path, *, fast_static_clone=False):
         source_root,
         _get_active_collection(),
         remap_links=not bool(fast_static_clone),
+        collect=collect,
     )
     if new_obj is None:
         return False
@@ -6230,6 +8012,7 @@ def _import_foliage_mesh(mesh: meshPath):
                 use_custom_grouping = bool(getattr(prefs, "ab_srt_custom_grouping", True))
                 lod0_only = bool(getattr(prefs, "ab_srt_lod0_only", True))
 
+                step_started = time.perf_counter()
                 srt_snapshot = _snapshot_srt_import_state(context) if use_custom_grouping else {}
                 tex_stats = _export_srt_textures_for_import(
                     context, srt_path, mesh.meshName, loadmods=False,
@@ -6237,10 +8020,25 @@ def _import_foliage_mesh(mesh: meshPath):
                 import_path = tex_stats.get("import_path") or srt_path
                 if lod0_only:
                     import_path = _prepare_srt_lod0_json(import_path)
-                result = getattr(bpy.ops, "import").srt_json(filepath=import_path)
+                prep_seconds = time.perf_counter() - step_started
+                from ..cloth.importer import surgical_external_joins
+                step_started = time.perf_counter()
+                with surgical_external_joins():
+                    result = getattr(bpy.ops, "import").srt_json(filepath=import_path)
+                op_seconds = time.perf_counter() - step_started
                 if 'FINISHED' in result:
+                    step_started = time.perf_counter()
                     if use_custom_grouping:
                         _flatten_srt_import_collections(context, import_path, srt_snapshot)
+                    flatten_seconds = time.perf_counter() - step_started
+                    if prep_seconds + op_seconds + flatten_seconds >= 0.25:
+                        log.info(
+                            "[foliage] srt %s: prep %.2fs, import %.2fs, flatten %.2fs",
+                            os.path.basename(srt_path),
+                            prep_seconds,
+                            op_seconds,
+                            flatten_seconds,
+                        )
                     return
                 log.warning("SRT import failed for %s, falling back to FBX", mesh.meshName)
             else:
@@ -6286,9 +8084,11 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
     backend = "reuse"
     reused_existing = False
 
+    reuse_clones = []
     obj = check_if_empty_already_in_scene(
         scene_repo_key,
         fast_static_clone=bool(kwargs.get("_cached_plan_fast_static_clone", False)),
+        collect=reuse_clones,
     )
     # if keep_lod_meshes:
     #     obj = check_if_empty_already_in_scene(mesh.meshName)
@@ -6312,12 +8112,14 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
                 log.error(message)
                 _append_import_error(errors, message)
                 raise FileNotFoundError(message)
-        # if keep_lod_meshes:
-        #     bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-        #     obj = bpy.context.object
-        pre_selected_ids = {obj.as_pointer() for obj in bpy.context.selected_objects[:]}
-        bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-        obj = bpy.context.object
+        for prev_selected in bpy.context.selected_objects:
+            prev_selected.select_set(False)
+        pre_selected_ids = set()
+        obj = bpy.data.objects.new("Empty", None)
+        obj.empty_display_type = 'PLAIN_AXES'
+        (_get_active_collection() or bpy.context.scene.collection).objects.link(obj)
+        obj.select_set(True)
+        bpy.context.view_layer.objects.active = obj
         defer_mats = False
         try:
             import_started = time.perf_counter()
@@ -6390,7 +8192,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
             #     obj['repo_path'] = mesh.meshName
             #apply scale
             bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
-            _record_duplicate_root(obj)
+            _record_duplicate_root(obj, subtree=objs)
             if defer_mats:
                 queue_deferred_mesh_materials(resolved_cr2w_path, embedded_cmesh_chunk_index, objs, repo_path=mesh_name)
             finalize_seconds = time.perf_counter() - finalize_started
@@ -6400,6 +8202,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
             return
     else:
         reused_existing = True
+    tree_objects = (reuse_clones or None) if reused_existing else objs
     if parent_transform:
         try:
             root_local_matrix = obj.matrix_local.copy()
@@ -6407,7 +8210,12 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
             root_local_matrix = None
         child_local_matrices = []
         try:
-            for child in list(getattr(obj, "children", []) or []):
+            children_iter = (
+                [o for o in tree_objects if o is not obj and o.parent == obj]
+                if tree_objects is not None
+                else list(getattr(obj, "children", []) or [])
+            )
+            for child in children_iter:
                 child_local_matrices.append((child, child.matrix_local.copy()))
         except Exception:
             child_local_matrices = []
@@ -6489,15 +8297,16 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
         kwargs.get("_layer_import_owner"),
         kwargs.get("_layer_import_plan_item_id"),
         kwargs.get("_layer_import_plan_mode"),
+        objects=tree_objects,
     )
     is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(getattr(mesh, "meshName", ""), "")
     if is_proxy_mesh:
-        _tag_object_tree_as_proxy_mesh(obj)
+        _tag_object_tree_as_proxy_mesh(obj, objects=tree_objects)
     elif (
         bool(obj.get("witcher_layer_proxy_mesh", False))
         or str(obj.get("witcher_layer_visibility_kind", "") or "").strip().lower() == "proxy_mesh"
     ):
-        _clear_object_tree_proxy_mesh_tags(obj)
+        _clear_object_tree_proxy_mesh_tags(obj, objects=tree_objects)
     sector_flags = getattr(mesh, "sector_flags", None)
     if sector_flags is not None:
         try:
@@ -6506,6 +8315,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
                 _sector_mesh_visible_from_flags(sector_flags, default=True),
                 kwargs,
                 sector_flags=sector_flags,
+                objects=tree_objects,
             )
         except Exception:
             pass
@@ -6516,6 +8326,7 @@ def import_single_mesh(mesh:meshPath, errors, parent_transform = False, keep_lod
                 bool(getattr(mesh, "engine_visible")),
                 kwargs,
                 drawable_flags=getattr(mesh, "drawable_flags", None) if hasattr(mesh, "drawable_flags") else None,
+                objects=tree_objects,
             )
         except Exception:
             pass
@@ -6563,14 +8374,24 @@ MeshComponent_Type_List = ['CStaticMeshComponent',
                             "CScriptedDestroyableComponent",
                             "CWindowComponent"]
 
-def getDataBufferMesh(entity, *, mesh_fbx_uncook_path=None, mesh_uncook_path=None):
+def getDataBufferMesh(
+    entity,
+    *,
+    mesh_fbx_uncook_path=None,
+    mesh_uncook_path=None,
+    component_types=None,
+):
     mesh_list = []
     cloth_list = []
+    selected_types = set(component_types) if component_types is not None else None
     if hasattr(entity, "streamingDataBuffer") and entity.streamingDataBuffer:
         for chunk in entity.streamingDataBuffer.CHUNKS.CHUNKS:
             if is_entity_chunk(chunk):
                 log.info("Found an entity in data buffer??")
-            if chunk.name in MeshComponent_Type_List:
+            if (
+                chunk.name in MeshComponent_Type_List
+                and (selected_types is None or chunk.name in selected_types)
+            ):
                 try:
                     mesh = _new_mesh_path(
                         fbx_uncook_path=mesh_fbx_uncook_path,
@@ -6589,7 +8410,10 @@ def getDataBufferMesh(entity, *, mesh_fbx_uncook_path=None, mesh_uncook_path=Non
                 mesh.component_action_name = _component_action_name(chunk)
                 mesh_list.append(mesh)
             
-            if chunk.name in {"CClothComponent", "CDestructionSystemComponent"}:
+            if (
+                chunk.name in {"CClothComponent", "CDestructionSystemComponent"}
+                and (selected_types is None or chunk.name in selected_types)
+            ):
                 cloth_list.append(chunk)
 
     return (mesh_list, cloth_list)
@@ -6680,467 +8504,4 @@ def import_single_component(component, parent_obj, keep_lod_meshes = False, **kw
         if component.name == "CSpotLightComponent":
             orient_red_spot(light_obj)
         return light_obj
-
-def import_gameplay_entity(ENTITY_OBJECT, errors, parent_obj = False, keep_lod_meshes = False, **kwargs):
-    _raise_if_layer_import_cancelled(kwargs)
-    entity_started = time.perf_counter()
-    mesh_fbx_uncook_path = kwargs.get("_mesh_fbx_uncook_path") or kwargs.get("mesh_fbx_uncook_path")
-    mesh_uncook_path = kwargs.get("_mesh_uncook_path") or kwargs.get("mesh_uncook_path")
-    source_context_path = kwargs.get("_redkit_source_context_path") or kwargs.get("redkit_source_context_path") or ""
-    flatten_entity_into_parent = (
-        bool(kwargs.get("_flatten_entity_into_parent", False))
-        and parent_obj is not False
-        and parent_obj is not None
-    )
-    try:
-        (mesh_list, cloth_list) = getDataBufferMesh(
-            ENTITY_OBJECT,
-            mesh_fbx_uncook_path=mesh_fbx_uncook_path,
-            mesh_uncook_path=mesh_uncook_path,
-        )
-    except Exception as e:
-        raise e
-    source_mesh_count = len(mesh_list or [])
-    source_cloth_count = len(cloth_list or [])
-    nearby_filter = _get_nearby_import_filter(kwargs)
-    nearby_stats = _get_nearby_import_stats(kwargs)
-    do_import_mesh = bool(kwargs.get("do_import_Mesh", True))
-    proxy_filter_active = _proxy_mesh_filter_active(kwargs)
-    do_import_proxy_mesh = bool(kwargs.get("do_import_ProxyMesh", False))
-    do_import_redcloth = _redcloth_enabled_for_import(kwargs, bpy.context)
-    do_import_redapex = _redapex_enabled_for_import(kwargs, bpy.context)
-    parent_world_position = kwargs.get("_nearby_parent_position")
-    entity_world_position = _entity_world_position(ENTITY_OBJECT, parent_world_position)
-    supported_component_names = {
-        "CMeshComponent",
-        "CStaticMeshComponent",
-        "CDestructionComponent",
-        "CPointLightComponent",
-        "CSpotLightComponent",
-    }
-    anchor_position = entity_world_position or parent_world_position
-
-    filtered_mesh_list = []
-    for mesh in mesh_list:
-        _raise_if_layer_import_cancelled(kwargs)
-        mesh_path = _mesh_repo_path(mesh)
-        if not mesh_path:
-            raise ValueError(
-                "Gameplay entity mesh resolved to an empty path: "
-                f"{getattr(ENTITY_OBJECT, 'name', '') or getattr(ENTITY_OBJECT, 'type', '')}"
-            )
-        try:
-            mesh_file_name = mesh.fileName() if callable(getattr(mesh, "fileName", None)) else ""
-        except Exception:
-            mesh_file_name = ""
-        is_proxy_mesh = _path_indicates_proxy_mesh(mesh_path, mesh_file_name)
-        if is_proxy_mesh and proxy_filter_active:
-            if not do_import_proxy_mesh:
-                continue
-        elif not do_import_mesh:
-            continue
-        if not _position_within_nearby_filter(_mesh_world_position(mesh, anchor_position), nearby_filter):
-            _note_nearby_filter_skip(nearby_stats)
-            continue
-        filtered_mesh_list.append(mesh)
-    mesh_list = filtered_mesh_list
-
-    filtered_cloth_list = []
-    for chunk in cloth_list:
-        _raise_if_layer_import_cancelled(kwargs)
-        cloth_resource = _chunk_cloth_resource(chunk)
-        if _is_redapex_resource(cloth_resource):
-            if not do_import_redapex:
-                continue
-        elif not do_import_redcloth:
-            continue
-        if not _position_within_nearby_filter(_chunk_world_position(chunk, anchor_position), nearby_filter):
-            _note_nearby_filter_skip(nearby_stats)
-            continue
-        filtered_cloth_list.append(chunk)
-    cloth_list = filtered_cloth_list
-
-    eligible_components = []
-    supported_component_source_count = 0
-    for component in (getattr(ENTITY_OBJECT, "Components", None) or []):
-        _raise_if_layer_import_cancelled(kwargs)
-        component_name = getattr(component, "name", getattr(component, "Type", ""))
-        if component_name not in supported_component_names:
-            continue
-        supported_component_source_count += 1
-        if not _position_within_nearby_filter(_chunk_world_position(component, anchor_position), nearby_filter):
-            _note_nearby_filter_skip(nearby_stats)
-            continue
-        eligible_components.append(component)
-    has_supported_components = bool(eligible_components)
-    template = getattr(ENTITY_OBJECT, "template", None)
-    template_mesh_list = _static_mesh_component_paths_from_template_source(
-        template,
-        getattr(ENTITY_OBJECT, "templatePath", "") if getattr(ENTITY_OBJECT, "isCreatedFromTemplate", False) else "",
-        mesh_fbx_uncook_path=mesh_fbx_uncook_path,
-        mesh_uncook_path=mesh_uncook_path,
-        source_context_path=source_context_path,
-    ) if template is not None else []
-    source_template_mesh_count = len(template_mesh_list or [])
-    filtered_template_mesh_list = []
-    for mesh in template_mesh_list:
-        _raise_if_layer_import_cancelled(kwargs)
-        mesh_path = _mesh_repo_path(mesh)
-        if not mesh_path:
-            continue
-        component_name = str(getattr(mesh, "component_name", "") or "")
-        is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(mesh_path, component_name)
-        if is_proxy_mesh and proxy_filter_active:
-            if not do_import_proxy_mesh:
-                continue
-        elif not do_import_mesh:
-            continue
-        if not _position_within_nearby_filter(_mesh_world_position(mesh, anchor_position), nearby_filter):
-            _note_nearby_filter_skip(nearby_stats)
-            continue
-        filtered_template_mesh_list.append(mesh)
-    template_mesh_list = filtered_template_mesh_list
-    has_template_child_content = bool(
-        template is not None
-        and (getattr(template, "includes", None) or getattr(template, "Entities", None))
-    )
-    has_template_content = bool(
-        template is not None
-        and (template_mesh_list or has_template_child_content)
-    )
-    empty_entity_only = (
-        source_mesh_count <= 0
-        and source_cloth_count <= 0
-        and supported_component_source_count <= 0
-        and source_template_mesh_count <= 0
-        and not has_template_child_content
-    )
-    if (
-        not empty_entity_only
-        and not mesh_list
-        and not cloth_list
-        and not has_supported_components
-        and not has_template_content
-    ):
-        reason_parts = []
-        if source_mesh_count:
-            reason_parts.append("mesh content filtered by import options or proximity")
-        if source_cloth_count:
-            reason_parts.append("cloth content filtered by import options or proximity")
-        if supported_component_source_count:
-            reason_parts.append("supported component content filtered by proximity")
-        if source_template_mesh_count:
-            reason_parts.append("template static mesh content filtered by import options or proximity")
-        if not reason_parts:
-            reason_parts.append("no mesh, cloth, supported mesh/light component, or template content")
-        _record_layer_entity_skip(kwargs, ENTITY_OBJECT, "; ".join(reason_parts))
-        _record_layer_entity_profile(
-            kwargs,
-            getattr(ENTITY_OBJECT, "name", ""),
-            time.perf_counter() - entity_started,
-            False,
-        )
-        return None
-    entity_target_collection = kwargs.get("_level_target_collection")
-    if import_isolation.is_isolated_import_context(bpy.context):
-        entity_target_collection = _get_active_collection(bpy.context) or entity_target_collection
-    if entity_target_collection is not None:
-        _activate_collection(bpy.context, entity_target_collection)
-
-    #TRANSFORM FOR THIS ENTITY
-    if flatten_entity_into_parent:
-        empty_transform = parent_obj
-    else:
-        bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-        empty_transform = bpy.context.object
-
-        if parent_obj:
-            empty_transform.name = ENTITY_OBJECT.name+"_SUB" # "CGameplayEntity_empty_transform"
-            empty_transform.parent = parent_obj
-        else:
-            empty_transform.name = ENTITY_OBJECT.name
-
-        _set_redkit_entity_metadata(
-            empty_transform,
-            getattr(ENTITY_OBJECT, "type", "") or "CEntity",
-            entity_name=getattr(ENTITY_OBJECT, "name", "") or "",
-            template_path=getattr(ENTITY_OBJECT, "templatePath", "") if getattr(ENTITY_OBJECT, "isCreatedFromTemplate", False) else "",
-            action_name=_entity_prop_string(ENTITY_OBJECT, "actionName"),
-        )
-
-    imported_any = False
-    if template_mesh_list:
-        for mesh in template_mesh_list:
-            _raise_if_layer_import_cancelled(kwargs)
-            mesh_path = _mesh_repo_path(mesh)
-            component_name = str(getattr(mesh, "component_name", "") or "")
-            is_proxy_mesh = bool(getattr(mesh, "is_proxy_mesh", False)) or _path_indicates_proxy_mesh(mesh_path, component_name)
-            mesh.import_name = Path(mesh_path.replace("\\", "/")).stem or str(getattr(mesh, "import_name", "") or "Mesh")
-            imported_mesh = _import_component_mesh_from_mesh(
-                mesh,
-                errors,
-                empty_transform,
-                component_type=str(getattr(mesh, "component_type", "") or "CMeshComponent"),
-                component_name=component_name,
-                component_transform=getattr(mesh, "transform", None),
-                drawable_flags=getattr(mesh, "drawable_flags", None) if hasattr(mesh, "drawable_flags") else None,
-                engine_visible=getattr(mesh, "engine_visible", None) if hasattr(mesh, "engine_visible") else None,
-                action_name=str(getattr(mesh, "component_action_name", "") or ""),
-                target_collection=entity_target_collection,
-                keep_lod_meshes=keep_lod_meshes or (is_proxy_mesh and bool(kwargs.get("keep_proxy_meshes", True))),
-                version=getattr(mesh, "cr2w_version", 999),
-                kwargs=kwargs,
-            )
-            if imported_mesh is not None:
-                imported_any = True
-    if mesh_list:
-        for mesh in mesh_list:
-            _raise_if_layer_import_cancelled(kwargs)
-            component_type = str(getattr(mesh, "component_type", "") or "").strip()
-            if component_type:
-                imported_mesh = _import_component_mesh_from_mesh(
-                    mesh,
-                    errors,
-                    empty_transform,
-                    component_type=component_type,
-                    component_name=str(getattr(mesh, "component_name", "") or ""),
-                    component_transform=getattr(mesh, "transform", None),
-                    drawable_flags=getattr(mesh, "drawable_flags", None) if hasattr(mesh, "drawable_flags") else None,
-                    engine_visible=getattr(mesh, "engine_visible", None) if hasattr(mesh, "engine_visible") else None,
-                    action_name=str(getattr(mesh, "component_action_name", "") or ""),
-                    keep_lod_meshes=keep_lod_meshes,
-                    version=getattr(mesh, "cr2w_version", 999),
-                    kwargs=kwargs,
-                )
-            else:
-                imported_mesh = import_single_mesh(mesh, errors, empty_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-            if imported_mesh is not None:
-                imported_any = True
-    if cloth_list:
-        from ..importers import import_entity
-        target_collection = entity_target_collection or _get_active_collection()
-        for chunk in cloth_list:
-            _raise_if_layer_import_cancelled(kwargs)
-            resource = ""
-            try:
-                resource = _chunk_cloth_resource(chunk)
-                if _is_redapex_resource(resource):
-                    if not do_import_redapex:
-                        continue
-                elif not do_import_redcloth:
-                    continue
-                cloth_name = chunk.GetVariableByName('name').String.String
-                if _is_redapex_resource(resource):
-                    root_obj, _cloth_meshes = import_entity.import_or_reuse_redapex(
-                        resource,
-                        repo_file(resource),
-                        context=bpy.context,
-                        loadmods=bool(kwargs.get("loadmods", False)),
-                        target_collection=target_collection,
-                        **_redapex_import_options(kwargs),
-                    )
-                    cloth_arma = root_obj
-                    cloth_grp = None
-                else:
-                    cloth_arma, cloth_grp, _cloth_meshes = import_entity.import_or_reuse_redcloth(
-                        empty_transform,
-                        resource,
-                        repo_file(resource),
-                        import_name="CClothComponent",
-                        entity_name=cloth_name,
-                        target_collection=target_collection,
-                        hide_collision_proxies=bool(kwargs.get("hide_proxy_meshes", False)),
-                    )
-                    root_obj = cloth_grp if cloth_grp is not None else cloth_arma
-                failure_reason = _cloth_import_failure_reason(cloth_arma)
-                if failure_reason:
-                    resource_label = "redapex" if _is_redapex_resource(resource) else "redcloth"
-                    message = f"Problem with {resource_label} import {resource}: {failure_reason}"
-                    log.warning("%s", message)
-                    errors.append(message)
-                    continue
-                if target_collection is not None:
-                    _activate_collection(bpy.context, target_collection)
-                if cloth_arma:
-                    if root_obj is not None:
-                        root_obj.parent = empty_transform
-                        component_type = str(getattr(chunk, "name", "") or "").strip()
-                        try:
-                            transform_prop = chunk.GetVariableByName('transform')
-                        except Exception:
-                            transform_prop = None
-                        try:
-                            _apply_engine_transform_local(
-                                root_obj,
-                                getattr(transform_prop, "EngineTransform", None) if transform_prop else None,
-                            )
-                        except Exception:
-                            pass
-                        if component_type in {"CDestructionComponent", "CDestructionSystemComponent"}:
-                            drawable_flags = _component_drawable_flags(chunk)
-                            engine_visible = _drawable_flags_visible_from_value(drawable_flags, default=True)
-                            _tag_object_tree_drawable_shadows(root_obj, drawable_flags, component_type)
-                            _tag_object_tree_engine_visibility(
-                                root_obj,
-                                engine_visible,
-                                kwargs,
-                                drawable_flags=drawable_flags,
-                            )
-                            _set_redkit_component_metadata(
-                                root_obj,
-                                component_type,
-                                component_name=_component_prop_string(chunk, "name"),
-                                drawable_flags=drawable_flags,
-                                engine_visible=engine_visible,
-                                action_name=_component_action_name(chunk),
-                            )
-                    imported_any = True
-            except Exception as e:
-                resource_label = "redapex" if _is_redapex_resource(resource) else "cloth"
-                message = f"Problem with {resource_label} import {resource}: {e}"
-                log.warning("%s", message)
-                errors.append(message)
-    
-    for component in eligible_components:
-        _raise_if_layer_import_cancelled(kwargs)
-        imported_component = import_single_component(component, empty_transform, keep_lod_meshes = keep_lod_meshes, **kwargs)
-        if imported_component is not None:
-            imported_any = True
-    _tag_entity_empty_engine_visibility_from_children(empty_transform, kwargs)
-    #MESH THIS ENTITY HAS
-    # for mesh in ENTITY_OBJECT.static_mesh_list:
-    #     import_single_mesh(mesh, errors, empty_transform, **kwargs)
-    if ENTITY_OBJECT.isCreatedFromTemplate:
-        if not flatten_entity_into_parent:
-            empty_transform['entity_type'] = ENTITY_OBJECT.type
-            empty_transform['template'] = ENTITY_OBJECT.templatePath
-
-    
-        #TODO work for all animated objects
-        if '(CDoor)' in ENTITY_OBJECT.name:
-            if _position_within_nearby_filter(entity_world_position, nearby_filter):
-                from ..importers import import_entity
-                ent_template = import_entity.import_ent_template(ENTITY_OBJECT.template.layerNode, False, 0, empty_transform)
-                if ent_template is not None:
-                    ent_template.parent = empty_transform
-                    imported_any = True
-            else:
-                _note_nearby_filter_skip(nearby_stats)
-            pass
-        else:
-            child_kwargs = dict(kwargs)
-            child_kwargs["_nearby_parent_position"] = anchor_position
-            child_kwargs["_nearby_filter"] = nearby_filter
-            child_kwargs["_nearby_stats"] = nearby_stats
-            if ENTITY_OBJECT.template.includes:
-                bpy.ops.object.empty_add(type="PLAIN_AXES", radius=1)
-                include_transform = bpy.context.object
-                include_transform.name = "INCLUDES"
-                include_transform.parent = empty_transform
-                imported_include_any = False
-                for INCLUDE_OBJECT in ENTITY_OBJECT.template.includes:
-                    _raise_if_layer_import_cancelled(kwargs)
-                    for inc_entity in INCLUDE_OBJECT.Entities:
-                        _raise_if_layer_import_cancelled(kwargs)
-                        if is_entity_chunk(inc_entity):
-                            imported_child = import_gameplay_entity(
-                                inc_entity,
-                                errors,
-                                include_transform,
-                                keep_lod_meshes = keep_lod_meshes,
-                                **child_kwargs,
-                            )
-                            if imported_child is not None:
-                                imported_any = True
-                                imported_include_any = True
-                if not imported_include_any:
-                    try:
-                        bpy.data.objects.remove(include_transform, do_unlink=True)
-                    except Exception:
-                        pass
-            for entity in ENTITY_OBJECT.template.Entities:
-                _raise_if_layer_import_cancelled(kwargs)
-                entity_child_kwargs = dict(child_kwargs)
-                if _is_template_preview_entity(entity):
-                    entity_child_kwargs["_flatten_entity_into_parent"] = True
-                else:
-                    entity_child_kwargs.pop("_flatten_entity_into_parent", None)
-                imported_child = import_gameplay_entity(
-                    entity,
-                    errors,
-                    empty_transform,
-                    keep_lod_meshes = keep_lod_meshes,
-                    **entity_child_kwargs,
-                )
-                if imported_child is not None:
-                    imported_any = True
-                # mesh_list = getDataBufferMesh(entity)
-                # for mesh in mesh_list:
-                #     import_single_mesh(mesh, errors, empty_transform, **kwargs)
-                # for component in entity.Components:
-                #     import_single_component(component, empty_transform, **kwargs)
-
-    if ENTITY_OBJECT.transform and not flatten_entity_into_parent:
-        set_blender_object_transform(empty_transform, ENTITY_OBJECT.transform)
-
-    if not imported_any:
-        if flatten_entity_into_parent:
-            _record_layer_entity_skip(
-                kwargs,
-                ENTITY_OBJECT,
-                "flattened template wrapper did not produce any Blender objects",
-            )
-            _record_layer_entity_profile(
-                kwargs,
-                getattr(ENTITY_OBJECT, "name", ""),
-                time.perf_counter() - entity_started,
-                False,
-            )
-            return None
-        if empty_entity_only:
-            try:
-                empty_transform["witcher_entity_empty_only"] = True
-                empty_transform["witcher_type"] = getattr(ENTITY_OBJECT, "type", "")
-            except Exception:
-                pass
-            _tag_object_tree_for_layer(
-                empty_transform,
-                kwargs.get("_layer_import_owner"),
-            )
-            _record_layer_entity_profile(
-                kwargs,
-                getattr(ENTITY_OBJECT, "name", ""),
-                time.perf_counter() - entity_started,
-                True,
-            )
-            return empty_transform
-        try:
-            bpy.data.objects.remove(empty_transform, do_unlink=True)
-        except Exception:
-            pass
-        _record_layer_entity_skip(
-            kwargs,
-            ENTITY_OBJECT,
-            "template, mesh, cloth, or component content did not produce any Blender objects",
-        )
-        _record_layer_entity_profile(
-            kwargs,
-            getattr(ENTITY_OBJECT, "name", ""),
-            time.perf_counter() - entity_started,
-            False,
-        )
-        return None
-
-    _tag_object_tree_for_layer(
-        empty_transform,
-        kwargs.get("_layer_import_owner"),
-    )
-    _record_layer_entity_profile(
-        kwargs,
-        getattr(ENTITY_OBJECT, "name", ""),
-        time.perf_counter() - entity_started,
-        True,
-    )
-    return empty_transform
-
 

@@ -947,7 +947,7 @@ def _normalize_embedded_cmesh_chunk_index(value):
     return int(value)
 
 
-def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, embedded_cmesh_chunk_index=None):
+def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, embedded_cmesh_chunk_index=None, materials_only=False):
     #OPTIONS
     cToLin = True
 
@@ -1048,6 +1048,9 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                     else:
                         # Allow meshes with no materials
                         the_materials = SimpleNamespace(Count=0, Handles=[])
+
+                if materials_only:
+                    break
 
                 #go to buffer start
                 br.seek(payload_start)
@@ -1457,7 +1460,8 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                     # Allow meshes with no materials
                     the_materials = SimpleNamespace(Count=0, Handles=[])
 
-
+            if materials_only:
+                continue
 
             #####################
             #!  GATHER MESH INFOS
@@ -1642,6 +1646,10 @@ def load_bin_mesh(filename, keep_lod_meshes = True, keep_proxy_meshes = False, e
                 CData.boneData.boneMatrices.append(cmatrix)
             CData.boneData.BoneIndecesMappingBoneIndex = [el.val for el in chunk.CMesh.BoneIndecesMappingBoneIndex.elements] if hasattr(chunk, "CMesh") and hasattr(chunk.CMesh, "BoneIndecesMappingBoneIndex") and hasattr(chunk.CMesh.BoneIndecesMappingBoneIndex, "elements") else []
             CData.boneData.Block3 = [el.val for el in chunk.CMesh.Block3.elements] if hasattr(chunk, "CMesh") and hasattr(chunk.CMesh, "Block3") and hasattr(chunk.CMesh.Block3, "elements") else []
+
+    if materials_only:
+        log.debug('FileLoading: %s - materials-only parse complete', _diag_label)
+        return (CData, bufferInfos, the_material_names, the_materials, meshName, meshFile)
 
     # TODO BETTER CHECK OF COOKED/UNCOOKED
     if rawVertices:

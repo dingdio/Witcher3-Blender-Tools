@@ -5,7 +5,7 @@ import json
 import shutil
 
 from ..importers import import_mesh
-from ..terrain_core import TERRAIN_FOLIAGE_MODE_ITEMS, TERRAIN_IMPORT_MODE_ITEMS
+from ..terrain_core import TERRAIN_IMPORT_MODE_ITEMS
 
 log = logging.getLogger(__name__)
 from ..importers import terrain_w2ter
@@ -576,11 +576,20 @@ class MySettings(PropertyGroup):
         description="Load foliage instances owned by the selected terrain tile",
         default=True,
     )
-    terrain_foliage_mode: bpy.props.EnumProperty(
-        name="Foliage Detail",
-        description="Choose a fast viewer-ready foliage set or load every source",
-        items=TERRAIN_FOLIAGE_MODE_ITEMS,
-        default='PROXY',
+    location_import_terrain: BoolProperty(
+        name="Terrain",
+        description="Import terrain tiles when opening a location",
+        default=False,
+    )
+    location_import_foliage: BoolProperty(
+        name="Foliage",
+        description="Import tile foliage when opening a location",
+        default=True,
+    )
+    location_import_layers: BoolProperty(
+        name="Layers",
+        description="Stream nearby world layers when opening a location",
+        default=False,
     )
     terrain_build_layer_tree: BoolProperty(
         name="Build Layer Tree",
@@ -767,6 +776,12 @@ class MySettings(PropertyGroup):
         soft_max=500.0,
         update=_update_foliage_viewport_settings,
     )
+    foliage_viewport_use_ground_density: BoolProperty(
+        name="Limit Ground Cover",
+        description="Thin generic viewport grass to the density percentage; flowers, reeds, shrubs and trees always show fully",
+        default=True,
+        update=_update_foliage_viewport_settings,
+    )
     foliage_viewport_ground_density: FloatProperty(
         name="Ground Cover Density",
         description="Percentage of nearby grass, flowers, reeds and shrubs shown in the viewport; final renders always use 100 percent",
@@ -774,12 +789,6 @@ class MySettings(PropertyGroup):
         min=0.01,
         max=1.0,
         subtype='FACTOR',
-        update=_update_foliage_viewport_settings,
-    )
-    foliage_viewport_fast_materials: BoolProperty(
-        name="Fast Foliage Materials",
-        description="Use a simple diffuse and alpha material for compatible foliage in the viewport only; final renders keep the original materials",
-        default=True,
         update=_update_foliage_viewport_settings,
     )
     terrain_layer_max_load_count: IntProperty(
@@ -940,7 +949,7 @@ class MySettings(PropertyGroup):
     terrain_layer_hide_proxy_meshes: BoolProperty(
         name="Hide Proxy Meshes",
         description="Hide imported layer proxy mesh objects while keeping them in the scene",
-        default=False,
+        default=True,
         update=lambda self, context: _update_layer_visibility_settings(self, context),
     )
     terrain_layer_solo_proxy_meshes: BoolProperty(
@@ -7404,9 +7413,6 @@ class SimpleFileBrowser(Operator):
                     coords.prop(witcher_file_browser, "terrain_tile_x", text="Tile X")
                     coords.prop(witcher_file_browser, "terrain_tile_y", text="Tile Y")
                     terrain_box.prop(witcher_file_browser, "terrain_include_foliage", text="Include Foliage")
-                    foliage_detail = terrain_box.row()
-                    foliage_detail.enabled = bool(witcher_file_browser.terrain_include_foliage)
-                    foliage_detail.prop(witcher_file_browser, "terrain_foliage_mode", text="Foliage")
                     op_import = import_row.operator(
                         "witcher.import_terrain_selected_tile",
                         text="Import Tile + Foliage" if witcher_file_browser.terrain_include_foliage else "Import Tile",
@@ -9618,7 +9624,9 @@ class FileActionOperatorImportToScene(Operator):
                 srt_import_path = tex_stats.get("import_path") or abs_file_path
                 if lod0_only:
                     srt_import_path = _prepare_srt_lod0_json(srt_import_path)
-                result = getattr(bpy.ops, "import").srt_json(filepath=srt_import_path)
+                from ..cloth.importer import surgical_external_joins
+                with surgical_external_joins():
+                    result = getattr(bpy.ops, "import").srt_json(filepath=srt_import_path)
                 if 'FINISHED' not in result:
                     self.report({'ERROR'}, f"SRT import failed: {os.path.basename(abs_file_path)}")
                     return {'CANCELLED'}
@@ -9674,43 +9682,23 @@ class FileActionOperatorImportToScene(Operator):
             elif ext == ".w2ent":
                 try:
                     metadata = import_entity.get_entity_appearance_metadata(abs_file_path)
-                    w2ent_mode = import_entity.classify_entity_import_metadata(metadata, context=context)
-                    if w2ent_mode == "character":
-                        default_appearance_name = str(metadata.get("default_name", "") or "").strip()
-                        import_entity.import_direct_entity_file(
-                            abs_file_path,
-                            False,
-                            0 if default_appearance_name else 1,
-                            None,
-                            selected_appearance_name=default_appearance_name,
-                            mesh_import_settings={
-                                "build_material_nodes": not self.unreal_send_profile,
-                                "import_morphs": not self.unreal_send_profile,
-                            },
-                        )
-                    elif w2ent_mode == "inventory":
-                        if not import_entity.try_apply_inventory_file_to_selected_character(context, abs_file_path):
-                            import_entity.import_direct_entity_file(
-                                abs_file_path,
-                                False,
-                                0,
-                                None,
-                                mesh_import_settings={
-                                    "build_material_nodes": not self.unreal_send_profile,
-                                    "import_morphs": not self.unreal_send_profile,
-                                },
-                            )
-                    else:
-                        import_entity.import_direct_entity_file(
-                            abs_file_path,
-                            False,
-                            0,
-                            None,
-                            mesh_import_settings={
-                                "build_material_nodes": not self.unreal_send_profile,
-                                "import_morphs": not self.unreal_send_profile,
-                            },
-                        )
+                    default_appearance_name = str(metadata.get("default_name", "") or "").strip()
+                    entity_result = import_entity.import_entity_file(
+                        abs_file_path,
+                        load_face_poses=False,
+                        import_apperance=0 if default_appearance_name else 1,
+                        parent_transform=None,
+                        selected_appearance_name=default_appearance_name,
+                        mesh_import_settings={
+                            "build_material_nodes": not self.unreal_send_profile,
+                            "import_morphs": not self.unreal_send_profile,
+                        },
+                    )
+                    ok, errors = import_entity.entity_import_result_errors(entity_result)
+                    if not ok:
+                        raise RuntimeError(errors[0])
+                    if errors:
+                        self.report({'WARNING'}, errors[0])
                 except Exception as exc:
                     log.error("Entity import failed for %s", abs_file_path, exc_info=True)
                     self.report({'ERROR'}, f"Entity import failed: {exc}")
@@ -9719,7 +9707,7 @@ class FileActionOperatorImportToScene(Operator):
                 from ..CR2W import CR2W_reader
                 from ..importers import import_w2l
                 foliage = CR2W_reader.load_foliage(abs_file_path)
-                import_w2l.btn_import_w2ent(foliage)
+                import_w2l.btn_import_W2L(foliage, context)
             elif ext == ".w2l":
                 from ..CR2W import CR2W_reader
                 from ..importers import import_w2l
@@ -10695,7 +10683,6 @@ class ImportTerrainSelectedTileOperator(Operator):
                     context=context,
                     multires_level=int(browser.terrain_multires_level),
                     include_foliage=bool(browser.terrain_include_foliage),
-                    foliage_mode=str(browser.terrain_foliage_mode),
                 )
         except Exception as exc:
             log.exception("Selected terrain tile import failed")
@@ -10979,18 +10966,20 @@ class FileActionOperator(Operator):
         # Auto-import for certain file types
         if export_path.endswith(".w2ent"):
             metadata = import_entity.get_entity_appearance_metadata(export_path)
-            w2ent_mode = import_entity.classify_entity_import_metadata(metadata, context=context)
-            if w2ent_mode == "character":
-                default_appearance_name = str(metadata.get("default_name", "") or "").strip()
-                import_entity.import_direct_entity_file(
-                    export_path,
-                    False,
-                    0 if default_appearance_name else 1,
-                    None,
-                    selected_appearance_name=default_appearance_name,
-                )
-            elif not import_entity.try_apply_inventory_file_to_selected_character(context, export_path):
-                import_entity.import_direct_entity_file(export_path, False, 0, None)
+            default_appearance_name = str(metadata.get("default_name", "") or "").strip()
+            entity_result = import_entity.import_entity_file(
+                export_path,
+                load_face_poses=False,
+                import_apperance=0 if default_appearance_name else 1,
+                parent_transform=None,
+                selected_appearance_name=default_appearance_name,
+            )
+            ok, errors = import_entity.entity_import_result_errors(entity_result)
+            if not ok:
+                self.report({'ERROR'}, errors[0])
+                return {'CANCELLED'}
+            if errors:
+                self.report({'WARNING'}, errors[0])
 
         # For terrain tiles, emit per-tile images next to extracted buffers.
         if effective_cache_type == "Bundle" and full_path_norm.lower().endswith(".w2ter"):
@@ -11070,6 +11059,12 @@ class WITCHER_PT_AssetBrowser(Panel):
         ref_row.operator("witcher.character_image_browser", text="Characters", icon='OUTLINER_OB_ARMATURE')
         ref_row = char_col.row(align=True)
         ref_row.operator("witcher.location_image_browser", text="Locations", icon='WORLD')
+        if browser_settings:
+            debug_row = char_col.row(align=True)
+            debug_row.label(text="Location:")
+            debug_row.prop(browser_settings, "location_import_terrain", toggle=True)
+            debug_row.prop(browser_settings, "location_import_foliage", toggle=True)
+            debug_row.prop(browser_settings, "location_import_layers", toggle=True)
 
 
 def register():

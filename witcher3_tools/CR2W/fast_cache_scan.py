@@ -61,6 +61,41 @@ _STREAM_COMPONENT_TYPES = _STREAM_MESH_COMPONENT_TYPES | {
     "CClothComponent",
     "CDestructionComponent",
     "CDestructionSystemComponent",
+    "CPointLightComponent",
+    "CSpotLightComponent",
+}
+_RICH_ENTITY_COMPONENT_TYPES = frozenset(
+    {
+        "CAnimatedComponent",
+        "CAnimDangleBufferComponent",
+        "CAnimDangleComponent",
+        "CClothComponent",
+        "CDestructionSystemComponent",
+        "CEntityExternalAppearance",
+        "CEntityTemplateParam",
+        "CFXDefinition",
+        "CHardAttachment",
+        "CMeshSkinningAttachment",
+        "CMimicComponent",
+        "CMovingPhysicalAgentComponent",
+        "CSkeletonBoneSlot",
+    }
+)
+_NONVISUAL_ENTITY_EXPORT_TYPES = frozenset(
+    {
+        "CEquipmentDefinition",
+        "CEquipmentDefinitionEntry",
+        "CInventoryComponent",
+        "CInventoryDefinition",
+        "CInventoryDefinitionEntry",
+        "CInventoryInitializerRandom",
+        "CInventoryInitializerUniform",
+        "CR4LootParam",
+    }
+)
+_RICH_ONLY_STREAM_MESH_COMPONENT_TYPES = _STREAM_MESH_COMPONENT_TYPES - {
+    "CMeshComponent",
+    "CStaticMeshComponent",
 }
 _TARGET_PROP_NAMES = frozenset(
     {
@@ -69,10 +104,15 @@ _TARGET_PROP_NAMES = frozenset(
         "brightness",
         "color",
         "drawableFlags",
+        "entityClass",
+        "entityId",
         "envColorGroup",
+        "guid",
+        "id",
         "includes",
         "innerAngle",
         "isEnabled",
+        "isVisible",
         "lightFlickering",
         "lightUsageMask",
         "mesh",
@@ -88,8 +128,22 @@ _TARGET_PROP_NAMES = frozenset(
         "streamingDistance",
         "template",
         "transform",
+        "visible",
     }
 )
+_RICH_ENTITY_PROP_NAMES = frozenset(
+    {
+        "appearance",
+        "appearances",
+        "BufferV1",
+        "BufferV2",
+        "coloringEntries",
+        "cookedEffects",
+        "slots",
+        "templateParams",
+    }
+)
+_RICH_ENTITY_PROP_MARKER = "__rich_entity_properties__"
 _PLAN_ITEM_EXTRA_KEYS = frozenset(
     {
         "brightness",
@@ -261,7 +315,9 @@ def _new_scan_result():
         "sector_items": [],
         "foliage_items": [],
         "bounds_markers": [],
+        "dependency_paths": [],
         "complete": True,
+        "requires_rich_entity": False,
         "unresolved_dependencies": [],
     }
 
@@ -288,6 +344,8 @@ def _merge_scan_completeness(target, source):
         return
     if not bool(source.get("complete", True)):
         target["complete"] = False
+    if bool(source.get("requires_rich_entity", False)):
+        target["requires_rich_entity"] = True
     target.setdefault("unresolved_dependencies", []).extend(
         list(source.get("unresolved_dependencies", []) or [])
     )
@@ -296,6 +354,14 @@ def _merge_scan_completeness(target, source):
 def _merge_scan_result(target, source):
     if not source:
         return
+    entity_class = str(source.get("entity_class", "") or "").strip()
+    if entity_class and not str(target.get("entity_class", "") or "").strip():
+        target["entity_class"] = entity_class
+    target.setdefault("dependency_paths", []).extend(
+        str(path)
+        for path in source.get("dependency_paths", []) or []
+        if str(path or "").strip()
+    )
     target["entities"].extend(list(source.get("entities", []) or []))
     target["includes"].extend(list(source.get("includes", []) or []))
     target["sector_items"].extend(list(source.get("sector_items", []) or []))
@@ -324,6 +390,40 @@ def _scan_cr2w_structure(
         export_name = str(getattr(export, "name", "") or "").strip()
         if not export_name:
             continue
+
+        if (
+            not stream_only
+            and export_name not in _ENTITY_TYPES
+            and CR2W_types._is_direct_entity_asset_root(
+                cr2w_file,
+                export_index,
+                export_name,
+                source_name,
+            )
+        ):
+            result["requires_rich_entity"] = True
+            continue
+
+        if (
+            root_export_name == "CEntityTemplate"
+            and not stream_only
+            and export_name not in (
+                {"CEntityTemplate"}
+                | _ENTITY_TYPES
+                | _DIRECT_COMPONENT_TYPES
+                | _NONVISUAL_ENTITY_EXPORT_TYPES
+            )
+        ):
+            result["requires_rich_entity"] = True
+        elif (
+            root_export_name == "CLayer"
+            and not stream_only
+            and (
+                export_name in _RICH_ENTITY_COMPONENT_TYPES
+                or export_name.startswith("CAnimDangleConstraint_")
+            )
+        ):
+            result["requires_rich_entity"] = True
 
         export_info = _open_export(cr2w_file, handle, export_index)
         if export_info is None:
@@ -361,6 +461,16 @@ def _scan_cr2w_structure(
             continue
 
         entity_props = None
+        unknown_direct_layer_entity = (
+            not stream_only
+            and export_name not in _ENTITY_TYPES
+            and export_name not in _NONVISUAL_ENTITY_EXPORT_TYPES
+            and root_export_name == "CLayer"
+            and int(getattr(export, "parentID", 0) or 0) == 1
+        )
+        if unknown_direct_layer_entity:
+            result["requires_rich_entity"] = True
+            continue
         if (
             not stream_only
             and export_name not in _ENTITY_TYPES
@@ -395,6 +505,8 @@ def _scan_cr2w_structure(
                 )
             if entity_scan.get("template") is not None:
                 _merge_scan_completeness(result, entity_scan.get("template"))
+            if bool(entity_scan.get("requires_rich_entity", False)):
+                result["requires_rich_entity"] = True
             entity_scan["_export_index"] = export_index
             pending_entities.append(entity_scan)
             marker = _bounds_marker_from_transform(
@@ -406,6 +518,11 @@ def _scan_cr2w_structure(
             continue
 
         if stream_only:
+            if export_name in _NONVISUAL_ENTITY_EXPORT_TYPES:
+                continue
+            if export_name in _RICH_ONLY_STREAM_MESH_COMPONENT_TYPES:
+                result["requires_rich_entity"] = True
+                continue
             if export_name in _STREAM_COMPONENT_TYPES:
                 stream_item = _scan_component_export(
                     cr2w_file,
@@ -415,8 +532,11 @@ def _scan_cr2w_structure(
                     as_stream=True,
                 )
                 if stream_item is None:
+                    result["requires_rich_entity"] = True
                     continue
                 result["sector_items"].append(stream_item)
+            elif export_name not in _ENTITY_TYPES:
+                result["requires_rich_entity"] = True
             continue
 
         if export_name in _DIRECT_COMPONENT_TYPES:
@@ -428,6 +548,7 @@ def _scan_cr2w_structure(
                 as_stream=False,
             )
             if component_desc is None:
+                result["requires_rich_entity"] = True
                 continue
             component_map[export_index] = component_desc
             try:
@@ -443,6 +564,35 @@ def _scan_cr2w_structure(
             if marker is not None:
                 result["bounds_markers"].append(marker)
 
+    pending_entity_export_indices = {
+        int(entity.get("_export_index", -1))
+        for entity in pending_entities
+        if int(entity.get("_export_index", -1)) >= 0
+    }
+    ancestor_cache = {}
+
+    def nearest_entity_ancestor(export_index):
+        seen = []
+        current_index = export_index
+        ancestor = -1
+        while 0 <= current_index < len(exports) and current_index not in ancestor_cache:
+            if current_index in seen:
+                break
+            seen.append(current_index)
+            try:
+                parent_index = int(getattr(exports[current_index], "parentID", 0) or 0) - 1
+            except Exception:
+                break
+            if parent_index in pending_entity_export_indices:
+                ancestor = parent_index
+                break
+            current_index = parent_index
+        else:
+            ancestor = ancestor_cache.get(current_index, -1)
+        for seen_index in seen:
+            ancestor_cache[seen_index] = ancestor
+        return ancestor
+
     for entity in pending_entities:
         components = []
         seen_components = set()
@@ -454,6 +604,12 @@ def _scan_cr2w_structure(
             if component_desc is not None and id(component_desc) not in seen_components:
                 components.append(component_desc)
                 seen_components.add(id(component_desc))
+            elif 0 <= actual_index < len(exports):
+                referenced_name = str(
+                    getattr(exports[actual_index], "name", "") or ""
+                ).strip()
+                if referenced_name not in _NONVISUAL_ENTITY_EXPORT_TYPES:
+                    result["requires_rich_entity"] = True
         for component_desc in component_parent_map.get(int(entity.get("_export_index", -1)), []) or []:
             if component_desc is not None and id(component_desc) not in seen_components:
                 components.append(component_desc)
@@ -462,6 +618,25 @@ def _scan_cr2w_structure(
         entity.pop("component_indices", None)
         entity.pop("_export_index", None)
         result["entities"].append(entity)
+
+    if not result["requires_rich_entity"] and pending_entity_export_indices:
+        for child_export_index, child_export in enumerate(exports):
+            if child_export_index in pending_entity_export_indices:
+                continue
+            child_name = str(getattr(child_export, "name", "") or "").strip()
+            if not child_name or child_name in _NONVISUAL_ENTITY_EXPORT_TYPES:
+                continue
+            try:
+                child_parent_index = int(getattr(child_export, "parentID", 0) or 0) - 1
+            except Exception:
+                child_parent_index = -1
+            ancestor_index = nearest_entity_ancestor(child_export_index)
+            if ancestor_index >= 0 and (
+                child_parent_index != ancestor_index
+                or child_name not in _DIRECT_COMPONENT_TYPES
+            ):
+                result["requires_rich_entity"] = True
+                break
 
     return result
 
@@ -503,10 +678,14 @@ def _scan_selected_props(cr2w_file, handle, class_end):
             handle.seek(prop_offset)
             break
         prop_name = str(getattr(prop, "name", "") or "").strip()
+        if prop_name in _RICH_ENTITY_PROP_NAMES:
+            values.setdefault(_RICH_ENTITY_PROP_MARKER, []).append(prop_name)
         if prop_name in _TARGET_PROP_NAMES:
             parsed_value = _parse_selected_prop_value(cr2w_file, handle, prop, data_end)
             if parsed_value is not None:
                 values[prop_name] = parsed_value
+            elif prop_name in {"guid", "id", "entityId", "visible", "isVisible"}:
+                values.setdefault(_RICH_ENTITY_PROP_MARKER, []).append(prop_name)
         handle.seek(data_end)
     return values
 
@@ -516,12 +695,27 @@ def _parse_selected_prop_value(cr2w_file, handle, prop, data_end):
     prop_type = str(getattr(prop, "type", "") or "").strip()
     count, element_type = _array_count_and_type(handle, data_end, prop_type)
 
-    if prop_name in {"name", "actionName"}:
+    if prop_name in {"name", "actionName", "entityClass"}:
         if "String" in prop_type or element_type in {"String", "NodeRef", "LocalizedString"}:
             return _read_cstring_value(handle)
         if element_type == "CName":
             return _read_cname_value(handle, cr2w_file)
         return None
+
+    if prop_name in {"guid", "id", "entityId"}:
+        parsed = CR2W_types.PROPERTY(
+            handle,
+            cr2w_file,
+            SimpleNamespace(classEnd=data_end),
+            custom_propstart=prop,
+        )
+        guid = getattr(parsed, "GUID", None)
+        if guid is not None:
+            return str(getattr(guid, "GuidString", "") or "").strip()
+        value = read_prop_value(parsed, ())
+        if value is None:
+            return None
+        return str(value).strip()
 
     if prop_name == "transform" and element_type == "EngineTransform":
         return _copy_engine_transform(CR2W_types.EngineTransform(handle))
@@ -559,7 +753,7 @@ def _parse_selected_prop_value(cr2w_file, handle, prop, data_end):
     if prop_name in {"brightness", "radius", "attenuation", "innerAngle", "outerAngle", "softness"}:
         return float(readFloat(handle)) if element_type == "Float" else None
 
-    if prop_name == "isEnabled":
+    if prop_name in {"isEnabled", "visible", "isVisible"}:
         return bool(readSByte(handle)) if element_type == "Bool" else None
 
     if prop_name in {"color", "envColorGroup", "shadowCastingMode", "lightFlickering", "lightUsageMask"}:
@@ -856,8 +1050,25 @@ def _scan_template_export(
 ):
     props = _scan_selected_props(cr2w_file, handle, class_end)
     result = _new_scan_result()
+    result["entity_class"] = str(props.get("entityClass", "") or "").strip()
+    if not result["entity_class"]:
+        for export in list(getattr(cr2w_file, "CR2WExport", []) or []):
+            export_name = str(getattr(export, "name", "") or "").strip()
+            if export_name != "CEntityTemplate" and export_name in _ENTITY_TYPES:
+                result["entity_class"] = export_name
+                break
+    rich_props = set(props.get(_RICH_ENTITY_PROP_MARKER, ()) or ())
+    rich_props.discard("templateParams")
+    if rich_props:
+        result["requires_rich_entity"] = True
 
-    for include_path in list(props.get("includes", []) or []):
+    include_paths = [
+        str(path)
+        for path in props.get("includes", []) or []
+        if str(path or "").strip()
+    ]
+    result["dependency_paths"] = list(include_paths)
+    for include_path in include_paths:
         resolved_path = _resolve_dependency_path(include_path, cr2w_file, dependency_resolver)
         if not resolved_path:
             _mark_unresolved_dependency(
@@ -867,7 +1078,6 @@ def _scan_template_export(
                 "include not resolved",
             )
             continue
-        dependency_scan = None
         if dependency_loader is not None:
             dependency_scan = dependency_loader(resolved_path)
         else:
@@ -878,9 +1088,13 @@ def _scan_template_export(
             )
         if dependency_scan is None:
             return None
-        if dependency_scan is not None:
-            result["includes"].append(dependency_scan)
-            _merge_scan_completeness(result, dependency_scan)
+        result["includes"].append(dependency_scan)
+        result["dependency_paths"].extend(
+            str(path)
+            for path in dependency_scan.get("dependency_paths", []) or []
+            if str(path or "").strip()
+        )
+        _merge_scan_completeness(result, dependency_scan)
 
     embedded_scan = _scan_embedded_template_data(
         handle,
@@ -893,6 +1107,8 @@ def _scan_template_export(
         return None
     if embedded_scan is not None:
         _merge_scan_result(result, embedded_scan)
+
+    result["dependency_paths"] = list(dict.fromkeys(result["dependency_paths"]))
     return result
 
 
@@ -944,39 +1160,73 @@ def _scan_entity_export(
             )
 
     stream_items = []
+    stream_requires_rich_entity = False
     buffer_bytes = _extract_buffer_bytes(cr2w_file, streaming_buffer)
     if buffer_bytes:
-        stream_items = _scan_stream_buffer_items(
+        stream_scan = _scan_stream_buffer(
             buffer_bytes,
             f"{source_name}:{export_name}:stream",
             dependency_resolver=dependency_resolver,
             dependency_loader=dependency_loader,
         )
-        if stream_items is None:
+        if stream_scan is None:
             return None
+        stream_items = list(stream_scan.get("sector_items", []) or [])
+        stream_requires_rich_entity = bool(stream_scan.get("requires_rich_entity", False))
 
     component_indices = []
     is_created_from_template = bool(template_path)
-    handle.seek(min(class_end, handle.tell() + 10))
-    size = class_end - class_start
-    end_pos = handle.tell()
-    bytes_left = size - (end_pos - class_start)
-    if not is_created_from_template:
-        handle.seek(min(class_end, handle.tell() + 63))
-        if bytes_left > 0 and handle.tell() < class_end:
-            try:
-                element_count = int(ReadBit6(handle) or 0)
-            except Exception:
-                element_count = 0
-            if 0 <= element_count < 300:
-                for _ in range(element_count):
-                    if handle.tell() + 4 > class_end:
-                        break
-                    component_indices.append(int(readInt32(handle) or 0))
+    tail_requires_rich_entity = False
+    tail_start = handle.tell()
+    try:
+        entity_stub = SimpleNamespace(ChunkIndex=-1)
+        payload_start = CR2W_types._entity_payload_start(
+            handle,
+            cr2w_file,
+            entity_stub,
+            tail_start,
+            class_end,
+        )
+        if is_created_from_template:
+            handle.seek(payload_start)
+        else:
+            component_indices = list(
+                CR2W_types._read_entity_components_from_payload(
+                    handle,
+                    cr2w_file,
+                    entity_stub,
+                    payload_start,
+                    class_end,
+                )
+                or []
+            )
+
+        version = int(getattr(getattr(cr2w_file, "HEADER", None), "version", 999) or 999)
+        if version >= 131:
+            buffer_v1 = CR2W_types._read_entity_buffer_v1_safe(
+                handle,
+                cr2w_file,
+                entity_stub,
+                class_end,
+            )
+            tail_requires_rich_entity = bool(buffer_v1)
+        if is_created_from_template and version >= 149 and not tail_requires_rich_entity:
+            buffer_v2 = CR2W_types._read_entity_buffer_v2_safe(
+                handle,
+                cr2w_file,
+                entity_stub,
+                class_end,
+            )
+            tail_requires_rich_entity = bool(buffer_v2)
+    except Exception:
+        tail_requires_rich_entity = True
 
     return {
         "name": entity_name,
-        "type": export_name,
+        "type": str(
+            (template_scan or {}).get("entity_class", "")
+            or export_name
+        ),
         "transform": transform,
         "template_path": template_path,
         "template": template_scan,
@@ -984,8 +1234,21 @@ def _scan_entity_export(
         "component_indices": component_indices,
         "components": [],
         "action_name": str(props.get("actionName", "") or "").strip(),
+        "guid": str(props.get("guid", "") or "").strip(),
+        "entity_id": str(props.get("id", "") or props.get("entityId", "") or "").strip(),
+        "engine_visible": (
+            bool(props.get("visible", props.get("isVisible")))
+            if "visible" in props or "isVisible" in props
+            else None
+        ),
+        "template_dependency_paths": list((template_scan or {}).get("dependency_paths", []) or []),
         "streaming_distance": float(props.get("streamingDistance", 0.0) or 0.0),
         "unresolved_dependencies": unresolved_dependencies,
+        "requires_rich_entity": bool(
+            stream_requires_rich_entity
+            or tail_requires_rich_entity
+            or props.get(_RICH_ENTITY_PROP_MARKER)
+        ),
     }
 
 
@@ -1078,7 +1341,8 @@ def _scan_component_export(
                 "component_name": str(props.get("name", "") or "").strip(),
                 "action_name": str(props.get("actionName", "") or "").strip(),
             }
-        return None
+        if export_name not in {"CPointLightComponent", "CSpotLightComponent"}:
+            return None
 
     if export_name in {"CMeshComponent", "CStaticMeshComponent"}:
         repo_path = str(props.get("mesh", "") or props.get("resource", "") or "").strip()
@@ -1201,7 +1465,7 @@ def _scan_embedded_template_data(
     return scan_result
 
 
-def _scan_stream_buffer_items(
+def _scan_stream_buffer(
     buffer_bytes,
     source_name,
     *,
@@ -1209,11 +1473,11 @@ def _scan_stream_buffer_items(
     dependency_loader=None,
 ):
     if not buffer_bytes:
-        return []
+        return _new_scan_result()
     data = bytes(buffer_bytes)
     start_index = data.find(b"CR2W")
     if start_index < 0:
-        return []
+        return _new_scan_result()
     stream = io.BytesIO(data[start_index:])
     stream.name = source_name
     try:
@@ -1222,7 +1486,7 @@ def _scan_stream_buffer_items(
         return None
     if not _supports_fast_scan(cr2w_file):
         return None
-    stream_scan = _scan_cr2w_structure(
+    return _scan_cr2w_structure(
         cr2w_file,
         stream,
         source_name,
@@ -1230,9 +1494,6 @@ def _scan_stream_buffer_items(
         dependency_loader=dependency_loader,
         stream_only=True,
     )
-    if stream_scan is None:
-        return None
-    return list(stream_scan.get("sector_items", []) or [])
 
 
 def _extract_buffer_bytes(cr2w_file, streaming_buffer):
@@ -1297,6 +1558,7 @@ def _build_cache_entry(level_path, resolved_path, file_mtime, file_size, scan_re
         "manifest_complete": manifest_complete,
         "unresolved_dependencies": unresolved_dependencies,
         "scan_backend": "fast",
+        "requires_rich_entity": bool(scan_result.get("requires_rich_entity", False)),
         "import_item_count": int(import_item_count),
         "items": items,
     }
@@ -1327,8 +1589,28 @@ def _append_entity(state, entity, *, parent_id, parent_position):
         translation=None,
         world_position=entity_position,
     )
-    if entity_id and state.get("items") and entity.get("action_name"):
-        state["items"][-1]["action_name"] = str(entity.get("action_name") or "")
+    if entity_id and state.get("items"):
+        item = state["items"][-1]
+        entity_class = str(entity.get("type", "") or "CEntity")
+        entity_guid = str(entity.get("guid", "") or "").strip()
+        native_entity_id = str(entity.get("entity_id", "") or "").strip()
+        item["entity_class"] = entity_class
+        item["instance_id"] = (
+            entity_guid
+            or native_entity_id
+            or f"{entity_class}:{str(entity.get('name', '') or '')}"
+        )
+        if entity_guid:
+            item["entity_guid"] = entity_guid
+        if native_entity_id:
+            item["entity_id"] = native_entity_id
+        if entity.get("engine_visible") is not None:
+            item["engine_visible"] = bool(entity.get("engine_visible"))
+        dependency_paths = list(entity.get("template_dependency_paths", []) or [])
+        if dependency_paths:
+            item["template_dependency_paths"] = dependency_paths
+        if entity.get("action_name"):
+            item["action_name"] = str(entity.get("action_name") or "")
     item_count_before_children = len(state["items"])
 
     for item_desc in list(entity.get("stream_items", []) or []):
@@ -1345,7 +1627,6 @@ def _append_entity(state, entity, *, parent_id, parent_position):
         for item in reversed(state.get("items", [])):
             if str(item.get("id", "") or "") == str(entity_id):
                 item["kind"] = "entity_empty"
-                item["repo_path"] = ""
                 break
 
 

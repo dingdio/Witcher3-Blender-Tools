@@ -6,6 +6,7 @@ log = logging.getLogger(__name__)
 
 from pathlib import Path
 import hashlib
+import json
 import struct
 import time
 import tempfile
@@ -1637,7 +1638,82 @@ def setup_w3_material(
         )
     # Publish success only after the complete node graph exists.
     material['witcher3_material_setup_version'] = MATERIAL_SETUP_VERSION
+    _register_find_material(material)
     return material
+
+_FIND_MATERIAL_INDEX = {}
+_FIND_MATERIAL_INDEX_COUNT = -1
+
+
+def _find_material_normalize(value):
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, (list, tuple)):
+        return [_find_material_normalize(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _find_material_normalize(v) for k, v in value.items()}
+    if hasattr(value, "to_dict"):
+        return _find_material_normalize(value.to_dict())
+    if hasattr(value, "to_list"):
+        return _find_material_normalize(value.to_list())
+    return value
+
+
+def _find_material_key(mat_base, params):
+    normalized = _find_material_normalize(params)
+    return (
+        str(mat_base),
+        json.dumps(normalized, sort_keys=True, ensure_ascii=False, default=str),
+    )
+
+
+def _find_material_matches(m, mat_base, params):
+    return (
+        m.get('witcher3_material_setup_version', 0) == MATERIAL_SETUP_VERSION
+        and 'witcher3_mat_params' in m
+        and mat_base == m['witcher3_mat_base']
+        and params == m['witcher3_mat_params'].to_dict()
+    )
+
+
+def _register_find_material(material):
+    global _FIND_MATERIAL_INDEX_COUNT
+    if _FIND_MATERIAL_INDEX_COUNT < 0:
+        return
+    try:
+        key = _find_material_key(material['witcher3_mat_base'], material['witcher3_mat_params'].to_dict())
+    except Exception:
+        return
+    entries = _FIND_MATERIAL_INDEX.setdefault(key, [])
+    ident = (material.name, material.session_uid)
+    if ident not in entries:
+        entries.append(ident)
+    _FIND_MATERIAL_INDEX_COUNT = len(bpy.data.materials)
+
+
+def _rebuild_find_material_index():
+    global _FIND_MATERIAL_INDEX_COUNT
+    _FIND_MATERIAL_INDEX.clear()
+    for m in bpy.data.materials:
+        if m.get('witcher3_material_setup_version', 0) != MATERIAL_SETUP_VERSION:
+            continue
+        if 'witcher3_mat_params' not in m or 'witcher3_mat_base' not in m:
+            continue
+        try:
+            key = _find_material_key(m['witcher3_mat_base'], m['witcher3_mat_params'].to_dict())
+        except Exception:
+            continue
+        _FIND_MATERIAL_INDEX.setdefault(key, []).append((m.name, m.session_uid))
+    _FIND_MATERIAL_INDEX_COUNT = len(bpy.data.materials)
+
+
+def invalidate_find_material_index():
+    global _FIND_MATERIAL_INDEX_COUNT
+    _FIND_MATERIAL_INDEX.clear()
+    _FIND_MATERIAL_INDEX_COUNT = -1
+
 
 def find_material(
         mat_base,
@@ -1651,27 +1727,40 @@ def find_material(
     which we store in custom properties on import.
     This is useful for checking whether a material was already imported.
     """
-    for m in bpy.data.materials:
-        if (
-            m.get('witcher3_material_setup_version', 0) == MATERIAL_SETUP_VERSION and \
-            'witcher3_mat_params' in m and \
-            mat_base == m['witcher3_mat_base'] and \
-            params == m['witcher3_mat_params'].to_dict()
-        ):
-            if material_local is not None and not material_local_mode_matches(m, material_local):
+    # File loads, undo, and append can bypass the registration hook.
+    if _FIND_MATERIAL_INDEX_COUNT != len(bpy.data.materials):
+        _rebuild_find_material_index()
+    entries = _FIND_MATERIAL_INDEX.get(_find_material_key(mat_base, params))
+    if not entries:
+        return None
+    stale = []
+    found = None
+    for ident in entries:
+        name, uid = ident
+        m = bpy.data.materials.get(name)
+        if m is None or m.session_uid != uid or not _find_material_matches(m, mat_base, params):
+            stale.append(ident)
+            continue
+        if material_local is not None and not material_local_mode_matches(m, material_local):
+            continue
+        if material_source_path is not None:
+            cached_source_path = normalize_depot_path(m.get('witcher3_mat_source_path', ''))
+            if cached_source_path != normalize_depot_path(material_source_path):
                 continue
-            if material_source_path is not None:
-                cached_source_path = normalize_depot_path(m.get('witcher3_mat_source_path', ''))
-                if cached_source_path != normalize_depot_path(material_source_path):
-                    continue
-            if expected_ng_name:
-                active_group = get_active_witcher_group_node(m)
-                active_tree = getattr(active_group, "node_tree", None) if active_group else None
-                active_ng_name = str(getattr(active_tree, "name", "") or "")
-                if not _node_group_names_match(active_ng_name, expected_ng_name):
-                    continue
-            # A material with the same parameters is already imported,
-            return m
+        if expected_ng_name:
+            active_group = get_active_witcher_group_node(m)
+            active_tree = getattr(active_group, "node_tree", None) if active_group else None
+            active_ng_name = str(getattr(active_tree, "name", "") or "")
+            if not _node_group_names_match(active_ng_name, expected_ng_name):
+                continue
+        found = m
+        break
+    for ident in stale:
+        try:
+            entries.remove(ident)
+        except ValueError:
+            pass
+    return found
 
 def read_2wmi_params2(
         material_bin: str

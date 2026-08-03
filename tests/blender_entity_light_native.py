@@ -30,7 +30,7 @@ def main():
         from witcher3_tools.importers.entity_light import apply_environment_light_groups
         from witcher3_tools.ui import ui_map
 
-        assert ui_map._WORLD_LAYER_SCAN_CACHE_VERSION == 15
+        assert ui_map._WORLD_LAYER_SCAN_CACHE_VERSION == 17
         assert import_blender_fun.CACHED_LAYER_TRANSFORM_MODE_VERSION == 11
         entity_light.unregister_driver_namespace()
         assert "witcher_light_wander" not in bpy.app.driver_namespace

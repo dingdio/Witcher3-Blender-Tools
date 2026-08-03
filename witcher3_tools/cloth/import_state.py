@@ -234,27 +234,27 @@ class ClothImportState:
         """Return collections created since this state was captured."""
         return _new_data_blocks(self.data_snapshot, "collections", bpy.data.collections)
 
-    def restore_context(self) -> None:
-        """Restore selection, active object, and active layer collection."""
+    def restore_context(self, selection=True) -> None:
         ctx = self.context or bpy.context
         view_layer = getattr(ctx, "view_layer", None)
-        try:
-            view_layer.objects.active = None
-        except Exception:
-            pass
-        try:
-            bpy.ops.object.select_all(action="DESELECT")
-        except Exception:
-            pass
-        try:
-            view_layer.objects.active = self.active_object
-        except Exception:
-            pass
-        for obj in self.selected_objects:
+        if selection:
             try:
-                obj.select_set(True)
+                view_layer.objects.active = None
             except Exception:
                 pass
+            try:
+                bpy.ops.object.select_all(action="DESELECT")
+            except Exception:
+                pass
+            try:
+                view_layer.objects.active = self.active_object
+            except Exception:
+                pass
+            for obj in self.selected_objects:
+                try:
+                    obj.select_set(True)
+                except Exception:
+                    pass
         try:
             restore_active_layer_collection(ctx, self.active_collection)
         except Exception:

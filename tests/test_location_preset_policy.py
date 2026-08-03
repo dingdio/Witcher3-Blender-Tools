@@ -318,13 +318,14 @@ class LocationSystemTests(unittest.TestCase):
             and "terrain_tiles" in ast.unparse(node.iter)
             and "import_world_terrain_tile" in ast.unparse(node)
         )
-        foliage_loop = next(
+        foliage_call = next(
             node for node in ast.walk(function)
-            if isinstance(node, ast.For)
-            and "terrain_results" in ast.unparse(node.iter)
-            and "_schedule_location_tile_foliage" in ast.unparse(node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_schedule_location_foliage"
         )
-        self.assertLess(terrain_loop.lineno, foliage_loop.lineno)
+        self.assertIn("terrain_tiles", ast.unparse(foliage_call))
+        self.assertLess(terrain_loop.lineno, foliage_call.lineno)
 
     def test_stream_invokes_the_normal_load_around_camera_operator(self):
         source = BROWSER_PATH.read_text(encoding="utf-8")

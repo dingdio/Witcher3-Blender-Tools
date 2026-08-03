@@ -4,7 +4,9 @@ import inspect
 import json
 import logging
 import os
+import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import addon_utils
@@ -29,13 +31,104 @@ log = logging.getLogger(__name__)
 _REDCLOTH_PROFILE_ENABLED = True
 _REDCLOTH_PROFILE_WARN_THRESHOLD = 0.10
 
-__all__ = ["import_cloth"]
+__all__ = ["import_cloth", "surgical_external_joins"]
 
 
 def _log_redcloth_profile_warning(message, *args):
     if not _REDCLOTH_PROFILE_ENABLED:
         return
     log.info("[redcloth-profile] " + str(message), *args)
+
+
+def _surgical_join_them(objects):
+    valid = [
+        o for o in objects or []
+        if o is not None and getattr(o, "type", "") == 'MESH' and getattr(o, "data", None) is not None
+    ]
+    if not valid:
+        return
+    view_layer = bpy.context.view_layer
+    view_layer.objects.active = None
+    try:
+        bpy.ops.object.select_all(action='DESELECT')
+    except Exception:
+        pass
+    selected = []
+    for obj in reversed(valid):
+        try:
+            obj.select_set(True)
+            view_layer.objects.active = obj
+            selected.append(obj)
+        except Exception:
+            continue
+    if not selected:
+        return
+    target = view_layer.objects.active
+    if len(selected) < 2 or sum(len(o.data.vertices) for o in selected) == 0:
+        return
+    doomed = [o.data for o in selected if o is not target]
+    bpy.ops.object.join()
+    orphans = [d for d in doomed if getattr(d, "users", 1) == 0]
+    if orphans:
+        try:
+            bpy.data.batch_remove(orphans)
+        except Exception:
+            log.debug("Could not remove %d joined mesh datablocks", len(orphans), exc_info=True)
+
+
+_EXTERNAL_JOIN_MODULE_PREFIXES = ("io_mesh_apx", "io_scene_apx", "io_mesh_srt")
+
+
+def _make_fast_get_parent_collection():
+    cache = {"count": -1, "parents": {}}
+
+    def _fast_get_parent_collection(coll, parent_colls):
+        if cache["count"] != len(bpy.data.collections):
+            parents = {}
+            for parent_collection in bpy.data.collections:
+                for child in parent_collection.children:
+                    parents.setdefault(child.name, []).append(parent_collection)
+            cache["parents"] = parents
+            cache["count"] = len(bpy.data.collections)
+        parents = cache["parents"]
+        first = parents.get(coll.name)
+        if first:
+            parent_colls.append(first[0])
+        for koll in parent_colls:
+            parent_colls.extend(parents.get(koll.name, ()))
+
+    return _fast_get_parent_collection
+
+
+@contextmanager
+def surgical_external_joins():
+    patched = []
+    fast_parent = _make_fast_get_parent_collection()
+    for module_name, module in list(sys.modules.items()):
+        if not module_name.startswith(_EXTERNAL_JOIN_MODULE_PREFIXES):
+            continue
+        original_join = getattr(module, "JoinThem", None)
+        if callable(original_join) and original_join is not _surgical_join_them:
+            try:
+                setattr(module, "JoinThem", _surgical_join_them)
+                patched.append((module, "JoinThem", original_join))
+            except Exception:
+                pass
+        original_parent = getattr(module, "get_parent_collection", None)
+        if callable(original_parent) and getattr(original_parent, "__name__", "") != "_fast_get_parent_collection":
+            try:
+                setattr(module, "get_parent_collection", fast_parent)
+                patched.append((module, "get_parent_collection", original_parent))
+            except Exception:
+                pass
+    try:
+        yield
+    finally:
+        for module, attr_name, original in patched:
+            try:
+                setattr(module, attr_name, original)
+            except Exception:
+                pass
 
 
 def _move_objects_between_collections(old_collection_name, new_collection_name):
@@ -232,6 +325,14 @@ def _io_mesh_apx_runtime_ready(context=None) -> bool:
     return wm is not None and hasattr(wm, "physx")
 
 
+def _restore_selection_wanted() -> bool:
+    try:
+        from ..importers import import_isolation
+        return not import_isolation.is_isolated_import_context(bpy.context)
+    except Exception:
+        return True
+
+
 def import_cloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename=""):
     total_started = time.perf_counter()
     sanitize_seconds = 0.0
@@ -284,7 +385,8 @@ def import_cloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename=
             args_count = len(inspect.signature(read_clothing).parameters)
             if args_count == 4:
                 addon_import_started = time.perf_counter()
-                read_clothing(context, filepath, rotate_180, rm_ph_me)
+                with surgical_external_joins():
+                    read_clothing(context, filepath, rotate_180, rm_ph_me)
                 addon_import_seconds = time.perf_counter() - addon_import_started
             else:
                 raise RuntimeError(f"Unsupported io_mesh_apx.read_clothing signature: {args_count}")
@@ -292,7 +394,8 @@ def import_cloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename=
             addon_name = "io_scene_apx"
             from io_scene_apx.importer.import_clothing import read_clothing
             addon_import_started = time.perf_counter()
-            read_clothing(context, filepath, use_mat, rotate_180, rm_ph_me)
+            with surgical_external_joins():
+                read_clothing(context, filepath, use_mat, rotate_180, rm_ph_me)
             addon_import_seconds = time.perf_counter() - addon_import_started
         else:
             if io_mesh_enabled and not io_mesh_runtime_ready:
@@ -567,7 +670,7 @@ def import_cloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename=
                 )
 
         restore_started = time.perf_counter()
-        import_state.restore_context()
+        import_state.restore_context(selection=_restore_selection_wanted())
         restore_seconds = time.perf_counter() - restore_started
 
         total_seconds = time.perf_counter() - total_started
@@ -632,6 +735,6 @@ def import_cloth(context, filepath, use_mat, rotate_180, rm_ph_me, mat_filename=
         except Exception as cleanup_exc:
             log.debug("Failed cleaning up partial cloth import for %s: %s", filepath, cleanup_exc)
         restore_started = time.perf_counter()
-        import_state.restore_context()
+        import_state.restore_context(selection=_restore_selection_wanted())
         restore_seconds = time.perf_counter() - restore_started
         return None

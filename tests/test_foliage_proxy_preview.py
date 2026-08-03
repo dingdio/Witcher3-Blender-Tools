@@ -64,32 +64,17 @@ class TestFoliageProxyClassification(unittest.TestCase):
     def test_unknown_foliage_is_a_shrub_not_a_diagnostic_marker(self):
         self.assertEqual(foliage._foliage_proxy_kind(r"custom\mystery.srt"), "shrub")
 
-    def test_viewer_priority_is_bounded_and_uses_instance_count(self):
-        transforms = {
-            "owner:a": {
-                **{f"grass_{index}.srt": [()] * (100 - index) for index in range(10)},
-                **{f"trees\\oak_{index}.srt": [()] * (50 - index) for index in range(8)},
-            },
-            "owner:b": {
-                "grass_9.srt": [()] * 200,
-                "trees\\oak_7.srt": [()] * 200,
-            },
-        }
-        selected = foliage._viewer_source_priority(transforms)
-        ground = [path for path in selected if "grass" in path]
-        trees = [path for path in selected if "trees" in path]
-        self.assertEqual(len(ground), 8)
-        self.assertEqual(len(trees), 6)
-        self.assertIn("grass_9.srt", selected)
-        self.assertIn(r"trees\oak_7.srt", selected)
-        self.assertNotIn("grass_8.srt", selected)
-        self.assertNotIn(r"trees\oak_6.srt", selected)
+    def test_trees_import_before_ground_cover(self):
+        paths = ["grass_a.srt", "trees\\oak.srt", "flowers\\poppy.srt", "trees\\pine.srt"]
+        ordered = sorted(paths, key=foliage._source_import_order)
+        self.assertEqual(ordered[:2], ["trees\\oak.srt", "trees\\pine.srt"])
 
-    def test_viewport_density_applies_only_to_ground_cover(self):
-        self.assertTrue(foliage._is_ground_cover("grass.srt"))
-        self.assertTrue(foliage._is_ground_cover("flowers\\poppy.srt"))
-        self.assertFalse(foliage._is_ground_cover("trees\\oak.srt"))
-        self.assertFalse(foliage._is_ground_cover("trees\\pine.srt"))
+    def test_viewport_density_applies_only_to_generic_grass(self):
+        self.assertTrue(foliage._is_generic_grass("grass.srt"))
+        self.assertFalse(foliage._is_generic_grass("flowers\\poppy.srt"))
+        self.assertFalse(foliage._is_generic_grass("bushes\\bramble.srt"))
+        self.assertFalse(foliage._is_generic_grass("trees\\oak.srt"))
+        self.assertFalse(foliage._is_generic_grass("trees\\pine.srt"))
 
     def test_viewport_density_threshold_is_explicit_percentage(self):
         self.assertEqual(foliage._viewport_density_threshold(0.01), 0.5)
@@ -141,47 +126,6 @@ class TestFoliageProxyVisibility(unittest.TestCase):
         self.assertFalse(instancer.hide_render)
         self.assertFalse(instancer.hidden)
 
-    def test_viewer_budget_switches_every_non_priority_instancer_to_one_placeholder(self):
-        transforms = {
-            "owner": {
-                **{f"grass_{index}.srt": [()] * (100 - index) for index in range(10)},
-                **{f"trees\\oak_{index}.srt": [()] * (50 - index) for index in range(8)},
-            }
-        }
-
-        class FakeInstancer(dict):
-            pass
-
-        objects = []
-        for depot_path in transforms["owner"]:
-            objects.append(FakeInstancer(_is_foliage_instancer=True, _depot_path="_inst_" + depot_path))
-        root = types.SimpleNamespace(objects=objects)
-        placeholder = object()
-        switched = []
-        hydration = foliage.FoliageHydrationResult((), (), (), ())
-        with (
-            mock.patch.object(foliage, "_get_root_transform_bucket", return_value=transforms),
-            mock.patch.object(foliage, "_get_or_create_proxy_source", return_value=placeholder) as proxy,
-            mock.patch.object(
-                foliage,
-                "_set_instancer_source",
-                side_effect=lambda obj, source: switched.append((obj, source)),
-            ),
-            mock.patch.object(
-                foliage,
-                "hydrate_missing_foliage_sources",
-                return_value=hydration,
-            ) as hydrate,
-        ):
-            self.assertIs(foliage.apply_viewer_source_budget(root), hydration)
-
-        requested = set(hydrate.call_args.kwargs["depot_paths"])
-        self.assertEqual(len(requested), 14)
-        self.assertEqual(len(switched), 4)
-        self.assertTrue(all(obj["_depot_path"][6:] not in requested for obj, _source in switched))
-        self.assertTrue(all(source is placeholder for _obj, source in switched))
-        proxy.assert_called_once_with(root)
-
     def test_failed_rebuild_restores_previous_geometry_and_owner_metadata(self):
         root = {foliage._OWNER_KEYS_PROP: '["owner:old"]'}
         previous = {"owner:old": {"grass.srt": [(1.0,)]}}
@@ -203,15 +147,19 @@ class TestFoliageProxyVisibility(unittest.TestCase):
                     previous,
                     candidate,
                     {"grass.srt"},
-                    source_mode=foliage.FOLIAGE_SOURCE_MODE_FULL,
                 )
 
         self.assertEqual(root[foliage._OWNER_KEYS_PROP], '["owner:old"]')
         self.assertIs(rebuild.call_args_list[1].args[1], previous)
-        self.assertEqual(
-            rebuild.call_args_list[1].kwargs["source_mode"],
-            foliage.FOLIAGE_SOURCE_MODE_PROXY,
-        )
+        self.assertFalse(rebuild.call_args_list[1].kwargs["import_sources"])
+
+
+class TestFoliageViewportDefaults(unittest.TestCase):
+    def test_viewport_defaults_favor_viewport_performance(self):
+        scene = types.SimpleNamespace(witcher_file_browser=None)
+        settings = foliage._foliage_viewport_settings(scene)
+        self.assertTrue(settings["cull_enabled"])
+        self.assertTrue(settings["ground_density_enabled"])
 
 
 if __name__ == "__main__":

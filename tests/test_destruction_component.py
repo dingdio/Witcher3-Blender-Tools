@@ -111,6 +111,25 @@ class DestructionComponentTests(unittest.TestCase):
         self.assertTrue(CR2W_types.is_entity_chunk(chunk))
         self.assertIn("CDestructionComponent", CR2W_file._ENTITY_DIRECT_COMPONENT_TYPES)
 
+    def test_outer_layer_cloth_and_destruction_components_are_supported(self):
+        for component_type in ("CClothComponent", "CDestructionSystemComponent"):
+            with self.subTest(component_type=component_type):
+                entity = CR2W_file.CEntity()
+                root = SimpleNamespace(name="CGameplayEntity", Components=[])
+                component = SimpleNamespace(name=component_type, Type=component_type)
+
+                CR2W_file._append_entity_components(
+                    entity,
+                    root,
+                    [root, component],
+                    {1: [(2, component)]},
+                    "layer.w2l",
+                    1,
+                )
+
+                self.assertEqual(entity.Components, [component])
+                self.assertEqual(entity.unsupportedComponents, [])
+
     def test_fast_scanner_routes_native_reddest_and_ignores_physics_pose(self):
         props = {
             "name": "CDestructionSystemComponentfence_straight_b_px",
@@ -219,18 +238,57 @@ class DestructionComponentTests(unittest.TestCase):
             patch.object(fast_cache_scan, "_supports_fast_scan", return_value=True),
             patch.object(fast_cache_scan, "_scan_cr2w_structure", nested_scan),
         ):
-            self.assertEqual(
-                fast_cache_scan._scan_stream_buffer_items(
-                    b"prefixCR2Wpayload",
-                    "stream",
-                    dependency_resolver=resolver,
-                    dependency_loader=loader,
-                ),
-                [],
+            scan = fast_cache_scan._scan_stream_buffer(
+                b"prefixCR2Wpayload",
+                "stream",
+                dependency_resolver=resolver,
+                dependency_loader=loader,
             )
+            self.assertEqual((scan or {}).get("sector_items"), [])
 
         self.assertIs(nested_scan.call_args.kwargs["dependency_resolver"], resolver)
         self.assertIs(nested_scan.call_args.kwargs["dependency_loader"], loader)
+
+    def test_stream_scanner_propagates_rich_graph_requirement(self):
+        rich_scan = {
+            "sector_items": [],
+            "requires_rich_entity": True,
+        }
+        with (
+            patch.object(fast_cache_scan.CR2W_types, "getCR2W", return_value=object()),
+            patch.object(fast_cache_scan, "_supports_fast_scan", return_value=True),
+            patch.object(fast_cache_scan, "_scan_cr2w_structure", return_value=rich_scan),
+        ):
+            self.assertTrue(
+                fast_cache_scan._scan_stream_buffer(
+                    b"prefixCR2Wpayload",
+                    "stream",
+                )["requires_rich_entity"]
+            )
+
+    def test_fast_template_scan_preserves_native_entity_class(self):
+        cr2w_file = SimpleNamespace(
+            CR2WExport=[
+                SimpleNamespace(name="CEntityTemplate"),
+                SimpleNamespace(name="CItemEntity"),
+            ],
+        )
+        with (
+            patch.object(fast_cache_scan, "_scan_selected_props", return_value={}),
+            patch.object(fast_cache_scan, "_scan_embedded_template_data", return_value=None),
+        ):
+            template_scan = fast_cache_scan._scan_template_export(
+                cr2w_file,
+                Mock(),
+                0,
+                "items\\sword.w2ent",
+            )
+
+        merged_scan = fast_cache_scan._new_scan_result()
+        fast_cache_scan._merge_scan_result(merged_scan, template_scan)
+
+        self.assertEqual(template_scan["entity_class"], "CItemEntity")
+        self.assertEqual(merged_scan["entity_class"], "CItemEntity")
 
 
 if __name__ == "__main__":

@@ -1,19 +1,20 @@
 import bpy
 
 from ..importers import import_blender_fun, import_environment, import_particle
-from ..ui import ui_equipment, ui_map, ui_rig
+from . import ui_equipment, ui_map, ui_rig
+
 
 _TIMERS = (
     {
         "id": "particle_billboards",
-        "label": "Particle billboard follow (30 Hz)",
+        "label": "Particle Billboards",
         "module": import_particle,
         "func": "_follow_particle_viewports",
         "start": "_ensure_particle_preview_runtime",
     },
     {
         "id": "sky_follow",
-        "label": "Sky preview viewport follow (5 Hz)",
+        "label": "Sky Preview",
         "module": import_environment,
         "func": "_follow_viewports",
         "start": "_ensure_view_follow",
@@ -21,14 +22,14 @@ _TIMERS = (
     },
     {
         "id": "deferred_materials",
-        "label": "Deferred material streaming",
+        "label": "Material Streaming",
         "module": import_blender_fun,
         "func": "_deferred_material_tick",
         "start": "ensure_deferred_material_timer",
     },
     {
         "id": "terrain_view_lod",
-        "label": "Terrain view-LOD / foliage auto tick",
+        "label": "Terrain / Foliage LOD",
         "module": ui_map,
         "func": "_terrain_view_lod_auto_tick",
         "start": "register_view_lod_timer",
@@ -36,7 +37,7 @@ _TIMERS = (
     },
     {
         "id": "equipment_icons",
-        "label": "Equipment icon resolver",
+        "label": "Equipment Icons",
         "module": ui_equipment,
         "func": "_equipment_item_icon_timer",
         "start": "_ensure_equipment_item_icon_timer",
@@ -44,7 +45,7 @@ _TIMERS = (
     },
     {
         "id": "rig_pose_sync",
-        "label": "Rig pose-mode sync",
+        "label": "Rig Pose Sync",
         "module": ui_rig,
         "func": "_rig_pose_sync_timer",
         "start": "start_rig_pose_sync_timer",
@@ -69,10 +70,10 @@ def _is_running(entry):
         return False
 
 
-class WITCHER_DEV_OT_timer_stop(bpy.types.Operator):
-    bl_idname = "witcher_dev.timer_stop"
+class WITCHER_OT_timer_stop(bpy.types.Operator):
+    bl_idname = "witcher.timer_stop"
     bl_label = "Stop Timer"
-    bl_description = "Unregister this recurring timer"
+    bl_description = "Stop this background timer"
 
     timer_id: bpy.props.StringProperty()
 
@@ -92,10 +93,10 @@ class WITCHER_DEV_OT_timer_stop(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class WITCHER_DEV_OT_timer_start(bpy.types.Operator):
-    bl_idname = "witcher_dev.timer_start"
+class WITCHER_OT_timer_start(bpy.types.Operator):
+    bl_idname = "witcher.timer_start"
     bl_label = "Start Timer"
-    bl_description = "Start this timer through its normal ensure/start path"
+    bl_description = "Start this background timer"
 
     timer_id: bpy.props.StringProperty()
 
@@ -113,35 +114,22 @@ class WITCHER_DEV_OT_timer_start(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class VIEW3D_PT_witcher_dev_timers(bpy.types.Panel):
-    bl_label = "Timers"
-    bl_idname = "VIEW3D_PT_witcher_dev_timers"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = 'W3 Dev'
-    bl_options = {'DEFAULT_CLOSED'}
-
-    def draw(self, context):
-        layout = self.layout
-        col = layout.column(align=True)
-        for entry in _TIMERS:
-            running = _is_running(entry)
-            row = col.row(align=True)
-            row.label(text=entry["label"], icon='PLAY' if running else 'PAUSE')
-            if running:
-                op = row.operator("witcher_dev.timer_stop", text="", icon='SNAP_FACE')
-            else:
-                op = row.operator("witcher_dev.timer_start", text="", icon='TRIA_RIGHT')
-            op.timer_id = entry["id"]
-        col.separator()
-        col.label(text="Instance timers (not controllable here):", icon='INFO')
-        col.label(text="  Unreal bridge job drain, LiveLink stream")
+def draw_timer_controls(layout):
+    for entry in _TIMERS:
+        running = _is_running(entry)
+        row = layout.row(align=True)
+        row.label(text="", icon='PLAY' if running else 'PAUSE')
+        row.label(text=entry["label"])
+        if running:
+            op = row.operator(WITCHER_OT_timer_stop.bl_idname, text="", icon='SNAP_FACE')
+        else:
+            op = row.operator(WITCHER_OT_timer_start.bl_idname, text="", icon='TRIA_RIGHT')
+        op.timer_id = entry["id"]
 
 
 _classes = (
-    WITCHER_DEV_OT_timer_stop,
-    WITCHER_DEV_OT_timer_start,
-    VIEW3D_PT_witcher_dev_timers,
+    WITCHER_OT_timer_stop,
+    WITCHER_OT_timer_start,
 )
 
 

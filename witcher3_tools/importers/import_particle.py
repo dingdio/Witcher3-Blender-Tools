@@ -32,6 +32,8 @@ _BILLBOARD_UPDATE_INTERVAL = 1.0 / 30.0
 _BILLBOARD_CONSTRAINT_NAME = "Witcher Particle Camera Facing"
 _BILLBOARD_MODE_PROP = "witcher_particle_billboard_mode"
 _BILLBOARD_TARGET_PROP = "witcher_particle_billboard_target"
+_BILLBOARD_ROOT_PROP = "witcher_particle_view_root"
+_BILLBOARD_ROOT_NAME = "Witcher Particle View Root"
 
 _SPLASH_TEXTURE = r"fx\textures\water\splash_with_normal.xbm"
 _WATER_SPLASH_MATERIAL = r"fx\shaders\water_splash_additive.w2mg"
@@ -1059,80 +1061,134 @@ def _active_view_rotation(scene=None):
     return None
 
 
-def _set_billboard_basis_orientation(basis, world_orientation):
+def _set_view_root_orientation(root, world_orientation):
     world_orientation.normalize()
-    if basis.parent is not None:
-        world_orientation = basis.parent.matrix_world.to_quaternion().inverted() @ world_orientation
-        world_orientation.normalize()
     # Avoid depsgraph updates for equivalent q/-q rotations.
-    if abs(basis.rotation_quaternion.dot(world_orientation)) > 1.0 - 1e-7:
-        return
-    basis.rotation_quaternion = world_orientation
-    basis.update_tag(refresh={"OBJECT"})
+    if abs(root.rotation_quaternion.dot(world_orientation)) > 1.0 - 1e-7:
+        return False
+    root.rotation_quaternion = world_orientation
+    root.update_tag(refresh={"OBJECT"})
+    return True
 
 
-def _update_billboard_basis(basis, scene, *, render=False, view_rotation=None):
-    mode = str(basis.get(_BILLBOARD_MODE_PROP, "live_viewport"))
-    target = None
-    if mode == "live_target":
-        target = bpy.data.objects.get(str(basis.get(_BILLBOARD_TARGET_PROP, "")))
-    elif render:
-        target = scene.camera
-    if target is not None:
-        orientation = target.matrix_world.to_quaternion()
-    else:
-        orientation = view_rotation if view_rotation is not None else _active_view_rotation(scene)
+def _view_orientation(scene, *, render=False):
+    if render and scene.camera is not None:
+        return scene.camera.matrix_world.to_quaternion()
+    orientation = _active_view_rotation(scene)
     if orientation is None and scene.camera is not None:
         orientation = scene.camera.matrix_world.to_quaternion()
+    return orientation
+
+
+def _update_view_root(root, scene, *, render=False):
+    orientation = _view_orientation(scene, render=render)
     if orientation is None:
         orientation = Quaternion((1.0, 0.0, 0.0), pi / 2.0)
-    _set_billboard_basis_orientation(basis, orientation)
+    _set_view_root_orientation(root, orientation)
 
 
-_BILLBOARD_NAME_CACHE = {"names": (), "expires": 0.0}
-_BILLBOARD_RESCAN_SECONDS = 2.0
+def _scene_view_root(scene, *, create=False):
+    root = bpy.data.objects.get(str(scene.get(_BILLBOARD_ROOT_PROP, "")))
+    if root is not None and root.get(_BILLBOARD_ROOT_PROP):
+        return root
+    if not create:
+        return None
+    root = bpy.data.objects.new(_BILLBOARD_ROOT_NAME, None)
+    scene.collection.objects.link(root)
+    root.rotation_mode = "QUATERNION"
+    root.empty_display_size = 0.001
+    root.hide_render = True
+    root.hide_select = True
+    root[_BILLBOARD_ROOT_PROP] = True
+    scene[_BILLBOARD_ROOT_PROP] = root.name
+    _update_view_root(root, scene)
+    return root
 
 
-def _invalidate_billboard_cache():
-    _BILLBOARD_NAME_CACHE["expires"] = 0.0
+def _constrain_billboard(owner, target):
+    constraint = owner.constraints.get(_BILLBOARD_CONSTRAINT_NAME)
+    if constraint is None or constraint.type != "COPY_ROTATION":
+        constraint = owner.constraints.new("COPY_ROTATION")
+        constraint.name = _BILLBOARD_CONSTRAINT_NAME
+    constraint.target = target
+    return constraint
 
 
 def _billboard_bases():
     objects = getattr(bpy.data, "objects", None)
     if objects is None:
         return []
-    now = time.monotonic()
-    if now >= _BILLBOARD_NAME_CACHE["expires"]:
-        _BILLBOARD_NAME_CACHE["names"] = tuple(
-            obj.name for obj in objects
-            if obj.get(PARTICLE_BILLBOARD_BASIS_PROP)
-        )
-        _BILLBOARD_NAME_CACHE["expires"] = now + _BILLBOARD_RESCAN_SECONDS
-    bases = []
-    for name in _BILLBOARD_NAME_CACHE["names"]:
-        obj = objects.get(name)
-        if obj is not None and obj.get(PARTICLE_BILLBOARD_BASIS_PROP):
-            bases.append(obj)
-    return bases
+    return [obj for obj in objects if obj.get(PARTICLE_BILLBOARD_BASIS_PROP)]
+
+
+def _update_billboard_basis(basis, scene, *, render=False, view_rotation=None):
+    constraint = basis.constraints.get(_BILLBOARD_CONSTRAINT_NAME)
+    target = getattr(constraint, "target", None)
+    if target is None or not target.get(_BILLBOARD_ROOT_PROP):
+        return
+    if view_rotation is not None and not render:
+        _set_view_root_orientation(target, view_rotation)
+    else:
+        _update_view_root(target, scene, render=render)
+
+
+_BILLBOARD_MIGRATED = False
+
+
+def _migrate_legacy_billboards():
+    legacy = [basis for basis in _billboard_bases()
+              if basis.constraints.get(_BILLBOARD_CONSTRAINT_NAME) is None]
+    if not legacy:
+        return
+    scene_names = [(scene, set(scene.objects.keys())) for scene in bpy.data.scenes]
+    for basis in legacy:
+        scene = next((s for s, names in scene_names if basis.name in names), None)
+        if scene is None:
+            continue
+        target = None
+        if str(basis.get(_BILLBOARD_MODE_PROP, "")) == "live_target":
+            target = bpy.data.objects.get(str(basis.get(_BILLBOARD_TARGET_PROP, "")))
+        if target is None:
+            target = _scene_view_root(scene, create=True)
+        _constrain_billboard(basis, target)
+
+
+_BILLBOARD_MOVING_SECONDS = 0.2
+_BILLBOARD_FOLLOW_STATE = {}
 
 
 def _follow_particle_viewports():
-    bases = _billboard_bases()
-    if not bases:
-        return None
+    global _BILLBOARD_MIGRATED
+    if not _BILLBOARD_MIGRATED:
+        _BILLBOARD_MIGRATED = True
+        _migrate_legacy_billboards()
+    interval = None
+    now = time.monotonic()
     for scene in bpy.data.scenes:
-        view_rotation = _active_view_rotation(scene)
-        scene_objects = scene.objects
-        for basis in bases:
-            if basis.name in scene_objects:
-                _update_billboard_basis(basis, scene, view_rotation=view_rotation)
-    return _BILLBOARD_UPDATE_INTERVAL
+        root = _scene_view_root(scene)
+        if root is None:
+            continue
+        interval = _BILLBOARD_UPDATE_INTERVAL
+        orientation = _view_orientation(scene)
+        if orientation is None:
+            orientation = Quaternion((1.0, 0.0, 0.0), pi / 2.0)
+        orientation.normalize()
+        state = _BILLBOARD_FOLLOW_STATE.setdefault(scene.name, [None, 0.0])
+        last_seen, last_push = state
+        moving = last_seen is not None and abs(last_seen.dot(orientation)) < 1.0 - 1e-7
+        state[0] = orientation
+        # Throttle depsgraph updates while navigating.
+        if moving and now - last_push < _BILLBOARD_MOVING_SECONDS:
+            continue
+        if _set_view_root_orientation(root, orientation):
+            state[1] = now
+    return interval
 
 
 def _restore_particle_billboards(scene, *_args):
-    for basis in _billboard_bases():
-        if basis.name in scene.objects:
-            _update_billboard_basis(basis, scene, render=True)
+    root = _scene_view_root(scene)
+    if root is not None:
+        _update_view_root(root, scene, render=True)
 
 
 def _ensure_particle_preview_runtime():
@@ -1144,7 +1200,9 @@ def _ensure_particle_preview_runtime():
 
 @persistent
 def _resume_particle_billboards(_unused):
-    _invalidate_billboard_cache()
+    global _BILLBOARD_MIGRATED
+    _BILLBOARD_MIGRATED = False
+    _BILLBOARD_FOLLOW_STATE.clear()
     if _billboard_bases():
         _ensure_particle_preview_runtime()
 
@@ -1152,7 +1210,6 @@ def _resume_particle_billboards(_unused):
 def register_particle_preview_runtime():
     if _resume_particle_billboards not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_resume_particle_billboards)
-    # The timer defers the object scan until Blender releases _RestrictData.
     _ensure_particle_preview_runtime()
 
 
@@ -1176,19 +1233,20 @@ def _create_billboard_basis(parent, target_collection, billboard_target, scene):
     basis.hide_render = True
     basis.hide_select = True
     basis[PARTICLE_BILLBOARD_BASIS_PROP] = True
-    _invalidate_billboard_cache()
     if billboard_target is not None:
         mode = "live_target"
         basis[_BILLBOARD_TARGET_PROP] = billboard_target.name
-    elif _active_view_rotation(scene) is not None:
-        mode = "live_viewport"
-    elif scene.camera is not None:
-        mode = "live_camera"
+        _constrain_billboard(basis, billboard_target)
     else:
-        mode = "live_fallback"
+        if _active_view_rotation(scene) is not None:
+            mode = "live_viewport"
+        elif scene.camera is not None:
+            mode = "live_camera"
+        else:
+            mode = "live_fallback"
+        _constrain_billboard(basis, _scene_view_root(scene, create=True))
+        _ensure_particle_preview_runtime()
     basis[_BILLBOARD_MODE_PROP] = mode
-    _update_billboard_basis(basis, scene)
-    _ensure_particle_preview_runtime()
     return basis, mode
 
 
@@ -1487,7 +1545,6 @@ def _resolve_source(source):
                 if redkit_module_count > module_count or (
                     redkit_module_count == module_count and rank < best_rank
                 ):
-                    # ponytail: decode cooked updater blobs only if source overlays fall short.
                     system, resolved = redkit_system, redkit_path
                     module_count, best_rank = redkit_module_count, rank
     except Exception:

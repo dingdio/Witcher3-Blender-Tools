@@ -472,6 +472,7 @@ from .ui import ui_physics
 from .ui import ui_environment
 from .ui import armature_context
 from .ui import ui_cache_export
+from .ui import ui_timers
 from . import lipsync
 from . import livelink_face
 from . import strings_browser
@@ -4150,9 +4151,6 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                     coords.prop(scene_settings, "terrain_tile_x", text="Tile X")
                     coords.prop(scene_settings, "terrain_tile_y", text="Tile Y")
                     col.prop(scene_settings, "terrain_include_foliage", text="Include Foliage")
-                    foliage_detail = col.row()
-                    foliage_detail.enabled = bool(scene_settings.terrain_include_foliage)
-                    foliage_detail.prop(scene_settings, "terrain_foliage_mode", text="Foliage Detail")
                     actions = col.row(align=True)
                     import_op = actions.operator("witcher.import_world_tile", text="Import Tile", icon='IMPORT')
                     import_op.use_view = False
@@ -4420,7 +4418,7 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
             if scene_settings and hasattr(scene_settings, "foliage_load_radius"):
                 controls.prop(scene_settings, "foliage_load_radius", text="Radius (World Units)")
             controls.operator("witcher.load_foliage_around_camera", text="Load Foliage Around Camera", icon='PARTICLE_DATA')
-            controls.operator("witcher.hydrate_foliage_sources", text="Load Full Sources", icon='IMPORT')
+            controls.operator("witcher.hydrate_foliage_sources", text="Retry Missing Sources", icon='IMPORT')
             if scene_settings and hasattr(scene_settings, "foliage_viewport_distance_culling"):
                 viewport_box = controls.box()
                 viewport_box.label(text="Viewport Quality")
@@ -4438,14 +4436,16 @@ class WITCH_PT_Terrain(WITCH_PT_Base, bpy.types.Panel):
                 )
                 viewport_box.prop(
                     scene_settings,
+                    "foliage_viewport_use_ground_density",
+                    text="Limit Ground Cover",
+                )
+                density_row = viewport_box.row(align=True)
+                density_row.enabled = bool(scene_settings.foliage_viewport_use_ground_density)
+                density_row.prop(
+                    scene_settings,
                     "foliage_viewport_ground_density",
                     text="Ground Cover Density",
                     slider=True,
-                )
-                viewport_box.prop(
-                    scene_settings,
-                    "foliage_viewport_fast_materials",
-                    text="Fast Foliage Materials",
                 )
             row = controls.row(align=True)
             row.operator("witcher.check_foliage_world", text="World Info", icon='INFO')
@@ -4932,6 +4932,11 @@ class WITCH_PT_Main(WITCH_PT_Base, bpy.types.Panel):
                     icon='ARMATURE_DATA'
                 )
 
+                col.separator()
+                timer_box = col.box()
+                timer_box.label(text="Background Timers", icon='TIME')
+                ui_timers.draw_timer_controls(timer_box.column(align=True))
+
         # ══ SETTINGS TAB ══════════════════════════════════════════
         elif tab == "SETTINGS":
             body = section("witcher_settings_cache", "Cache Management", 'FILE_FOLDER')
@@ -5264,6 +5269,7 @@ def register():
         set=_collection_visible_on_start_set,
     )
     armature_context.register()
+    ui_timers.register()
     for cls in _classes:
         register_class(cls)
     bpy.types.Scene.witcher_terrain_texture_layers = CollectionProperty(
@@ -5327,6 +5333,8 @@ def unregister():
     import_particle.unregister_particle_preview_runtime()
     ui_map.import_blender_fun.unregister_deferred_material_load_handler()
     ui_map.unregister_view_lod_timer()
+    from .importers import import_foliage
+    import_foliage.cancel_background_source_hydration()
     # Safe no-op when dev features were never registered.
     try:
         from . import dev
@@ -5382,6 +5390,7 @@ def unregister():
     armature_context.unregister()
     for cls in _classes:
         unregister_class(cls)
+    ui_timers.unregister()
     ui_import_menu.unregister()
     ui_texture_export.unregister()
     ui_cutscene.unregister()

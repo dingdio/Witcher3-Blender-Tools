@@ -2363,11 +2363,16 @@ class Entity(base_w3):
                 inventoryDefinitions = None,
                 beh_paths = None,
                 included_template_paths = None,
+                template_dependency_paths = None,
                 w2_body_part_states = None,
                 cookedEffects = None,
                 isLightOn = None,
+                type = None,
+                unsupported_components = None,
+                plan_components = None,
                 **kwargs):
         self.name:str = name
+        self.type = type
         self.MovingPhysicalAgentComponent = MovingPhysicalAgentComponent
         self.appearances = appearances
         self.staticMeshes = staticMeshes
@@ -2379,12 +2384,19 @@ class Entity(base_w3):
         self.inventoryDefinitions = inventoryDefinitions if inventoryDefinitions is not None else []
         self.beh_paths: list = beh_paths if beh_paths is not None else []
         self.included_template_paths: list = included_template_paths if included_template_paths is not None else []
+        self.template_dependency_paths: list = template_dependency_paths if template_dependency_paths is not None else []
         self.w2_body_part_states: dict = w2_body_part_states if w2_body_part_states is not None else {}
         self.cookedEffects: list = cookedEffects if cookedEffects is not None else []
         self.isLightOn = isLightOn
+        self.unsupported_components = (
+            list(unsupported_components) if unsupported_components is not None else []
+        )
+        self.plan_components = list(plan_components) if plan_components is not None else []
 
     @classmethod
     def from_json(cls, data):
+        if not data.get("type") and data.get("entity_class"):
+            data["type"] = data["entity_class"]
         if "MovingPhysicalAgentComponent" in data and isinstance(data["MovingPhysicalAgentComponent"], dict):
             data["MovingPhysicalAgentComponent"] = CMovingPhysicalAgentComponent.from_json(data["MovingPhysicalAgentComponent"])
         else:

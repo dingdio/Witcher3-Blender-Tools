@@ -1,6 +1,9 @@
 import copy
 import logging
 import re
+import threading
+import time
+from contextvars import ContextVar
 from functools import partial
 from typing import List
 log = logging.getLogger(__name__)
@@ -8,7 +11,7 @@ log = logging.getLogger(__name__)
 import os
 from pathlib import Path
 
-from .common_blender import repo_file, redkit_repo_context
+from .common_blender import get_repo_resolution_context, repo_file, redkit_repo_context
 from .CR2W_file import create_level, read_CR2W
 from .CR2W_types import Entity_Type_List, getCR2W, is_entity_chunk
 from .bStream import bStream, bReadStream
@@ -17,9 +20,10 @@ from .read_json_w3 import readCSkeletonData
 from . import w3_types
 from ..repo_paths import materialize_entity_repo_path, resolve_w2_repo_file_from_source
 
-# Session-scoped cache for LoadCEntityTemplateFile results.
-# Cleared between imports via clear_template_cache().
 _template_file_cache = {}
+_template_file_cache_lock = threading.RLock()
+_template_file_cache_inflight = {}
+_template_dependency_collectors = ContextVar("template_dependency_collectors", default=())
 _prop_to_string = partial(prop_to_string, default=None)
 
 _DEPOT_PATH_ROOTS = (
@@ -59,7 +63,170 @@ _KNOWN_REPO_EXTS = (
 
 def clear_template_cache():
     """Clear the template file parse cache. Call at the start of each import."""
-    _template_file_cache.clear()
+    with _template_file_cache_lock:
+        _template_file_cache.clear()
+    _dep_stat_memo.clear()
+
+
+_dep_stat_memo = {}
+
+
+def _dependencies_current(dependencies):
+    # Repo priority changes require clear_template_cache().
+    now = time.monotonic()
+    for signature in dependencies:
+        kind = signature[0] if signature else None
+        if kind == "file":
+            path, mtime, size = signature[1], signature[2], signature[3]
+        elif kind == "repo":
+            path, mtime, size = signature[4], signature[5], signature[6]
+        else:
+            continue
+        if not path:
+            continue
+        memo = _dep_stat_memo.get(path)
+        if memo is not None and memo[0] > now:
+            current = memo[1]
+        else:
+            try:
+                stat = os.stat(path)
+                current = (
+                    int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+                    int(stat.st_size),
+                )
+            except OSError:
+                current = (0, 0)
+            _dep_stat_memo[path] = (now + 3.0, current)
+        if current != (mtime, size):
+            return False
+    return True
+
+
+def _template_file_signature(path_value):
+    raw_path = str(path_value or "").strip()
+    if not raw_path:
+        return "file", "", 0, 0
+    path = os.path.normcase(os.path.normpath(os.path.abspath(raw_path)))
+    try:
+        stat = os.stat(path)
+        return (
+            "file",
+            path,
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            int(stat.st_size),
+        )
+    except OSError:
+        return "file", path, 0, 0
+
+
+def _template_repo_signature(logical_path, resolved_path, game_version=None, source_path=""):
+    if game_version is None:
+        version = None
+    else:
+        try:
+            version = int(game_version)
+        except Exception:
+            version = None
+    logical_path = str(logical_path or "").replace("/", "\\").strip()
+    source_path = os.path.normcase(os.path.normpath(os.path.abspath(str(source_path)))) if source_path else ""
+    file_signature = _template_file_signature(resolved_path)
+    return (
+        "repo",
+        logical_path,
+        source_path,
+        version,
+        file_signature[1],
+        file_signature[2],
+        file_signature[3],
+    )
+
+
+def _record_template_dependency(path_value):
+    signature = _template_file_signature(path_value)
+    for collector in _template_dependency_collectors.get():
+        collector.add(signature)
+    return signature
+
+
+def _record_template_repo_dependency(logical_path, resolved_path, game_version=None, source_path=""):
+    signature = _template_repo_signature(
+        logical_path,
+        resolved_path,
+        game_version,
+        source_path,
+    )
+    for collector in _template_dependency_collectors.get():
+        collector.add(signature)
+    return signature
+
+
+def _read_template_dependency_cr2w(path_value):
+    _record_template_dependency(path_value)
+    return read_CR2W(path_value)
+
+
+def _cached_template_result(cache_key):
+    with _template_file_cache_lock:
+        record = _template_file_cache.get(cache_key)
+        if isinstance(record, dict) and "value" in record:
+            value = record["value"]
+            dependencies = tuple(record.get("dependencies", ()))
+        else:
+            value = record
+            dependencies = ()
+    if value is None:
+        return None
+    if not _dependencies_current(dependencies):
+        with _template_file_cache_lock:
+            _template_file_cache.pop(cache_key, None)
+        return None
+    for collector in _template_dependency_collectors.get():
+        collector.update(dependencies)
+    return copy.deepcopy(value)
+
+
+def _store_template_result(cache_key, value):
+    if isinstance(value, tuple) and value:
+        try:
+            value[0].plan_complete = True
+        except Exception:
+            pass
+    collectors = _template_dependency_collectors.get()
+    dependencies = tuple(sorted(collectors[-1], key=repr)) if collectors else ()
+    dependency_paths = [
+        signature[1] if signature[0] == "file" else signature[4]
+        for signature in dependencies
+        if signature and signature[0] in {"file", "repo"}
+    ]
+    if isinstance(value, tuple) and value:
+        try:
+            value[0].template_dependency_paths = list(dependency_paths)
+        except Exception:
+            pass
+        if len(value) > 1 and value[1] is not None:
+            try:
+                value[1].template_dependency_paths = list(dependency_paths)
+            except Exception:
+                pass
+            try:
+                value[0].unsupported_components = list(
+                    getattr(value[1], "unsupported_components", None) or []
+                )
+            except Exception:
+                pass
+    with _template_file_cache_lock:
+        for old_key in tuple(_template_file_cache):
+            if (
+                old_key != cache_key
+                and old_key[0] == cache_key[0]
+                and old_key[2:] == cache_key[2:]
+            ):
+                _template_file_cache.pop(old_key, None)
+        _template_file_cache[cache_key] = {
+            "value": value,
+            "dependencies": dependencies,
+        }
+    return copy.deepcopy(value)
 
 
 def _flat_compiled_file(cr2w_file):
@@ -162,8 +329,28 @@ def _candidate_import_indices(import_index):
     return out
 
 
-def _template_cache_key(template_filename: str) -> str:
-    return str(template_filename or "").lower().replace("/", "\\")
+def _template_cache_key(template_filename: str, game_version=None):
+    path = os.path.normcase(os.path.normpath(os.path.abspath(str(template_filename or ""))))
+    try:
+        stat = os.stat(path)
+        file_identity = (
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+            int(stat.st_size),
+        )
+    except OSError:
+        file_identity = (0, 0)
+    try:
+        depot_context = get_repo_resolution_context(path)
+    except Exception:
+        depot_context = ((), False, (), ())
+    if game_version is None:
+        version = None
+    else:
+        try:
+            version = int(game_version)
+        except Exception:
+            version = None
+    return path, file_identity, version, depot_context
 
 
 def _normalize_repo_subpath(depot_subpath: str, expected_ext: str):
@@ -470,6 +657,7 @@ def _collect_w2_related_entity_paths(cr2w_file):
 
 def _load_w2_related_files_recursive(cr2w_file, inherit_visited):
     out = []
+    complete = True
     seen_paths = set(inherit_visited or set())
     queue = [cr2w_file]
     while queue:
@@ -477,19 +665,27 @@ def _load_w2_related_files_recursive(cr2w_file, inherit_visited):
         for depot_path in _collect_w2_related_entity_paths(source_file):
             try:
                 full_path = _resolve_w2_related_full_path(source_file, depot_path)
+                _record_template_repo_dependency(
+                    depot_path,
+                    full_path,
+                    getattr(getattr(source_file, "HEADER", None), "version", None),
+                    getattr(source_file, "fileName", ""),
+                )
                 norm_full_path = os.path.normcase(os.path.normpath(full_path))
             except Exception:
+                complete = False
                 continue
             if norm_full_path in seen_paths:
                 continue
             seen_paths.add(norm_full_path)
             try:
-                related_file = read_CR2W(full_path)
+                related_file = _read_template_dependency_cr2w(full_path)
             except Exception:
+                complete = False
                 continue
             out.append((depot_path, full_path, related_file))
             queue.append(related_file)
-    return out
+    return out, complete
 
 
 def _w2_repo_roots_from_file_path(file_name: str):
@@ -724,6 +920,14 @@ def _resolve_mesh_path(chunk, mesh_value):
         return embedded_source_path
     return None
 
+
+def _resolve_component_mesh(chunk, component, next_mesh_import_path):
+    component.mesh = _resolve_mesh_path(chunk, component.mesh)
+    if not component.mesh:
+        component.mesh = next_mesh_import_path()
+    return component
+
+
 def _chunk_props_summary(chunk, limit=10):
     props = getattr(chunk, "PROPS", None) or []
     out = []
@@ -788,6 +992,7 @@ class ModelEnt(object):
         self.templateFilename = templateFilename
         self.ns = ns
         self.chunks = []
+        self.template_dependency_paths = []
         #self.animation_face_object = False
     def __getitem__(self, item):
         return getattr(self, item)
@@ -1105,6 +1310,17 @@ class CClothComponent(JsonChunk):
         self.resource = resource
         self.name = name
 
+class CFoliageComponent(JsonChunk):
+    def __init__(self, srt, name: str = "", transform=None, transformParent=None,
+                 srt_entries=None, srt_entry: str = ""):
+        super(CFoliageComponent, self).__init__()
+        self.srt = srt
+        self.name = name
+        self.transform = transform
+        self.transformParent = transformParent
+        self.srt_entries = dict(srt_entries or {})
+        self.srt_entry = srt_entry
+
 class CMorphedMeshComponent(JsonChunk):
     """docstring for CMorphedMeshComponent."""
     def __init__(self, morphTarget:str, morphSource:str, morphComponentId:str):
@@ -1393,13 +1609,68 @@ def _extract_cname_array_values(prop):
     return out
 
 
+def _entity_class_from_chunks(chunks) -> str:
+    chunks = list(chunks or [])
+    templates = [chunk for chunk in chunks if getattr(chunk, "Type", None) == "CEntityTemplate"]
+
+    for template in templates:
+        entity_class = str(_chunk_prop_string(template, "entityClass") or "").strip()
+        if entity_class and entity_class != "CName":
+            return entity_class
+
+    for template in templates:
+        for prop_name in ("cookedEntityObject", "entityObject"):
+            prop = _find_prop_by_name(template, prop_name)
+            if prop is None:
+                continue
+            value = getattr(prop, "Value", None)
+            indices = [value - 1] if isinstance(value, int) and value > 0 else []
+            indices.extend(
+                ref for ref in (getattr(handle, "Reference", None) for handle in getattr(prop, "Handles", None) or [])
+                if isinstance(ref, int)
+            )
+            for index in indices:
+                if 0 <= index < len(chunks):
+                    entity_type = str(getattr(chunks[index], "Type", "") or "").strip()
+                    if entity_type:
+                        return entity_type
+
+    for chunk in chunks:
+        if getattr(chunk, "Type", None) == "CEntityTemplate":
+            continue
+        if is_entity_chunk(chunk) or hasattr(chunk, "Components"):
+            return str(getattr(chunk, "Type", "") or "").strip()
+
+    if chunks and getattr(chunks[0], "Type", None) != "CEntityTemplate":
+        return str(getattr(chunks[0], "Type", "") or "").strip()
+    return ""
+
+
+def _entity_class_from_cr2w(cr2w_file) -> str:
+    entity_class = _entity_class_from_chunks(
+        getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None)
+    )
+    if entity_class:
+        return entity_class
+    flat_compiled = _flat_compiled_file(cr2w_file)
+    return _entity_class_from_chunks(
+        getattr(getattr(flat_compiled, "CHUNKS", None), "CHUNKS", None)
+    ) if flat_compiled is not None else ""
+
+
 def read_entity_template_appearance_metadata(template_filename: str):
     template_filename = str(template_filename or "").strip()
     empty_result = {
         "all_names": [],
         "used_names": [],
         "default_name": "",
+        "entity_class": "",
+        "component_metadata_known": False,
         "has_armature_root": False,
+        "has_mesh_components": False,
+        "has_cloth_components": False,
+        "base_has_cloth_components": False,
+        "cloth_appearance_names": [],
         "has_inventory_entries": False,
     }
     if not template_filename:
@@ -1443,7 +1714,7 @@ def read_entity_template_appearance_metadata(template_filename: str):
         return False
 
     try:
-        cr2w_file = read_CR2W(resolved_path)
+        cr2w_file = _read_template_dependency_cr2w(resolved_path)
     except Exception:
         log.debug("Failed to read lightweight entity appearance metadata for %s", resolved_path, exc_info=True)
         return copy.deepcopy(empty_result)
@@ -1456,58 +1727,184 @@ def read_entity_template_appearance_metadata(template_filename: str):
         used_seen = set()
         root_used_seen = set()
         has_armature_root = False
+        has_mesh_components = False
+        has_cloth_components = False
+        base_has_cloth_components = False
+        cloth_appearance_keys = set()
         has_inventory_entries = False
+        component_metadata_known = True
+        entity_class = _entity_class_from_cr2w(cr2w_file)
+        file_appearance_names = {}
 
         files_to_scan = [cr2w_file]
         if getattr(getattr(cr2w_file, "HEADER", None), "version", 999) <= 115:
             try:
                 norm_path = os.path.normcase(os.path.normpath(resolved_path))
-                related_files = _load_w2_related_files_recursive(cr2w_file, {norm_path})
+                related_files, related_complete = _load_w2_related_files_recursive(
+                    cr2w_file,
+                    {norm_path},
+                )
+                component_metadata_known = component_metadata_known and related_complete
                 files_to_scan.extend(related_file for _depot_path, _full_path, related_file in related_files)
             except Exception:
+                component_metadata_known = False
                 log.debug("Failed to scan related Witcher 2 metadata for %s", resolved_path, exc_info=True)
+            base_file_ids = {id(source_file) for source_file in files_to_scan}
         else:
             seen_paths = {os.path.normcase(os.path.normpath(resolved_path))}
+            loaded_files_by_path = {
+                os.path.normcase(os.path.normpath(resolved_path)): cr2w_file,
+            }
             with redkit_repo_context(resolved_path):
-                for source_file in files_to_scan:
-                    for chunk in getattr(getattr(source_file, "CHUNKS", None), "CHUNKS", None) or []:
-                        if getattr(chunk, "Type", None) != "CEntityTemplate":
-                            continue
-                        for depot_path in _resolve_repo_paths_from_array(chunk, "includes", ".w2ent"):
-                            try:
-                                include_path = materialize_entity_repo_path(
-                                    depot_path,
-                                    version=getattr(getattr(source_file, "HEADER", None), "version", 999),
+
+                def _load_template_includes(queue, seen):
+                    loaded_files = []
+                    complete = True
+                    while queue:
+                        depot_path, owner_file = queue.pop(0)
+                        try:
+                            include_path = materialize_entity_repo_path(
+                                depot_path,
+                                version=getattr(getattr(owner_file, "HEADER", None), "version", 999),
+                            )
+                            if not include_path or not os.path.exists(include_path):
+                                complete = False
+                                continue
+                            norm_include_path = os.path.normcase(os.path.normpath(include_path))
+                            if norm_include_path in seen:
+                                continue
+                            seen.add(norm_include_path)
+                            include_file = loaded_files_by_path.get(norm_include_path)
+                            if include_file is None:
+                                include_file = _read_template_dependency_cr2w(include_path)
+                                loaded_files_by_path[norm_include_path] = include_file
+                            loaded_files.append(include_file)
+                            for include_chunk in getattr(getattr(include_file, "CHUNKS", None), "CHUNKS", None) or []:
+                                if getattr(include_chunk, "Type", None) != "CEntityTemplate":
+                                    continue
+                                queue.extend(
+                                    (included_path, include_file)
+                                    for included_path in _resolve_repo_paths_from_array(
+                                        include_chunk,
+                                        "includes",
+                                        ".w2ent",
+                                    )
                                 )
-                                if not include_path or not os.path.exists(include_path):
+                        except Exception:
+                            complete = False
+                            log.debug("Failed to scan included entity metadata for %s", depot_path, exc_info=True)
+                    return loaded_files, complete
+
+                root_queue = [
+                    (depot_path, source_file)
+                    for source_file in files_to_scan
+                    for chunk in getattr(getattr(source_file, "CHUNKS", None), "CHUNKS", None) or []
+                    if getattr(chunk, "Type", None) == "CEntityTemplate"
+                    for depot_path in _resolve_repo_paths_from_array(chunk, "includes", ".w2ent")
+                ]
+                included_files, includes_complete = _load_template_includes(root_queue, seen_paths)
+                component_metadata_known = component_metadata_known and includes_complete
+                files_to_scan.extend(included_files)
+
+                base_files_to_scan = list(files_to_scan)
+                base_file_ids = {id(source_file) for source_file in base_files_to_scan}
+                all_file_ids = set(base_file_ids)
+
+                for source_file in base_files_to_scan:
+                    for chunk in getattr(getattr(source_file, "CHUNKS", None), "CHUNKS", None) or []:
+                        chunk_type = getattr(chunk, "Type", None)
+                        if chunk_type == "CEntityTemplate":
+                            appearances = _iter_struct_items(chunk.GetVariableByName("appearances"))
+                        elif chunk_type == "CEntityExternalAppearance":
+                            appearance = chunk.GetVariableByName("appearance")
+                            appearances = [appearance] if appearance is not None else []
+                        else:
+                            continue
+                        for appearance in appearances:
+                            appearance_name = str(
+                                _prop_to_string(_find_prop_by_name(appearance, "name")) or ""
+                            ).strip()
+                            included_templates = _find_prop_by_name(appearance, "includedTemplates")
+                            handles = list(getattr(included_templates, "Handles", None) or [])
+                            depot_paths = []
+                            depot_seen = set()
+                            for handle in handles:
+                                depot_path = _resolve_handle_repo_path(chunk, handle, ".w2ent")
+                                if not depot_path:
+                                    component_metadata_known = False
                                     continue
-                                norm_include_path = os.path.normcase(os.path.normpath(include_path))
-                                if norm_include_path in seen_paths:
+                                depot_key = _repo_path_key(depot_path)
+                                if depot_key in depot_seen:
                                     continue
-                                seen_paths.add(norm_include_path)
-                                files_to_scan.append(read_CR2W(include_path))
-                            except Exception:
-                                log.debug("Failed to scan included entity metadata for %s", depot_path, exc_info=True)
+                                depot_seen.add(depot_key)
+                                depot_paths.append(depot_path)
+                            if not handles:
+                                depot_path = _normalize_repo_path_value(
+                                    _prop_to_string(included_templates),
+                                    ".w2ent",
+                                )
+                                if depot_path:
+                                    depot_paths.append(depot_path)
+                            if not depot_paths:
+                                continue
+                            appearance_files, appearance_complete = _load_template_includes(
+                                [(depot_path, source_file) for depot_path in depot_paths],
+                                set(),
+                            )
+                            component_metadata_known = component_metadata_known and appearance_complete
+                            if not appearance_name:
+                                component_metadata_known = False
+                            for appearance_file in appearance_files:
+                                if appearance_name:
+                                    file_appearance_names.setdefault(id(appearance_file), set()).add(
+                                        appearance_name
+                                    )
+                                if id(appearance_file) not in all_file_ids:
+                                    all_file_ids.add(id(appearance_file))
+                                    files_to_scan.append(appearance_file)
 
         for source_file in files_to_scan:
+            source_file_id = id(source_file)
+            source_appearance_names = file_appearance_names.get(source_file_id, ())
             for chunk in getattr(getattr(source_file, "CHUNKS", None), "CHUNKS", None) or []:
                 chunk_type = getattr(chunk, "Type", None)
+                if is_entity_chunk(chunk):
+                    try:
+                        streaming_data = chunk.GetVariableByName("streamingDataBuffer")
+                    except (AttributeError, TypeError):
+                        streaming_data = _find_prop_by_name(chunk, "streamingDataBuffer")
+                    if (
+                        getattr(chunk, "BufferV1", False)
+                        or getattr(chunk, "BufferV2", False)
+                        or streaming_data is not None
+                    ):
+                        component_metadata_known = False
                 if chunk_type == "CInventoryDefinition":
                     has_inventory_entries = True
                 if not has_armature_root and _chunk_has_armature_hint(chunk):
                     has_armature_root = True
+                if chunk_type in _MESH_BEARING_COMPONENT_TYPES:
+                    has_mesh_components = True
+                if chunk_type == "CClothComponent":
+                    has_cloth_components = True
+                    if source_file_id in base_file_ids:
+                        base_has_cloth_components = True
+                    cloth_appearance_keys.update(
+                        name.lower() for name in source_appearance_names if name
+                    )
                 if chunk_type == "CEntityTemplate":
-                    used_prop = chunk.GetVariableByName("usedAppearances")
-                    if used_prop:
-                        for name in _extract_cname_array_values(used_prop):
-                            _append_name(used_names, used_seen, name)
-                            if source_file is cr2w_file:
-                                _append_name(root_used_names, root_used_seen, name)
+                    if source_file_id in base_file_ids:
+                        used_prop = chunk.GetVariableByName("usedAppearances")
+                        if used_prop:
+                            for name in _extract_cname_array_values(used_prop):
+                                _append_name(used_names, used_seen, name)
+                                if source_file is cr2w_file:
+                                    _append_name(root_used_names, root_used_seen, name)
 
-                    appearances_prop = chunk.GetVariableByName("appearances")
-                    for appearance in _iter_struct_items(appearances_prop):
-                        name = _prop_to_string(_find_prop_by_name(appearance, "name"))
-                        _append_name(all_names, all_seen, name)
+                        appearances_prop = chunk.GetVariableByName("appearances")
+                        for appearance in _iter_struct_items(appearances_prop):
+                            name = _prop_to_string(_find_prop_by_name(appearance, "name"))
+                            _append_name(all_names, all_seen, name)
 
                     flat_compiled = getattr(chunk, "flatCompiledData", None)
                     sub_chunks = getattr(getattr(flat_compiled, "CHUNKS", None), "CHUNKS", None) or []
@@ -1515,7 +1912,17 @@ def read_entity_template_appearance_metadata(template_filename: str):
                         for sub_chunk in sub_chunks:
                             if not has_armature_root and _chunk_has_armature_hint(sub_chunk):
                                 has_armature_root = True
-                elif chunk_type == "CEntityExternalAppearance":
+                            sub_chunk_type = getattr(sub_chunk, "Type", None)
+                            if sub_chunk_type in _MESH_BEARING_COMPONENT_TYPES:
+                                has_mesh_components = True
+                            if sub_chunk_type == "CClothComponent":
+                                has_cloth_components = True
+                                if source_file_id in base_file_ids:
+                                    base_has_cloth_components = True
+                                cloth_appearance_keys.update(
+                                    name.lower() for name in source_appearance_names if name
+                                )
+                elif chunk_type == "CEntityExternalAppearance" and source_file_id in base_file_ids:
                     appearance = chunk.GetVariableByName("appearance")
                     name = _prop_to_string(_find_prop_by_name(appearance, "name"))
                     _append_name(all_names, all_seen, name)
@@ -1524,11 +1931,20 @@ def read_entity_template_appearance_metadata(template_filename: str):
             used_names = root_used_names
         all_keys = {name.lower() for name in all_names}
         used_names = [name for name in used_names if name.lower() in all_keys]
+        cloth_appearance_names = [
+            name for name in all_names if name.lower() in cloth_appearance_keys
+        ]
         return {
             "all_names": all_names,
             "used_names": used_names,
             "default_name": used_names[0] if used_names else (all_names[0] if all_names else ""),
+            "entity_class": entity_class,
+            "component_metadata_known": component_metadata_known,
             "has_armature_root": has_armature_root,
+            "has_mesh_components": has_mesh_components,
+            "has_cloth_components": has_cloth_components,
+            "base_has_cloth_components": base_has_cloth_components,
+            "cloth_appearance_names": cloth_appearance_names,
             "has_inventory_entries": has_inventory_entries,
         }
     except Exception:
@@ -2196,6 +2612,7 @@ def _make_w2_mimic_proxy_chunk(source_chunk, head_name, mesh_path, mesh_role, me
     proxy.w2_mimic_float_track_skeleton = metadata.get("float_track_skeleton", "")
     proxy.w2_mimic_skeleton_embedded_source = metadata.get("skeleton_embedded_source", "")
     proxy.w2_mimic_skeleton_embedded_chunk_index = metadata.get("skeleton_embedded_chunk_index", -1)
+    proxy.w2_mimic_embedded_skeleton_data = metadata.get("embedded_skeleton_data")
     proxy.w2_mimic_faces = metadata.get(f"mimic_faces_{mesh_role}", "")
     proxy.w2_mimic_faces_high = metadata.get("mimic_faces_high", "")
     proxy.w2_mimic_faces_low = metadata.get("mimic_faces_low", "")
@@ -2389,7 +2806,51 @@ def _w2_head_parent_slot_name(chunks):
     return ""
 
 
-def _build_w2_head_chunks(chunks, head_name):
+def _w2_embedded_skeleton_data_for_plan(cr2w_file, chunk_index):
+    source_path = str(getattr(cr2w_file, "fileName", "") or "").strip()
+    if not source_path or not os.path.isfile(source_path):
+        return None
+    try:
+        chunk_index = int(chunk_index)
+    except Exception:
+        return None
+    if chunk_index < 0:
+        return None
+    try:
+        from .dc_skeleton import _read_w2_mimic_skeleton, read_skelly
+
+        with open(source_path, "rb") as source_file:
+            raw_data = source_file.read()
+        chunks = list(getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or [])
+        for candidate_index in dict.fromkeys((chunk_index, chunk_index - 1)):
+            if not (0 <= candidate_index < len(chunks)):
+                continue
+            chunk = chunks[candidate_index]
+            if getattr(chunk, "Type", None) != "CSkeleton":
+                continue
+            rig = _read_w2_mimic_skeleton(cr2w_file, raw_data, candidate_index)
+            if rig is None or not getattr(rig, "names", None):
+                rig = read_skelly(chunk)
+            if not getattr(rig, "names", None):
+                continue
+            skeleton_data = readCSkeletonData(rig)
+            bone_names = {
+                str(getattr(bone, "name", "") or "")
+                for bone in getattr(skeleton_data, "bones", []) or []
+            }
+            if {"Rootface", "head_face"}.intersection(bone_names):
+                return skeleton_data
+    except Exception:
+        log.debug(
+            "Failed to embed W2 mimic skeleton data for %s #%s",
+            source_path,
+            chunk_index,
+            exc_info=True,
+        )
+    return None
+
+
+def _build_w2_head_chunks(chunks, head_name, cr2w_file=None):
     if not head_name:
         return []
     head_chunk = _find_chunk_by_name(chunks, head_name, "CHeadDefinifion")
@@ -2462,6 +2923,11 @@ def _build_w2_head_chunks(chunks, head_name):
         "dist_for_default_head": dist_for_default_head,
         "parent_slot_name": parent_slot_name,
     }
+    if cr2w_file is not None and skeleton_embedded_chunk_index is not None:
+        metadata["embedded_skeleton_data"] = _w2_embedded_skeleton_data_for_plan(
+            cr2w_file,
+            skeleton_embedded_chunk_index,
+        )
     preferred_ref = mimic_high_refs[:1] or mimic_low_refs[:1]
     if preferred_ref and (metadata["mimic_skeleton"] or metadata["mimic_faces_high"] or metadata["mimic_faces_low"]):
         mesh_role = "high" if mimic_high_refs else "low"
@@ -2473,6 +2939,7 @@ def _build_w2_head_chunks(chunks, head_name):
 def _build_w2_cooked_appearance_template(file, template_chunk, appearance, current_app, chunks, base_mesh_paths):
     template_filename = f"{Path(file.fileName).stem}:{current_app.name}:cooked_bodyparts"
     model_ent = ModelEnt(template_filename, current_app.name)
+    model_ent.plan_complete = True
     seen_mesh_paths = set(base_mesh_paths or [])
     seen_signatures = set()
 
@@ -2497,7 +2964,7 @@ def _build_w2_cooked_appearance_template(file, template_chunk, appearance, curre
         model_ent.chunks.append(converted_chunk)
 
     head_name = _prop_to_string(_find_prop_by_name(appearance, "headName")) or getattr(current_app, "headName", None)
-    for head_chunk in _build_w2_head_chunks(chunks, head_name):
+    for head_chunk in _build_w2_head_chunks(chunks, head_name, file):
         mesh_path = getattr(head_chunk, "mesh", None)
         if mesh_path:
             mesh_key = _repo_path_key(mesh_path)
@@ -2525,9 +2992,16 @@ def chunk_append(new_mesh, chunk, item, added_chunks=None):
 _KNOWN_STRUCTURAL_CHUNKS = {
     'CWetnessComponent',
     'CItemEntity', # Handled separately in ReadTemplate (streaming buffer path).
+    "CEquipmentDefinition",
+    "CEquipmentDefinitionEntry",
     "CEntityTemplate",
     "CEntity",
     "CGameplayEntity",
+    "CInventoryComponent",
+    "CInventoryDefinition",
+    "CInventoryDefinitionEntry",
+    "CInventoryInitializerRandom",
+    "CInventoryInitializerUniform",
     "CActor",
     "CNewNPC",
     "CR4Player",
@@ -2547,6 +3021,7 @@ _KNOWN_STRUCTURAL_CHUNKS = {
     "CHeadDefinifion",
     "CSkeleton",
     "CMimicFaces",
+    "CR4LootParam",
 }
 
 _STREAMED_ITEM_CHUNK_TYPES = {
@@ -2559,13 +3034,126 @@ _STREAMED_ITEM_CHUNK_TYPES = {
 }
 
 _VISUAL_MESH_COMPONENT_TYPES = {
+    "CBgMeshComponent",
+    "CBgNpcItemComponent",
+    "CBoatBodyComponent",
+    "CImpostorMeshComponent",
     "CMeshComponent",
+    "CMergedMeshComponent",
+    "CMergedShadowMeshComponent",
+    "CNavmeshComponent",
     "CStaticMeshComponent",
     "CFurComponent",
     "CRigidMeshComponent",
+    "CRigidMeshComponentCooked",
     "CRagdollMeshComponent",
+    "CScriptedDestroyableComponent",
     "CDressMeshComponent",
+    "CWindowComponent",
 }
+
+_MESH_BEARING_COMPONENT_TYPES = _VISUAL_MESH_COMPONENT_TYPES | {"CMorphedMeshComponent"}
+
+_SUPPORTED_ENTITY_VISUAL_CHUNKS = _VISUAL_MESH_COMPONENT_TYPES | {
+    "CAnimatedAttachment",
+    "CAnimatedComponent",
+    "CAnimDangleBufferComponent",
+    "CAnimDangleComponent",
+    "CCameraComponent",
+    "CClothComponent",
+    "CDynamicFoliageComponent",
+    "CExternalProxyAttachment",
+    "CExternalProxyComponent",
+    "CGameplayLightComponent",
+    "CHeadAttachment",
+    "CHardAttachment",
+    "CMeshSkinningAttachment",
+    "CMimicComponent",
+    "CMorphedMeshComponent",
+    "CMovingPhysicalAgentComponent",
+    "CPointLightComponent",
+    "CSkeletonBoneSlot",
+    "CSpotLightComponent",
+    "CSwitchableFoliageComponent",
+}
+
+
+def _destruction_plan_component_from_chunk(chunk):
+    chunk_type = str(getattr(chunk, "Type", "") or getattr(chunk, "name", "") or "")
+    if chunk_type == "CDestructionComponent":
+        kind = "component_mesh"
+        resource_names = ("m_baseResource", "resource")
+        expected_exts = (".reddest",)
+    elif chunk_type == "CDestructionSystemComponent":
+        kind = "cloth"
+        resource_names = ("m_resource", "resource")
+        expected_exts = (".redapex", ".redcloth", ".apx")
+    else:
+        return None
+
+    repo_path = ""
+    for prop_name in resource_names:
+        repo_path = _resolve_repo_path(chunk, prop_name, expected_exts) or ""
+        if repo_path:
+            break
+    if not repo_path:
+        return None
+
+    transform_prop = _find_prop_by_name(chunk, "transform")
+    drawable_prop = _find_prop_by_name(chunk, "drawableFlags")
+    drawable_flags = getattr(drawable_prop, "Value", None)
+    if drawable_flags is None and drawable_prop is not None:
+        drawable_flags = _prop_to_string(drawable_prop)
+    component_name = _chunk_prop_string(chunk, "name")
+    return {
+        "kind": kind,
+        "name": component_name or Path(repo_path.replace("\\", "/")).stem or chunk_type,
+        "repo_path": repo_path,
+        "transform": getattr(transform_prop, "EngineTransform", None),
+        "component_type": chunk_type,
+        "component_name": component_name,
+        "action_name": _chunk_prop_string(chunk, "actionName"),
+        "drawable_flags": drawable_flags,
+    }
+
+
+def _unsupported_entity_visual_chunk_types(chunks):
+    unsupported = []
+    visual_tokens = (
+        "Anim",
+        "Cloth",
+        "Decal",
+        "Destruction",
+        "Effect",
+        "Fur",
+        "Light",
+        "Mesh",
+        "Mimic",
+        "Particle",
+        "Visual",
+    )
+    for chunk in chunks or []:
+        chunk_type = str(
+            getattr(chunk, "Type", "") or getattr(chunk, "name", "") or ""
+        ).strip()
+        if (
+            not chunk_type
+            or chunk_type in _KNOWN_STRUCTURAL_CHUNKS
+            or chunk_type in _SUPPORTED_ENTITY_VISUAL_CHUNKS
+            or chunk_type.startswith("CAnimDangleConstraint_")
+            or is_entity_chunk(chunk)
+        ):
+            continue
+        is_visual_candidate = (
+            chunk_type.endswith(("Attachment", "Component", "Slot"))
+            or (
+                any(token in chunk_type for token in visual_tokens)
+                and not chunk_type.endswith(("Entity", "Param"))
+            )
+        )
+        if is_visual_candidate and chunk_type not in unsupported:
+            unsupported.append(chunk_type)
+    return unsupported
 
 # Synthetic chunk indices for streamed items live well above any real chunk index
 # so the hard attachments we fabricate can reference each streamed mesh uniquely.
@@ -2613,6 +3201,79 @@ def _is_w2_synthetic_appearance_chunk(chunk):
     if chunk_type in {"CClothComponent", "CMorphedMeshComponent"}:
         return True
     return bool(getattr(chunk, "w2_head_support", False) or getattr(chunk, "w2_mimic_support", False))
+
+
+_switchable_foliage_cache = {}
+
+
+def _switchable_foliage_entries(w2sf_repo_path):
+    key = _repo_path_key(w2sf_repo_path)
+    if not key:
+        return {}
+    cached = _switchable_foliage_cache.get(key)
+    if cached is not None:
+        return dict(cached)
+
+    entries = {}
+    try:
+        abs_path = repo_file(w2sf_repo_path)
+        if abs_path and os.path.isfile(abs_path):
+            from .dc_environment import resource_path as _handle_resource_path
+            w2sf = read_CR2W(abs_path)
+            for res_chunk in w2sf.CHUNKS.CHUNKS:
+                if getattr(res_chunk, "Type", None) != "CSwitchableFoliageResource":
+                    continue
+                entries_prop = res_chunk.GetVariableByName("entries")
+                for element in getattr(entries_prop, "More", None) or []:
+                    entry_name = srt = None
+                    for sub in getattr(element, "MoreProps", None) or []:
+                        if getattr(sub, "theName", None) == "name":
+                            entry_name = _prop_to_string(sub)
+                        elif getattr(sub, "theName", None) == "tree":
+                            srt = _normalize_repo_path_value(_handle_resource_path(sub), ".srt")
+                    if entry_name and srt:
+                        entries[str(entry_name)] = srt
+    except Exception:
+        log.warning("Failed to read switchable foliage resource: %s", w2sf_repo_path, exc_info=True)
+    _switchable_foliage_cache[key] = dict(entries)
+    return entries
+
+
+def _foliage_component_from_chunk(chunk):
+    name = _chunk_prop_string(chunk, "name")
+    transform_prop = chunk.GetVariableByName("transform")
+    transform = getattr(transform_prop, "EngineTransform", None) if transform_prop else None
+    parent_prop = chunk.GetVariableByName("transformParent")
+    parent_value = getattr(parent_prop, "Value", None) if parent_prop else None
+    transform_parent = parent_value - 1 if isinstance(parent_value, int) else None
+
+    if chunk.Type == "CDynamicFoliageComponent":
+        srt = _resolve_repo_path(chunk, "baseTree", ".srt")
+        if not srt:
+            log.warning(
+                "CDynamicFoliageComponent #%s has no resolvable baseTree; props=%s",
+                chunk.ChunkIndex, _chunk_props_summary(chunk),
+            )
+            return None
+        return CFoliageComponent(srt, name=name, transform=transform, transformParent=transform_parent)
+
+    resource = _resolve_repo_path(chunk, "resource", ".w2sf")
+    entries = _switchable_foliage_entries(resource)
+    if not entries:
+        log.warning(
+            "CSwitchableFoliageComponent #%s has no resolvable entries (resource=%s)",
+            chunk.ChunkIndex, resource,
+        )
+        return None
+    # The engine selects the active entry at runtime.
+    entry = "full" if "full" in entries else next(iter(entries))
+    return CFoliageComponent(
+        entries[entry], name=name, transform=transform, transformParent=transform_parent,
+        srt_entries=entries, srt_entry=entry,
+    )
+
+
+_FOLIAGE_COMPONENT_TYPES = ("CDynamicFoliageComponent", "CSwitchableFoliageComponent")
 
 
 def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
@@ -2708,9 +3369,7 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
             )
             return False
 
-        streamed_component.mesh = _resolve_mesh_path(streamed_chunk, streamed_component.mesh)
-        if not streamed_component.mesh:
-            streamed_component.mesh = _next_mesh_import_path()
+        streamed_component = _resolve_component_mesh(streamed_chunk, streamed_component, _next_mesh_import_path)
         if streamed_component.mesh:
             appended = _append_unique_chunk(owner_chunk, streamed_component)
             if appended:
@@ -2756,10 +3415,7 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
     
     for chunk in CHUNKS:
         if chunk.Type in ("CMeshComponent", "CStaticMeshComponent", "CDressMeshComponent"):
-            mesh_component = _coerce_w2_mesh_component_for_io(chunk, CMeshComponent(chunk).convert_for_io())
-            mesh_component.mesh = _resolve_mesh_path(chunk, mesh_component.mesh)
-            if not mesh_component.mesh:
-                mesh_component.mesh = _next_mesh_import_path()
+            mesh_component = _resolve_component_mesh(chunk, _coerce_w2_mesh_component_for_io(chunk, CMeshComponent(chunk).convert_for_io()), _next_mesh_import_path)
             if mesh_component.mesh:
                 _append_unique_chunk(chunk, mesh_component)
             else:
@@ -2768,10 +3424,7 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
                     f"props={_chunk_props_summary(chunk)}"
                 )
         elif (chunk.Type == "CRigidMeshComponent" or chunk.Type == "CRagdollMeshComponent"):
-            mesh_component = CMeshComponent(chunk).convert_for_io()
-            mesh_component.mesh = _resolve_mesh_path(chunk, mesh_component.mesh)
-            if not mesh_component.mesh:
-                mesh_component.mesh = _next_mesh_import_path()
+            mesh_component = _resolve_component_mesh(chunk, CMeshComponent(chunk).convert_for_io(), _next_mesh_import_path)
             if mesh_component.mesh:
                 _append_unique_chunk(chunk, mesh_component)
             else:
@@ -2797,10 +3450,7 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
                 chunk_append(new_mesh, chunk, CClothComponent(cloth, name=_cname))
         elif (chunk.Type == "CFurComponent"):
             if (chunk.GetVariableByName("mesh")):
-                fur_component = CMeshComponent(chunk).convert_for_io()
-                fur_component.mesh = _resolve_mesh_path(chunk, fur_component.mesh)
-                if not fur_component.mesh:
-                    fur_component.mesh = _next_mesh_import_path()
+                fur_component = _resolve_component_mesh(chunk, CMeshComponent(chunk).convert_for_io(), _next_mesh_import_path)
                 if fur_component.mesh:
                     _append_unique_chunk(chunk, fur_component)
                 else:
@@ -2808,6 +3458,19 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
                         f"Skipping CFurComponent with invalid mesh ref in template: {chunk.ChunkIndex}; "
                         f"props={_chunk_props_summary(chunk)}"
                     )
+        elif chunk.Type in _FOLIAGE_COMPONENT_TYPES:
+            foliage_component = _foliage_component_from_chunk(chunk)
+            if foliage_component is not None:
+                chunk_append(new_mesh, chunk, foliage_component)
+        elif chunk.Type in _VISUAL_MESH_COMPONENT_TYPES:
+            mesh_component = _resolve_component_mesh(chunk, CMeshComponent(chunk).convert_for_io(), _next_mesh_import_path)
+            if mesh_component.mesh:
+                _append_unique_chunk(chunk, mesh_component)
+            else:
+                log.warning(
+                    f"Skipping {chunk.Type} with invalid mesh ref in template: {chunk.ChunkIndex}; "
+                    f"props={_chunk_props_summary(chunk)}"
+                )
         elif (chunk.Type == "CMorphedMeshComponent"):
             morphTarget = _resolve_repo_path(chunk, "morphTarget", ".w2mesh")
             morphSource = _resolve_repo_path(chunk, "morphSource", ".w2mesh")
@@ -2871,26 +3534,88 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
                 )
     return new_mesh, this_Entity
 
-def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:
+def LoadCEntityTemplateFile(templateFilename: str, game_version=None) -> ModelEnt:
     if os.path.isabs(templateFilename) and os.path.exists(templateFilename):
-        fileNameFull = templateFilename
+        file_name_full = templateFilename
     else:
-        fileNameFull = materialize_entity_repo_path(templateFilename)
-    cache_key = _template_cache_key(fileNameFull)
-    if cache_key in _template_file_cache:
-        return copy.deepcopy(_template_file_cache[cache_key])
+        file_name_full = materialize_entity_repo_path(templateFilename, version=game_version)
+    root_dependency = _record_template_repo_dependency(
+        templateFilename,
+        file_name_full,
+        game_version,
+    )
+    cache_key = _template_cache_key(file_name_full, game_version)
+    current_thread = threading.get_ident()
 
+    with _template_file_cache_lock:
+        cached = _cached_template_result(cache_key)
+        if cached is not None:
+            return cached
+        pending = _template_file_cache_inflight.get(cache_key)
+        is_loader = pending is None
+        if is_loader:
+            pending = {
+                "event": threading.Event(),
+                "owner": current_thread,
+                "error": None,
+            }
+            _template_file_cache_inflight[cache_key] = pending
+        elif pending.get("owner") == current_thread:
+            raise RuntimeError(f"Cyclic entity template dependency: {templateFilename}")
+
+    if not is_loader:
+        if pending["event"].wait(timeout=60):
+            if pending.get("error") is not None:
+                raise RuntimeError(
+                    f"Entity template load failed: {templateFilename}"
+                ) from pending["error"]
+            cached = _cached_template_result(cache_key)
+            if cached is None:
+                raise RuntimeError(f"Entity template load produced no cache entry: {templateFilename}")
+            return cached
+        log.warning("Timed out waiting for in-flight entity template %s; loading in place", templateFilename)
+
+    dependency_collector = {root_dependency}
+    collector_token = _template_dependency_collectors.set(
+        _template_dependency_collectors.get() + (dependency_collector,)
+    )
+    try:
+        return _load_centity_template_file(
+            templateFilename,
+            game_version,
+            file_name_full=file_name_full,
+            cache_key=cache_key,
+        )
+    except Exception as exc:
+        if is_loader:
+            pending["error"] = exc
+        raise
+    finally:
+        _template_dependency_collectors.reset(collector_token)
+        if is_loader:
+            with _template_file_cache_lock:
+                _template_file_cache_inflight.pop(cache_key, None)
+                pending["event"].set()
+
+
+def _load_centity_template_file(
+    templateFilename: str,
+    game_version,
+    *,
+    file_name_full,
+    cache_key,
+) -> ModelEnt:
     new_mesh = ModelEnt(templateFilename, Path(templateFilename).stem)
-    cr2w_file = read_CR2W(fileNameFull)
+    cr2w_file = _read_template_dependency_cr2w(file_name_full)
     is_w2_entity = getattr(getattr(cr2w_file, "HEADER", None), "version", 999) <= 115
     parsed_entity = None
     if not is_w2_entity:
-        with redkit_repo_context(fileNameFull):
+        with redkit_repo_context(file_name_full):
             parsed_mesh, parsed_entity = ReadTemplate(cr2w_file, new_mesh)
     else:
         parsed_mesh = new_mesh
 
-    with redkit_repo_context(fileNameFull):
+    with redkit_repo_context(file_name_full):
         full_entity = create_CEntity(cr2w_file)
     full_mesh = getattr(full_entity, "staticMeshes", None)
     if full_mesh and getattr(full_mesh, "chunks", None):
@@ -2898,20 +3623,24 @@ def LoadCEntityTemplateFile(templateFilename: str) -> ModelEnt:
         if not is_w2_entity or has_full_mesh or getattr(full_entity, "appearances", None):
             full_mesh.templateFilename = templateFilename
             full_mesh.ns = Path(templateFilename).stem
-            _template_file_cache[cache_key] = (full_mesh, full_entity)
-            return copy.deepcopy(_template_file_cache[cache_key])
+            return _store_template_result(cache_key, (full_mesh, full_entity))
     if is_w2_entity and getattr(full_entity, "appearances", None):
         parsed_mesh.templateFilename = templateFilename
         parsed_mesh.ns = Path(templateFilename).stem
-        _template_file_cache[cache_key] = (parsed_mesh, full_entity)
-        return copy.deepcopy(_template_file_cache[cache_key])
+        return _store_template_result(cache_key, (parsed_mesh, full_entity))
     if not is_w2_entity and any(getattr(c, "mesh", None) for c in getattr(parsed_mesh, "chunks", [])):
-        _template_file_cache[cache_key] = (parsed_mesh, parsed_entity or full_entity)
-        return copy.deepcopy(_template_file_cache[cache_key])
-    _template_file_cache[cache_key] = (parsed_mesh, full_entity if is_w2_entity else parsed_entity)
-    return copy.deepcopy(_template_file_cache[cache_key])
+        return _store_template_result(cache_key, (parsed_mesh, parsed_entity or full_entity))
+    return _store_template_result(
+        cache_key,
+        (parsed_mesh, full_entity if is_w2_entity else parsed_entity),
+    )
 
-def create_CEntity(file, _inherit_visited=None):
+def create_CEntity(
+    file,
+    _inherit_visited=None,
+    _included_entity_assets=None,
+    _allow_unscoped_import_fallbacks=True,
+):
     hasCMovingPhysicalAgentComponent = False
     CHUNKS = file.CHUNKS.CHUNKS
     flat_compiled_file = _flat_compiled_file(file) if file.HEADER.version > 115 else None
@@ -2921,21 +3650,22 @@ def create_CEntity(file, _inherit_visited=None):
             for chunk in CHUNKS
         )
         has_resolved_components = any(
-            getattr(chunk, "Type", None) in {
-                "CAnimatedComponent",
-                "CMeshComponent",
-                "CStaticMeshComponent",
-                "CRigidMeshComponent",
-                "CClothComponent",
-                "CAnimDangleComponent",
-                "CMovingPhysicalAgentComponent",
-            }
+            getattr(chunk, "Type", None) in (
+                _VISUAL_MESH_COMPONENT_TYPES
+                | {
+                    "CAnimatedComponent",
+                    "CClothComponent",
+                    "CAnimDangleComponent",
+                    "CMovingPhysicalAgentComponent",
+                }
+            )
             for chunk in CHUNKS
         )
         if not has_external_proxies and has_resolved_components:
             flat_compiled_file = None
     this_Entity = w3_types.Entity()
     this_Entity.name = Path(file.fileName).stem
+    this_Entity.type = _entity_class_from_cr2w(file) or None
     this_Entity.version = getattr(getattr(file, "HEADER", None), "version", 999)
     this_Entity.appearances = []
     this_Entity.coloringEntries = []
@@ -2943,6 +3673,9 @@ def create_CEntity(file, _inherit_visited=None):
     this_Entity.w2_body_part_states = {}
     this_Entity.cookedEffects = []
     this_Entity.isLightOn = None
+    this_Entity.plan_components = []
+    incomplete_components = []
+    this_Entity.unsupported_components = []
     new_mesh = ModelEnt("staticMeshes", "staticMeshes")
     added_chunks = set()  # Track chunk indices already added to avoid duplicates
     streamed_attachment_slots = _read_streamed_attachment_slots(CHUNKS)
@@ -2954,7 +3687,11 @@ def create_CEntity(file, _inherit_visited=None):
     seen_animated_signatures = set()
     this_Entity.CAnimAnimsetsParam = []
     this_Entity.CAnimMimicParam = []
-    mesh_import_paths = _collect_mesh_import_paths(file)
+    mesh_import_paths = (
+        _collect_mesh_import_paths(file)
+        if _allow_unscoped_import_fallbacks
+        else []
+    )
     mesh_import_cursor = 0
     top_level_template_includes = []
     top_level_template_include_set = set()
@@ -2967,6 +3704,11 @@ def create_CEntity(file, _inherit_visited=None):
     w2_related_files = []
     w2_related_search_chunks = []
     inherit_visited = set(_inherit_visited or [])
+    included_entity_assets = {
+        str(path or "").replace("/", "\\").strip().lower(): entity
+        for path, entity in dict(_included_entity_assets or {}).items()
+        if str(path or "").strip() and entity is not None
+    }
     current_file_name = getattr(file, "fileName", None)
     if current_file_name:
         inherit_visited.add(os.path.normcase(os.path.normpath(str(current_file_name))))
@@ -3052,7 +3794,13 @@ def create_CEntity(file, _inherit_visited=None):
             return (str(entry.get("appearance", "")), str(entry.get("componentName", "")))
         return (str(getattr(entry, "appearance", "")), str(getattr(entry, "componentName", "")))
 
+    related_w2_entity_cache = None
+
     def _iter_related_w2_entities():
+        nonlocal related_w2_entity_cache
+        if related_w2_entity_cache is not None:
+            return related_w2_entity_cache
+        related_w2_entity_cache = []
         for depot_path, full_path, related_file in w2_related_files:
             norm_full_path = os.path.normcase(os.path.normpath(full_path))
             if norm_full_path in inherit_visited:
@@ -3061,11 +3809,13 @@ def create_CEntity(file, _inherit_visited=None):
                 related_entity = create_CEntity(
                     related_file,
                     _inherit_visited=inherit_visited | {norm_full_path},
+                    _included_entity_assets=included_entity_assets,
                 )
             except Exception as e:
                 log.debug("Failed to build related Witcher 2 entity '%s': %s", depot_path, e)
                 continue
-            yield depot_path, related_entity
+            related_w2_entity_cache.append((depot_path, related_entity))
+        return related_w2_entity_cache
 
     def _merge_related_inventory_definitions(target_defs, source_defs):
         target_defs = list(target_defs or [])
@@ -3160,8 +3910,7 @@ def create_CEntity(file, _inherit_visited=None):
             selected_root = cooked_root if cooked_root is not None else editor_root
             if selected_root is None:
                 continue
-            if is_entity_chunk(CHUNKS[selected_root]):
-                roots.add(selected_root)
+            roots.add(selected_root)
         return roots
 
     def _w2_attachment_parent_child_indices(chunk):
@@ -3296,7 +4045,13 @@ def create_CEntity(file, _inherit_visited=None):
             name = _chunk_prop_string(source_chunk, "name")
             skeleton = _resolve_repo_path(source_chunk, "skeleton", ".w2rig")
             if not skeleton:
-                skeleton_paths = _collect_rig_import_paths(getattr(source_chunk, "_W_CLASS__CR2WFILE", None))
+                skeleton_paths = (
+                    _collect_rig_import_paths(
+                        getattr(source_chunk, "_W_CLASS__CR2WFILE", None)
+                    )
+                    if _allow_unscoped_import_fallbacks
+                    else []
+                )
                 if skeleton_paths:
                     skeleton = skeleton_paths[0]
             component.name = name or component.name
@@ -3476,22 +4231,49 @@ def create_CEntity(file, _inherit_visited=None):
             depot_path = str(include_path or "").strip()
             if not depot_path or not depot_path.lower().endswith(".w2ent"):
                 continue
+            cached_entity = included_entity_assets.get(
+                depot_path.replace("/", "\\").strip().lower()
+            )
+            if cached_entity is not None:
+                included_entities.append((depot_path, copy.deepcopy(cached_entity)))
+                continue
             try:
                 include_full_path = materialize_entity_repo_path(
                     depot_path,
                     version=file.HEADER.version,
                 )
+                _record_template_repo_dependency(
+                    depot_path,
+                    include_full_path,
+                    file.HEADER.version,
+                    getattr(file, "fileName", ""),
+                )
                 norm_include_path = os.path.normcase(os.path.normpath(include_full_path))
             except Exception as e:
+                incomplete_components.append(
+                    f"unresolved included template {depot_path}: {e}"
+                )
                 log.debug(f"Failed to resolve included template path '{depot_path}': {e}")
                 continue
             if norm_include_path in inherit_visited:
                 continue
             try:
-                include_cr2w = read_CR2W(include_full_path)
-                include_entity = create_CEntity(include_cr2w, _inherit_visited=inherit_visited | {norm_include_path})
+                include_cr2w = _read_template_dependency_cr2w(include_full_path)
+                include_entity = create_CEntity(
+                    include_cr2w,
+                    _inherit_visited=inherit_visited | {norm_include_path},
+                    _included_entity_assets=included_entity_assets,
+                )
             except Exception as e:
+                incomplete_components.append(
+                    f"unresolved included template {depot_path}: {e}"
+                )
                 log.debug(f"Failed to load included template '{depot_path}': {e}")
+                continue
+            if include_entity is None:
+                incomplete_components.append(
+                    f"unresolved included template {depot_path}: compiler returned no entity"
+                )
                 continue
             included_entities.append((depot_path, include_entity))
 
@@ -3521,6 +4303,10 @@ def create_CEntity(file, _inherit_visited=None):
         beh_seen = {_repo_path_key(path) for path in inherited_beh_paths}
         for depot_path, include_entity in _iter_top_level_included_entities():
             _merge_related_appearances(include_entity)
+
+            for plan_component in getattr(include_entity, "plan_components", None) or []:
+                if plan_component not in this_Entity.plan_components:
+                    this_Entity.plan_components.append(copy.deepcopy(plan_component))
 
             inherited_component = getattr(include_entity, "MovingPhysicalAgentComponent", None)
             if inherited_component and needs_inherited_animated and not hasCMovingPhysicalAgentComponent:
@@ -3653,6 +4439,8 @@ def create_CEntity(file, _inherit_visited=None):
                     attachment_chunk.PROPS[existing_props[prop_name]] = prop
                 else:
                     attachment_chunk.PROPS.append(prop)
+
+    _apply_external_proxy_attachments()
 
     def _synthesize_missing_transform_parents_from_hard_attachments():
         child_to_attachment = {}
@@ -3832,7 +4620,7 @@ def create_CEntity(file, _inherit_visited=None):
         #CExternalProxyAttachment + orginal makes for final attachment
         guids = {}
 
-        w2_related_files = _load_w2_related_files_recursive(file, inherit_visited)
+        w2_related_files, _w2_related_complete = _load_w2_related_files_recursive(file, inherit_visited)
         w2_related_entity_paths = [depot_path for depot_path, _full_path, _related_file in w2_related_files]
         w2_related_search_chunks = [
             chunk
@@ -4095,7 +4883,7 @@ def create_CEntity(file, _inherit_visited=None):
                     includedTemplates = currentApp.includedTemplates.ToArray()
                     for entryTemplate in includedTemplates:
                         entry = entryTemplate.DepotPath
-                        (templateMesh, entity) = LoadCEntityTemplateFile(entry)
+                        (templateMesh, entity) = LoadCEntityTemplateFile(entry, file.HEADER.version)
                         final_includedTemplates.append(templateMesh)
                     setattr(currentApp, 'includedTemplates', final_includedTemplates) # Replace pointers with chunks
                 elif appearance.GetVariableByName("parts"): #!WITCHER 2
@@ -4167,10 +4955,14 @@ def create_CEntity(file, _inherit_visited=None):
                         #   'animationSets':list(map(lambda x: x.DepotPath, chunk.GetVariableByName("animationSets").ToArray()))
                         # })
 
-        elif is_entity_chunk(chunk):
+        elif (
+            is_entity_chunk(chunk)
+            or chunk.ChunkIndex in w2_selected_entity_roots
+        ):
             entity_chunk = chunk  # save before inner loop reassigns chunk variable
             this_Entity.is_entity = True
-            this_Entity.type = entity_chunk.Type
+            if not this_Entity.type:
+                this_Entity.type = entity_chunk.Type
             entity_animated_component_chunk_index = None  # track for synthetic skinning attachment
             if hasattr(chunk, 'Components'):
             #for staticChunkPtr in chunk.GetVariableByName("components").ToArray():
@@ -4198,10 +4990,7 @@ def create_CEntity(file, _inherit_visited=None):
                     if chunk.ChunkIndex in w2_body_part_chunk_indices or str(chunk_name or "").strip().lower() in w2_body_part_component_names:
                         continue
                     if (chunk.Type == "CStaticMeshComponent"):
-                        static_mesh_component = CStaticMeshComponent(chunk).convert_for_io()
-                        static_mesh_component.mesh = _resolve_mesh_path(chunk, static_mesh_component.mesh)
-                        if not static_mesh_component.mesh:
-                            static_mesh_component.mesh = _next_mesh_import_path()
+                        static_mesh_component = _resolve_component_mesh(chunk, CStaticMeshComponent(chunk).convert_for_io(), _next_mesh_import_path)
                         if static_mesh_component.mesh:
                             _append_unique_chunk(chunk, static_mesh_component, added_chunks)
                         else:
@@ -4210,10 +4999,7 @@ def create_CEntity(file, _inherit_visited=None):
                                 f"props={_chunk_props_summary(chunk)}"
                             )
                     elif chunk.Type in ("CMeshComponent", "CDressMeshComponent"):
-                        mesh_component = _coerce_w2_mesh_component_for_io(chunk, CMeshComponent(chunk).convert_for_io())
-                        mesh_component.mesh = _resolve_mesh_path(chunk, mesh_component.mesh)
-                        if not mesh_component.mesh:
-                            mesh_component.mesh = _next_mesh_import_path()
+                        mesh_component = _resolve_component_mesh(chunk, _coerce_w2_mesh_component_for_io(chunk, CMeshComponent(chunk).convert_for_io()), _next_mesh_import_path)
                         if mesh_component.mesh:
                             _append_unique_chunk(chunk, mesh_component, added_chunks)
                         else:
@@ -4229,10 +5015,7 @@ def create_CEntity(file, _inherit_visited=None):
                             )
                         else:
                             mesh_cls = CRagdollMeshComponent if chunk.Type == "CRagdollMeshComponent" else CMeshComponent
-                            mesh_component = mesh_cls(chunk).convert_for_io()
-                            mesh_component.mesh = _resolve_mesh_path(chunk, mesh_component.mesh)
-                            if not mesh_component.mesh:
-                                mesh_component.mesh = _next_mesh_import_path()
+                            mesh_component = _resolve_component_mesh(chunk, mesh_cls(chunk).convert_for_io(), _next_mesh_import_path)
                             if chunk.Type == "CRagdollMeshComponent":
                                 mesh_component.ragdoll_meta = _extract_w2_ragdoll_meta(chunk, CHUNKS)
                             if mesh_component.mesh:
@@ -4243,15 +5026,21 @@ def create_CEntity(file, _inherit_visited=None):
                                     f"props={_chunk_props_summary(chunk)}"
                                 )
                     elif (chunk.Type == "CFurComponent"):
-                        fur_component = CMeshComponent(chunk).convert_for_io()
-                        fur_component.mesh = _resolve_mesh_path(chunk, fur_component.mesh)
-                        if not fur_component.mesh:
-                            fur_component.mesh = _next_mesh_import_path()
+                        fur_component = _resolve_component_mesh(chunk, CMeshComponent(chunk).convert_for_io(), _next_mesh_import_path)
                         if fur_component.mesh:
                             _append_unique_chunk(chunk, fur_component, added_chunks)
                         else:
                             log.warning(
                                 f"Skipping CFurComponent with invalid mesh ref: {chunk.ChunkIndex}; "
+                                f"props={_chunk_props_summary(chunk)}"
+                            )
+                    elif chunk.Type in _VISUAL_MESH_COMPONENT_TYPES:
+                        mesh_component = _resolve_component_mesh(chunk, CMeshComponent(chunk).convert_for_io(), _next_mesh_import_path)
+                        if mesh_component.mesh:
+                            _append_unique_chunk(chunk, mesh_component, added_chunks)
+                        else:
+                            log.warning(
+                                f"Skipping {chunk.Type} with invalid mesh ref: {chunk.ChunkIndex}; "
                                 f"props={_chunk_props_summary(chunk)}"
                             )
                     elif chunk.Type == "CPointLightComponent":
@@ -4267,7 +5056,11 @@ def create_CEntity(file, _inherit_visited=None):
                             # Component may be an override chunk that stores only
                             # non-skeleton properties (e.g. transform). Fall back to
                             # the first CSkeleton referenced in the file's import table.
-                            rig_paths = _collect_rig_import_paths(file)
+                            rig_paths = (
+                                _collect_rig_import_paths(file)
+                                if _allow_unscoped_import_fallbacks
+                                else []
+                            )
                             if rig_paths:
                                 skeleton = rig_paths[0]
                                 log.debug(
@@ -4293,20 +5086,23 @@ def create_CEntity(file, _inherit_visited=None):
                     buf_stream = bReadStream(sdb.Bufferdata.Bytes, name='streamingDataBuffer')
                     buf_cr2w = getCR2W(buf_stream)
                     for buf_chunk in buf_cr2w.CHUNKS.CHUNKS:
+                        if buf_chunk.Type in _FOLIAGE_COMPONENT_TYPES:
+                            foliage_component = _foliage_component_from_chunk(buf_chunk)
+                            if foliage_component is not None:
+                                chunk_append(new_mesh, buf_chunk, foliage_component)
+                            continue
                         if buf_chunk.Type == 'CStaticMeshComponent':
                             mc = CStaticMeshComponent(buf_chunk).convert_for_io()
-                        elif buf_chunk.Type in ('CMeshComponent', 'CRigidMeshComponent', 'CFurComponent'):
-                            mc = CMeshComponent(buf_chunk).convert_for_io()
                         elif buf_chunk.Type == 'CRagdollMeshComponent':
                             if buf_chunk.GetVariableByName("mesh") is None:
                                 continue
                             mc = CRagdollMeshComponent(buf_chunk).convert_for_io()
                             mc.ragdoll_meta = _extract_w2_ragdoll_meta(buf_chunk, buf_cr2w.CHUNKS.CHUNKS)
+                        elif buf_chunk.Type in _VISUAL_MESH_COMPONENT_TYPES:
+                            mc = CMeshComponent(buf_chunk).convert_for_io()
                         else:
                             continue
-                        mc.mesh = _resolve_mesh_path(buf_chunk, mc.mesh)
-                        if not mc.mesh:
-                            mc.mesh = _next_mesh_import_path()
+                        mc = _resolve_component_mesh(buf_chunk, mc, _next_mesh_import_path)
                         if _register_streamed_slot_mesh(mc, buf_chunk.Type):
                             continue
                         if mc.mesh and _append_unique_chunk(buf_chunk, mc):
@@ -4394,10 +5190,7 @@ def create_CEntity(file, _inherit_visited=None):
         #######
         # Only add top-level mesh chunks if they weren't already added via CEntity.Components
         elif (chunk.Type == "CStaticMeshComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
-            mc = CStaticMeshComponent(chunk).convert_for_io()
-            mc.mesh = _resolve_mesh_path(chunk, mc.mesh)
-            if not mc.mesh:
-                mc.mesh = _next_mesh_import_path()
+            mc = _resolve_component_mesh(chunk, CStaticMeshComponent(chunk).convert_for_io(), _next_mesh_import_path)
             if mc.mesh:
                 _append_unique_chunk(chunk, mc, added_chunks)
             else:
@@ -4406,10 +5199,7 @@ def create_CEntity(file, _inherit_visited=None):
                     f"props={_chunk_props_summary(chunk)}"
                 )
         elif chunk.Type in ("CMeshComponent", "CDressMeshComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
-            mc = _coerce_w2_mesh_component_for_io(chunk, CMeshComponent(chunk).convert_for_io())
-            mc.mesh = _resolve_mesh_path(chunk, mc.mesh)
-            if not mc.mesh:
-                mc.mesh = _next_mesh_import_path()
+            mc = _resolve_component_mesh(chunk, _coerce_w2_mesh_component_for_io(chunk, CMeshComponent(chunk).convert_for_io()), _next_mesh_import_path)
             if mc.mesh:
                 _append_unique_chunk(chunk, mc, added_chunks)
             else:
@@ -4425,10 +5215,7 @@ def create_CEntity(file, _inherit_visited=None):
                 )
             else:
                 mesh_cls = CRagdollMeshComponent if chunk.Type == "CRagdollMeshComponent" else CMeshComponent
-                mc = mesh_cls(chunk).convert_for_io()
-                mc.mesh = _resolve_mesh_path(chunk, mc.mesh)
-                if not mc.mesh:
-                    mc.mesh = _next_mesh_import_path()
+                mc = _resolve_component_mesh(chunk, mesh_cls(chunk).convert_for_io(), _next_mesh_import_path)
                 if chunk.Type == "CRagdollMeshComponent":
                     mc.ragdoll_meta = _extract_w2_ragdoll_meta(chunk, CHUNKS)
                 if mc.mesh:
@@ -4446,10 +5233,7 @@ def create_CEntity(file, _inherit_visited=None):
                 chunk_append(new_mesh, chunk, CClothComponent(cloth, name=_cname), added_chunks)
         elif (chunk.Type == "CFurComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
             if (chunk.GetVariableByName("mesh")):
-                fur_component = CMeshComponent(chunk).convert_for_io()
-                fur_component.mesh = _resolve_mesh_path(chunk, fur_component.mesh)
-                if not fur_component.mesh:
-                    fur_component.mesh = _next_mesh_import_path()
+                fur_component = _resolve_component_mesh(chunk, CMeshComponent(chunk).convert_for_io(), _next_mesh_import_path)
                 if fur_component.mesh:
                     _append_unique_chunk(chunk, fur_component, added_chunks)
                 else:
@@ -4457,6 +5241,19 @@ def create_CEntity(file, _inherit_visited=None):
                         f"Skipping top-level CFurComponent with invalid mesh ref: {chunk.ChunkIndex}; "
                         f"props={_chunk_props_summary(chunk)}"
                     )
+        elif chunk.Type in _VISUAL_MESH_COMPONENT_TYPES and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
+            mesh_component = _resolve_component_mesh(chunk, CMeshComponent(chunk).convert_for_io(), _next_mesh_import_path)
+            if mesh_component.mesh:
+                _append_unique_chunk(chunk, mesh_component, added_chunks)
+            else:
+                log.warning(
+                    f"Skipping top-level {chunk.Type} with invalid mesh ref: {chunk.ChunkIndex}; "
+                    f"props={_chunk_props_summary(chunk)}"
+                )
+        elif chunk.Type in _FOLIAGE_COMPONENT_TYPES and chunk.ChunkIndex not in added_chunks:
+            foliage_component = _foliage_component_from_chunk(chunk)
+            if foliage_component is not None:
+                chunk_append(new_mesh, chunk, foliage_component, added_chunks)
         elif (chunk.Type == "CPointLightComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
             _append_unique_light_chunk(chunk, CPointLightComponent(chunk).convert_for_io(), added_chunks)
         elif (chunk.Type == "CSpotLightComponent") and chunk.ChunkIndex not in added_chunks and chunk.ChunkIndex not in w2_body_part_chunk_indices and str(_prop_to_string(_find_prop_by_name(chunk, "name")) or "").strip().lower() not in w2_body_part_component_names:
@@ -4467,7 +5264,11 @@ def create_CEntity(file, _inherit_visited=None):
             skeleton = _resolve_repo_path(chunk, "skeleton", ".w2rig")
             animation_sets = _resolve_repo_paths_from_array(chunk, "animationSets", ".w2anims")
             if not skeleton:
-                rig_paths = _collect_rig_import_paths(file)
+                rig_paths = (
+                    _collect_rig_import_paths(file)
+                    if _allow_unscoped_import_fallbacks
+                    else []
+                )
                 if rig_paths:
                     skeleton = rig_paths[0]
                     log.debug(
@@ -4535,12 +5336,16 @@ def create_CEntity(file, _inherit_visited=None):
 
     if file.HEADER.version <= 115:
         for head_name in _iter_w2_head_param_names(CHUNKS):
-            for head_chunk in _build_w2_head_chunks(CHUNKS, head_name):
+            for head_chunk in _build_w2_head_chunks(CHUNKS, head_name, file):
                 _append_unique_generated_chunk(head_chunk)
 
     if flat_compiled_file is not None:
         try:
-            resolved_entity = create_CEntity(flat_compiled_file, _inherit_visited=inherit_visited)
+            resolved_entity = create_CEntity(
+                flat_compiled_file,
+                _inherit_visited=inherit_visited,
+                _included_entity_assets=included_entity_assets,
+            )
             resolved_mesh = getattr(resolved_entity, "staticMeshes", None)
             if resolved_mesh and getattr(resolved_mesh, "chunks", None):
                 new_mesh = resolved_mesh
@@ -4549,6 +5354,8 @@ def create_CEntity(file, _inherit_visited=None):
             if resolved_moving is not None:
                 this_Entity.MovingPhysicalAgentComponent = resolved_moving
                 hasCMovingPhysicalAgentComponent = True
+            if not this_Entity.type:
+                this_Entity.type = getattr(resolved_entity, "type", None)
         except Exception as e:
             log.warning("Failed to resolve flatCompiledData for %s: %s", file.fileName, e)
 
@@ -4618,6 +5425,9 @@ def create_CEntity(file, _inherit_visited=None):
             if getattr(related_entity, "inventoryDefinitions", None):
                 current_defs = getattr(this_Entity, "inventoryDefinitions", [])
                 this_Entity.inventoryDefinitions = _merge_related_inventory_definitions(current_defs, related_entity.inventoryDefinitions)
+            for plan_component in getattr(related_entity, "plan_components", None) or []:
+                if plan_component not in this_Entity.plan_components:
+                    this_Entity.plan_components.append(copy.deepcopy(plan_component))
             related_chunks = getattr(getattr(related_entity, "staticMeshes", None), "chunks", None)
             if (
                 related_chunks
@@ -4643,7 +5453,11 @@ def create_CEntity(file, _inherit_visited=None):
                 this_Entity.MovingPhysicalAgentComponent = ent
                 break
     this_Entity.staticMeshes = new_mesh
-    beh_paths = _collect_beh_import_paths(file)
+    beh_paths = (
+        _collect_beh_import_paths(file)
+        if _allow_unscoped_import_fallbacks
+        else []
+    )
     beh_seen = {_repo_path_key(path) for path in beh_paths}
     for beh_path in inherited_beh_paths:
         beh_key = _repo_path_key(beh_path)
@@ -4656,10 +5470,103 @@ def create_CEntity(file, _inherit_visited=None):
     included_template_paths = []
     for include_path in top_level_template_includes:
         _append_unique_repo_path(included_template_paths, include_path)
+    for include_path in w2_related_entity_paths:
+        _append_unique_repo_path(included_template_paths, include_path)
     for _depot_path, include_entity in _iter_top_level_included_entities() or []:
         for inherited_path in getattr(include_entity, "included_template_paths", None) or []:
             _append_unique_repo_path(included_template_paths, inherited_path)
     this_Entity.included_template_paths = included_template_paths
+    template_dependency_paths = list(included_template_paths)
+    for _depot_path, full_path, _related_file in w2_related_files:
+        _append_unique_repo_path(template_dependency_paths, full_path)
+    for appearance in this_Entity.appearances:
+        for template in getattr(appearance, "includedTemplates", None) or []:
+            _append_unique_repo_path(
+                template_dependency_paths,
+                getattr(template, "templateFilename", ""),
+            )
+            for dependency_path in getattr(template, "template_dependency_paths", None) or []:
+                _append_unique_repo_path(template_dependency_paths, dependency_path)
+    for _depot_path, include_entity in _iter_top_level_included_entities() or []:
+        for dependency_path in getattr(include_entity, "template_dependency_paths", None) or []:
+            _append_unique_repo_path(template_dependency_paths, dependency_path)
+    this_Entity.template_dependency_paths = template_dependency_paths
+    unsupported_source_chunks = CHUNKS
+    if file.HEADER.version <= 115 and w2_selected_graph_indices:
+        unsupported_source_chunks = [
+            CHUNKS[index]
+            for index in sorted(w2_selected_graph_indices)
+            if 0 <= index < len(CHUNKS)
+        ]
+    unsupported_components = _unsupported_entity_visual_chunk_types(
+        unsupported_source_chunks
+    )
+    for source_chunk in unsupported_source_chunks:
+        source_type = str(
+            getattr(source_chunk, "Type", "") or getattr(source_chunk, "name", "") or ""
+        )
+        missing_detail = ""
+        if source_type in _VISUAL_MESH_COMPONENT_TYPES:
+            physics_only_ragdoll = (
+                source_type == "CRagdollMeshComponent"
+                and _find_prop_by_name(source_chunk, "mesh") is None
+            )
+            if (
+                not physics_only_ragdoll
+                and not _resolve_mesh_path(source_chunk, None)
+                and not top_level_template_includes
+            ):
+                missing_detail = "missing mesh resource"
+        elif source_type == "CMorphedMeshComponent":
+            morph_source = _resolve_repo_path(source_chunk, "morphSource", ".w2mesh")
+            morph_target = _resolve_repo_path(source_chunk, "morphTarget", ".w2mesh")
+            if not morph_source or not morph_target:
+                missing_detail = "missing morph source/target resource"
+        elif source_type == "CClothComponent":
+            cloth_resource = _resolve_repo_path(
+                source_chunk,
+                "resource",
+                (".redcloth", ".redapex", ".apx"),
+            )
+            if not cloth_resource and not top_level_template_includes:
+                missing_detail = "missing cloth resource"
+        if missing_detail:
+            incomplete_components.append(
+                f"incomplete {source_type} #{getattr(source_chunk, 'ChunkIndex', '?')}: "
+                f"{missing_detail}"
+            )
+    own_destruction_counts = {}
+    converted_destruction_counts = {}
+    for source_chunk in unsupported_source_chunks:
+        source_type = str(
+            getattr(source_chunk, "Type", "") or getattr(source_chunk, "name", "") or ""
+        )
+        if source_type not in {"CDestructionComponent", "CDestructionSystemComponent"}:
+            continue
+        own_destruction_counts[source_type] = own_destruction_counts.get(source_type, 0) + 1
+        plan_component = _destruction_plan_component_from_chunk(source_chunk)
+        if plan_component is None:
+            continue
+        converted_destruction_counts[source_type] = converted_destruction_counts.get(source_type, 0) + 1
+        if plan_component not in this_Entity.plan_components:
+            this_Entity.plan_components.append(plan_component)
+    unsupported_components = [
+        component_type
+        for component_type in unsupported_components
+        if component_type not in own_destruction_counts
+        or converted_destruction_counts.get(component_type, 0) < own_destruction_counts[component_type]
+    ]
+    seen_unsupported = set(unsupported_components)
+    for component_type in (
+        [t for a in this_Entity.appearances for tm in (getattr(a, "includedTemplates", None) or []) for t in (getattr(tm, "unsupported_components", None) or [])]
+        + [t for _d, e in _iter_related_w2_entities() or [] for t in (getattr(e, "unsupported_components", None) or [])]
+        + [t for _d, e in _iter_top_level_included_entities() or [] for t in (getattr(e, "unsupported_components", None) or [])]
+        + incomplete_components
+    ):
+        if component_type not in seen_unsupported:
+            seen_unsupported.add(component_type)
+            unsupported_components.append(component_type)
+    this_Entity.unsupported_components = unsupported_components
     return this_Entity
 
 def load_bin_entity(fileName) -> w3_types.Entity:

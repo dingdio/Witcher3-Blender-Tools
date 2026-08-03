@@ -309,13 +309,13 @@ def replace_cutscene_actor_template(
     actor_name = str(actor_name or "").strip()
     appearance_name = str(appearance_name or "").strip()
     old_actor_names = _collect_cutscene_actor_removal_names(old_actor_obj)
-    new_actor_obj = import_entity.import_ent_template(
+    new_actor_obj = import_entity.import_entity_file(
         resolved_template_path,
         load_face_poses=True,
         import_apperance=1,
         selected_appearance_name=appearance_name,
         entity_namespace=actor_name,
-    )
+    ).main_object
     if new_actor_obj is None:
         raise RuntimeError(f"Failed to import replacement actor: {resolved_template_path}")
 
@@ -1848,13 +1848,13 @@ def load_cutscene_actor(filename, actor_index, cutscene_template=None, actor_cac
                 load_template_path,
                 resolved_template_path,
             )
-            actor_obj = import_entity.import_ent_template(
+            actor_obj = import_entity.import_entity_file(
                 resolved_template_path,
                 load_face_poses=True,
                 import_apperance=1,
                 selected_appearance_name=preferred_appearance_name,
                 entity_namespace=actor_name,
-            )
+            ).main_object
         except Exception:
             log.exception("Failed to import cutscene actor '%s' from '%s'", actor_name or actor_index, template_path)
             actor_obj = None

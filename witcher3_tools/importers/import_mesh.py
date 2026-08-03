@@ -2065,6 +2065,7 @@ def import_mesh_materials(filename, mesh_objects, embedded_cmesh_chunk_index=Non
         False,
         False,
         embedded_cmesh_chunk_index=embedded_cmesh_chunk_index,
+        materials_only=True,
     )
     _ensure_imported_material_slots(mesh_objects, the_material_names, filename)
     return apply_mesh_materials(meshFile, the_materials, the_material_names, mesh_objects, meshName)

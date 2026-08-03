@@ -16,6 +16,7 @@ import re
 import json
 import shutil
 import sys
+import threading
 from contextlib import contextmanager
 from ..extension_paths import get_dev_override, get_w2_uncook_root
 from ..repo_paths import (
@@ -261,8 +262,7 @@ def bpy_image_load_safe(path, **kwargs):
 
 _repo_override_roots = []
 _repo_override_read_only = False
-_redkit_repo_context_stack = []
-_w2_repo_context_stack = []
+_repo_context_state = threading.local()
 _w2_bundle_reset_attempted_paths = set()
 _w2_auto_detect_game_path_ready = False
 _w2_auto_detect_game_path = ""
@@ -276,6 +276,18 @@ _source_map_cache = {
     "data": {},
     "mtime": 0,
 }
+
+
+def _repo_context_stacks():
+    redkit_stack = getattr(_repo_context_state, "redkit_stack", None)
+    if redkit_stack is None:
+        redkit_stack = []
+        _repo_context_state.redkit_stack = redkit_stack
+    w2_stack = getattr(_repo_context_state, "w2_stack", None)
+    if w2_stack is None:
+        w2_stack = []
+        _repo_context_state.w2_stack = w2_stack
+    return redkit_stack, w2_stack
 
 def clear_mod_index_cache():
     """Clear cached mod override index so it can be rebuilt from current cache data."""
@@ -329,13 +341,14 @@ def redkit_repo_context(source_path=None, roots=None):
     """Temporarily enable REDkit dual-depot lookup for children of a REDkit source."""
     context_roots = list(roots or _redkit_roots_for_path(source_path))
     w2_context = _w2_repo_context_for_source(source_path, roots=roots)
-    _redkit_repo_context_stack.append(context_roots)
-    _w2_repo_context_stack.append(w2_context)
+    redkit_stack, w2_stack = _repo_context_stacks()
+    redkit_stack.append(context_roots)
+    w2_stack.append(w2_context)
     try:
         yield
     finally:
-        _redkit_repo_context_stack.pop()
-        _w2_repo_context_stack.pop()
+        redkit_stack.pop()
+        w2_stack.pop()
 
 @contextmanager
 def vanilla_only_repo_context():
@@ -343,27 +356,30 @@ def vanilla_only_repo_context():
     bundles/uncook. Used to load the cooked vanilla copy of an asset when its
     REDkit-uncooked sibling is missing data that only exists post-cook (e.g.
     CAnimAnimsetsParam baked into entity templates)."""
-    saved = list(_redkit_repo_context_stack)
-    saved_w2 = list(_w2_repo_context_stack)
-    _redkit_repo_context_stack.clear()
-    _w2_repo_context_stack.clear()
+    redkit_stack, w2_stack = _repo_context_stacks()
+    saved = list(redkit_stack)
+    saved_w2 = list(w2_stack)
+    redkit_stack.clear()
+    w2_stack.clear()
     try:
         yield
     finally:
-        _redkit_repo_context_stack.clear()
-        _redkit_repo_context_stack.extend(saved)
-        _w2_repo_context_stack.clear()
-        _w2_repo_context_stack.extend(saved_w2)
+        redkit_stack.clear()
+        redkit_stack.extend(saved)
+        w2_stack.clear()
+        w2_stack.extend(saved_w2)
 
 def _active_redkit_repo_roots():
-    for roots in reversed(_redkit_repo_context_stack):
+    redkit_stack, _w2_stack = _repo_context_stacks()
+    for roots in reversed(redkit_stack):
         if roots:
             return roots
     return []
 
 
 def _active_w2_repo_context():
-    for context in reversed(_w2_repo_context_stack):
+    _redkit_stack, w2_stack = _repo_context_stacks()
+    for context in reversed(w2_stack):
         if context:
             return context
     return None
@@ -400,6 +416,30 @@ def overwrite_existing_enabled() -> bool:
 def get_repo_override_state():
     return list(_repo_override_roots), bool(_repo_override_read_only)
 
+
+def get_repo_resolution_context(source_path=None):
+    redkit_roots = list(_active_redkit_repo_roots() or _redkit_roots_for_path(source_path))
+    w2_context = _active_w2_repo_context() or _w2_repo_context_for_source(source_path)
+    try:
+        pref_roots = _get_repo_roots_from_prefs()
+    except Exception:
+        pref_roots = ("", "", "", False)
+    normalized_pref_roots = tuple(
+        bool(value)
+        if isinstance(value, bool)
+        else os.path.normcase(os.path.normpath(str(value))) if value else ""
+        for value in pref_roots
+    )
+    return (
+        tuple(os.path.normcase(os.path.normpath(root)) for root in _repo_override_roots),
+        bool(_repo_override_read_only),
+        tuple(os.path.normcase(os.path.normpath(root)) for root in redkit_roots),
+        tuple(sorted((str(key), str(value)) for key, value in (w2_context or {}).items())),
+        normalized_pref_roots,
+        (bool(_mod_priority_enabled), bool(_mod_priority_high), bool(_overwrite_existing)),
+    )
+
+
 @contextmanager
 def mod_loading_context(context=None, prefer_mods=None, overwrite=None):
     """Context manager that configures mod loading for all repo_file calls within the block.
@@ -409,7 +449,7 @@ def mod_loading_context(context=None, prefer_mods=None, overwrite=None):
 
     Usage:
         with mod_loading_context(context):
-            import_entity.import_ent_template(path, ...)
+            import_entity.import_entity_file(path, ...)
     """
     if context is not None and (prefer_mods is None or overwrite is None):
         try:

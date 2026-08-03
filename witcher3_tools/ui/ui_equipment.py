@@ -98,7 +98,6 @@ _EQUIPMENT_ICON_PATH_DISK_DIRTY = False
 _EQUIPMENT_ICON_PATH_CACHE_FILE = Path(get_cache_root(create=True)) / "equipment_icon_paths.json"
 _EQUIPMENT_ICON_PERSIST_DIR = Path(get_cache_root(create=True)) / "equipment_icons"
 _ENTITY_APPEARANCE_CACHE = {}
-_EQUIPMENT_ENTITY_CACHE = {}
 _TEMPLATE_PATH_RESOLVE_CACHE = {}  # (template_key, roots_tuple) -> (repo_path, export_path)
 # Main-thread resolver budget: enough to stream thumbnails without visible stalls.
 _EQUIPMENT_ITEM_ICON_TICK_BUDGET = 0.018
@@ -3432,12 +3431,6 @@ def _get_cached_equipment_item_entity(export_path, prepared_context=None):
     except Exception:
         cache_key = (os.path.normcase(os.path.normpath(export_path)),)
 
-    if cache_key in _EQUIPMENT_ENTITY_CACHE:
-        entity = _EQUIPMENT_ENTITY_CACHE[cache_key]
-        if prepared_context is not None:
-            prepared_context.setdefault("item_entity_cache", {})[cache_key] = entity
-        return entity
-
     local_cache = prepared_context.setdefault("item_entity_cache", {}) if prepared_context is not None else None
     if local_cache is not None and cache_key in local_cache:
         return local_cache[cache_key]
@@ -3448,8 +3441,6 @@ def _get_cached_equipment_item_entity(export_path, prepared_context=None):
         log.warning("Failed to parse equipment entity '%s': %s", export_path, e)
         item_entity = None
 
-    _EQUIPMENT_ENTITY_CACHE[cache_key] = item_entity
-    _clear_cache_if_oversized(_EQUIPMENT_ENTITY_CACHE, max_entries=128)
     if local_cache is not None:
         local_cache[cache_key] = item_entity
     return item_entity

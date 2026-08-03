@@ -192,13 +192,7 @@ def _apx_destructible_submesh_positions(
     return None
 
 
-def _write_sanitized_apx_copy(
-    path: str,
-    tree,
-    change_notes: List[str],
-) -> str:
-    if not change_notes:
-        return path
+def _sanitized_apx_cache_paths(path: str):
     try:
         stat = os.stat(path)
         cache_key = hashlib.sha1(
@@ -207,8 +201,24 @@ def _write_sanitized_apx_copy(
             )
         ).hexdigest()[:12]
         out_dir = os.path.join(get_temp_root(create=True), "sanitized_apx")
-        os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{Path(path).stem}.{cache_key}.apx")
+    except Exception:
+        return None, None
+    return out_path, out_path + ".clean"
+
+
+def _write_sanitized_apx_copy(
+    path: str,
+    tree,
+    change_notes: List[str],
+) -> str:
+    if not change_notes:
+        return path
+    try:
+        out_path, _clean_marker = _sanitized_apx_cache_paths(path)
+        if out_path is None:
+            return path
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
         tree.write(out_path, encoding="utf-8", xml_declaration=True)
         log.warning(
             "Using sanitized APX copy for %s: %s",
@@ -298,6 +308,22 @@ def sanitize_apx_for_import(filepath: str) -> str:
     if not path.lower().endswith(".apx") or not os.path.isfile(path):
         return filepath
 
+    out_path, clean_marker = _sanitized_apx_cache_paths(path)
+    if out_path is not None and os.path.isfile(out_path):
+        return out_path
+    if clean_marker is not None and os.path.isfile(clean_marker):
+        return path
+    result = _sanitize_apx_for_import_uncached(path)
+    if clean_marker is not None and result == path:
+        try:
+            os.makedirs(os.path.dirname(clean_marker), exist_ok=True)
+            open(clean_marker, "wb").close()
+        except Exception:
+            pass
+    return result
+
+
+def _sanitize_apx_for_import_uncached(path: str) -> str:
     try:
         tree = ElementTree.parse(path)
         root = tree.getroot()
@@ -477,6 +503,6 @@ def sanitize_apx_for_import(filepath: str) -> str:
                 )
 
     if not change_notes:
-        return filepath
+        return path
 
     return _write_sanitized_apx_copy(path, tree, change_notes)

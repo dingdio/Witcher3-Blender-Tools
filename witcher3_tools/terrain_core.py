@@ -19,16 +19,6 @@ TERRAIN_IMPORT_MODE_ITEMS = (
     ('TILES', 'All Tiles', 'Import every terrain tile (advanced and potentially expensive)', 2),
 )
 
-TERRAIN_FOLIAGE_MODE_ITEMS = (
-    (
-        'PROXY',
-        'Viewer Ready',
-        'Load the dominant real grass and trees quickly; hide unresolved technical fallbacks',
-    ),
-    ('FULL', 'All Sources', 'Import every foliage source during the tile load'),
-)
-
-
 @dataclass(frozen=True)
 class Bounds2D:
     """Half-open world-space bounds: ``[min_x, max_x) x [min_y, max_y)``."""
@@ -166,7 +156,6 @@ def point_in_bounds(
 
 __all__ = (
     "Bounds2D",
-    "TERRAIN_FOLIAGE_MODE_ITEMS",
     "TERRAIN_IMPORT_MODE_ITEMS",
     "coerce_bounds",
     "point_in_bounds",

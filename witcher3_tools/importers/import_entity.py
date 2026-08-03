@@ -38,7 +38,7 @@ from ..rigging import constraints as constrain_util
 from ..CR2W import read_json_w3
 from ..CR2W import w3_types
 from ..CR2W.dc_entity import load_bin_entity
-from ..CR2W.dc_entity import LoadCEntityTemplateFile, clear_template_cache
+from ..CR2W.dc_entity import LoadCEntityTemplateFile
 from ..CR2W.dc_entity import read_entity_template_appearance_metadata as _read_entity_template_appearance_metadata
 from ..CR2W.dc_entity import is_valid_mesh_path
 from ..CR2W.dc_entity import _resolve_repo_path, _resolve_repo_paths_from_array
@@ -172,6 +172,43 @@ def _make_redcloth_reuse_key(resource_path: str, redcloth_mat_path: str) -> str:
 
 def _is_cloth_resource_path(resource_path: str) -> bool:
     return str(resource_path or "").strip().lower().endswith((".redcloth", ".redapex"))
+
+
+def _component_import_option(options, name: str, default: bool = True) -> bool:
+    if options is None or name not in options:
+        return default
+    return bool(options[name])
+
+
+def _entity_chunk_is_proxy_mesh(chunk) -> bool:
+    text = f"{chunk.get('mesh', '')}/{chunk.get('name', '')}".replace("\\", "/").lower()
+    tokens = []
+    for part in (part for part in text.split("/") if part):
+        stem = Path(part).stem if "." in part else part
+        if stem == "no_proxy" or stem.endswith(("_no_proxy", "-no-proxy")):
+            continue
+        tokens.extend(token for token in re.split(r"[_\-\s]+", stem) if token)
+    return "proxy" in tokens
+
+
+def _entity_chunk_mesh_enabled(chunk, component_import_options) -> bool:
+    if _entity_chunk_is_proxy_mesh(chunk) and component_import_options is not None and "do_import_ProxyMesh" in component_import_options:
+        return _component_import_option(component_import_options, "do_import_ProxyMesh", False)
+    return _component_import_option(component_import_options, "do_import_Mesh", True)
+
+
+def _entity_chunk_cloth_enabled(resource_path, component_import_options, import_redcloth_enabled: bool) -> bool:
+    if str(resource_path or "").strip().lower().endswith(".redapex"):
+        return _component_import_option(
+            component_import_options,
+            "do_import_Redapex",
+            import_redcloth_enabled,
+        )
+    return import_redcloth_enabled and _component_import_option(
+        component_import_options,
+        "do_import_Redcloth",
+        True,
+    )
 
 
 def _snapshot_collection_object_ids(collection):
@@ -1364,8 +1401,8 @@ def _get_import_root_objects(objects):
     return roots or imported_objects
 
 
-def _new_merged_armature_context(context=None, root_armature=None):
-    if not armature_merge.should_unify_character_armature(context):
+def _new_merged_armature_context(context=None, root_armature=None, *, force=False):
+    if not force and not armature_merge.should_unify_character_armature(context):
         return None
     return {
         "enabled": True,
@@ -1504,6 +1541,65 @@ def stamp_import_origin(objects, *, origin="", entity_path="",
                 obj[key] = value
 
 
+_SRT_SOURCE_PATH_PROP = "witcher_srt_source"
+_SRT_MESH_NAMES = {}
+
+
+def _find_srt_source_mesh(srt_key):
+    name = _SRT_MESH_NAMES.get(srt_key)
+    if name:
+        mesh = bpy.data.meshes.get(name)
+        if mesh is not None and mesh.get(_SRT_SOURCE_PATH_PROP) == srt_key:
+            return mesh
+        _SRT_MESH_NAMES.pop(srt_key, None)
+    for existing in bpy.data.meshes:
+        if existing.get(_SRT_SOURCE_PATH_PROP) == srt_key:
+            _SRT_MESH_NAMES[srt_key] = existing.name
+            return existing
+    return None
+
+
+def _import_srt_chunk_object(srt_depot_path, object_name):
+    srt_key = str(srt_depot_path or "").replace("/", "\\").lower()
+    if not srt_key:
+        return None
+    existing = _find_srt_source_mesh(srt_key)
+    if existing is not None:
+        obj = bpy.data.objects.new(object_name, existing)
+        bpy.context.collection.objects.link(obj)
+        return obj
+
+    from .import_helpers import meshPath
+    from .import_blender_fun import _import_foliage_mesh
+    from .. import get_W3_FOLIAGE_PATH
+
+    mp = meshPath(meshName=srt_depot_path, fbx_uncook_path=get_W3_FOLIAGE_PATH(bpy.context))
+    mp.type = "mesh_foliage"
+    before = {o.as_pointer() for o in bpy.data.objects}
+    _import_foliage_mesh(mp)
+    new_objects = [o for o in bpy.data.objects if o.as_pointer() not in before]
+    new_meshes = [o for o in new_objects if o.type == 'MESH' and o.data]
+    best = max(new_meshes, key=lambda o: len(o.data.polygons), default=None)
+    for obj in new_objects:
+        if obj is best:
+            continue
+        data = obj.data if obj.type == 'MESH' else None
+        bpy.data.objects.remove(obj, do_unlink=True)
+        if data is not None and data.users == 0:
+            bpy.data.meshes.remove(data)
+    if best is None or len(best.data.vertices) == 0:
+        if best is not None:
+            data = best.data
+            bpy.data.objects.remove(best, do_unlink=True)
+            if data.users == 0:
+                bpy.data.meshes.remove(data)
+        return None
+    best.data[_SRT_SOURCE_PATH_PROP] = srt_key
+    _SRT_MESH_NAMES[srt_key] = best.data.name
+    best.name = object_name
+    return best
+
+
 def _apply_chunk_transform_to_import_roots(chunk, *, armatures=None, meshes=None):
     rt = _coerce_engine_transform(chunk.get("transform"))
     if rt is None:
@@ -1522,49 +1618,14 @@ def _apply_chunk_transform_to_import_roots(chunk, *, armatures=None, meshes=None
 def import_direct_entity_file(filename, load_face_poses=False, import_apperance=0,
                               parent_transform=None, selected_appearance_name="",
                               mesh_import_settings=None):
-    _, ext = os.path.splitext(str(filename or ""))
-    if ext.lower() == ".json":
-        log.info("Importing entity via common importer (JSON): %s", filename)
-        return import_ent_template(
-            filename,
-            load_face_poses,
-            import_apperance,
-            parent_transform,
-            selected_appearance_name,
-            mesh_import_settings=mesh_import_settings,
-        )
-
-    before_objects = set(bpy.data.objects)
-    try:
-        log.info("Importing entity via common importer: %s", filename)
-        result = import_ent_template(
-            filename,
-            load_face_poses,
-            import_apperance,
-            parent_transform,
-            selected_appearance_name,
-            mesh_import_settings=mesh_import_settings,
-        )
-    except Exception:
-        if set(bpy.data.objects) != before_objects:
-            raise
-        log.warning("Common importer failed for %s with no imported objects; falling back to legacy importer.", filename, exc_info=True)
-        result = None
-    else:
-        if result is not None:
-            return result
-        if set(bpy.data.objects) != before_objects:
-            log.info("Keeping common-import result for %s despite missing main armature return value.", filename)
-            return result
-        log.info("Common importer produced no objects for %s; falling back to legacy importer.", filename)
-
-    from ..CR2W import CR2W_reader
-    from ..importers import import_w2l
-
-    log.info("Importing entity via legacy importer fallback: %s", filename)
-    legacy_entity = CR2W_reader.load_entity(filename)
-    import_w2l.btn_import_w2ent(legacy_entity)
-    return None
+    return import_entity_file(
+        filename,
+        load_face_poses,
+        import_apperance,
+        parent_transform,
+        selected_appearance_name,
+        mesh_import_settings=mesh_import_settings,
+    ).main_object
 
 
 def _dedupe_entity_appearance_names(values) -> list[str]:
@@ -1594,13 +1655,110 @@ def normalize_entity_appearance_metadata(metadata: dict | None) -> dict:
     default_name = str(metadata.get("default_name", "") or "").strip()
     if default_name.lower() not in selectable_keys:
         default_name = used_names[0] if used_names else (all_names[0] if all_names else "")
+    entity_class = str(
+        metadata.get("entity_class")
+        or metadata.get("type")
+        or metadata.get("entityClass")
+        or ""
+    ).strip()
+    has_scoped_cloth_metadata = (
+        "base_has_cloth_components" in metadata
+        or "cloth_appearance_names" in metadata
+    )
+    cloth_appearance_names = _dedupe_entity_appearance_names(
+        metadata.get("cloth_appearance_names", [])
+    )
+    base_has_cloth_components = bool(metadata.get(
+        "base_has_cloth_components",
+        metadata.get("has_cloth_components", False) if not has_scoped_cloth_metadata else False,
+    ))
+    has_cloth_components = bool(
+        metadata.get("has_cloth_components", False)
+        or base_has_cloth_components
+        or cloth_appearance_names
+    )
     return {
         "all_names": all_names,
         "used_names": used_names,
         "default_name": default_name,
+        "entity_class": entity_class,
+        "component_metadata_known": bool(metadata.get("component_metadata_known", False)),
         "has_armature_root": bool(metadata.get("has_armature_root", False)),
+        "has_mesh_components": bool(metadata.get("has_mesh_components", False)),
+        "has_cloth_components": has_cloth_components,
+        "base_has_cloth_components": base_has_cloth_components,
+        "cloth_appearance_names": cloth_appearance_names,
         "has_inventory_entries": bool(metadata.get("has_inventory_entries", False)),
     }
+
+
+def entity_appearance_has_cloth(metadata: dict | None, selected_appearance_name: str = "") -> bool:
+    metadata = dict(metadata or {})
+    if (
+        "base_has_cloth_components" not in metadata
+        and "cloth_appearance_names" not in metadata
+    ):
+        return bool(metadata.get("has_cloth_components", False))
+    if metadata.get("base_has_cloth_components", False):
+        return True
+    selected_key = str(selected_appearance_name or "").strip().lower()
+    return bool(selected_key) and selected_key in {
+        str(name or "").strip().lower()
+        for name in metadata.get("cloth_appearance_names", []) or []
+        if str(name or "").strip()
+    }
+
+
+def _entity_json_component_metadata(data):
+    flags = {
+        "component_metadata_known": True,
+        "has_armature_root": False,
+        "has_mesh_components": False,
+        "has_cloth_components": False,
+        "has_inventory_entries": False,
+    }
+    mesh_types = {
+        "CMeshComponent",
+        "CStaticMeshComponent",
+        "CRigidMeshComponent",
+        "CRagdollMeshComponent",
+        "CDressMeshComponent",
+        "CFurComponent",
+        "CMorphedMeshComponent",
+    }
+    armature_types = {
+        "CMovingPhysicalAgentComponent",
+        "CAnimatedComponent",
+        "CAnimDangleBufferComponent",
+        "CMimicComponent",
+    }
+    stack = [data]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, list):
+            stack.extend(value)
+            continue
+        if not isinstance(value, dict):
+            continue
+
+        component_type = str(value.get("type") or value.get("component_type") or "").strip()
+        if component_type in mesh_types or bool(value.get("mesh")):
+            flags["has_mesh_components"] = True
+        resource = str(value.get("resource") or "").strip().lower()
+        if component_type == "CClothComponent" or resource.endswith((".redcloth", ".redapex", ".apx")):
+            flags["has_cloth_components"] = True
+        skeleton = str(value.get("skeleton") or value.get("mimicFace") or "").strip().lower()
+        if component_type in armature_types and skeleton not in {"", "none"}:
+            flags["has_armature_root"] = True
+        moving_agent = value.get("MovingPhysicalAgentComponent")
+        if isinstance(moving_agent, dict):
+            agent_skeleton = str(moving_agent.get("skeleton") or "").strip().lower()
+            if agent_skeleton not in {"", "none"}:
+                flags["has_armature_root"] = True
+        if value.get("inventoryDefinitions"):
+            flags["has_inventory_entries"] = True
+        stack.extend(value.values())
+    return flags
 
 
 def get_entity_appearance_metadata(filename: str) -> dict:
@@ -1624,30 +1782,21 @@ def get_entity_appearance_metadata(filename: str) -> dict:
                 for appearance in data.get("appearances", []) or []
             ],
             "used_names": data.get("usedAppearances", []) or [],
+            "entity_class": data.get("entity_class") or data.get("type") or data.get("entityClass") or "",
+            **_entity_json_component_metadata(data),
         })
         dlc_names = get_dlc_external_appearance_names_for_entity(filename)
         if dlc_names:
             metadata["all_names"] = _dedupe_entity_appearance_names(metadata.get("all_names", []) + dlc_names)
+            metadata["component_metadata_known"] = False
         return normalize_entity_appearance_metadata(metadata)
 
     metadata = normalize_entity_appearance_metadata(_read_entity_template_appearance_metadata(filename))
     dlc_names = get_dlc_external_appearance_names_for_entity(filename)
     if dlc_names:
         metadata["all_names"] = _dedupe_entity_appearance_names(metadata.get("all_names", []) + dlc_names)
+        metadata["component_metadata_known"] = False
     return normalize_entity_appearance_metadata(metadata)
-
-
-def classify_entity_import_metadata(metadata: dict | None, context=None) -> str:
-    metadata = normalize_entity_appearance_metadata(metadata)
-    if bool(metadata.get("has_armature_root", False)):
-        return "character"
-    if bool(metadata.get("has_inventory_entries", False)):
-        try:
-            if can_apply_inventory_to_selected_character(context):
-                return "inventory"
-        except Exception:
-            pass
-    return "entity"
 
 
 def _load_entity_state_from_json(rig_settings):
@@ -1734,6 +1883,7 @@ def _coerce_version(value, default=999):
     except Exception:
         return default
 
+
 def test_load_entity(filename, append_dlc_appearances=True, load_dlc_appearances=False) ->  w3_types.Entity:
     # #TODO add this custom json after normal bin file is loaded
     # if filename.endswith("geralt_player.w2ent") or filename.endswith(r"player\player.w2ent"):
@@ -1741,8 +1891,7 @@ def test_load_entity(filename, append_dlc_appearances=True, load_dlc_appearances
     #     RES_DIR = str(Path(RES_DIR).parents[1])
     #     filename = os.path.join(RES_DIR, r"CR2W\data\geralt_CUSTOM.w2ent.json")
 
-    dirpath, file = os.path.split(filename)
-    basename, ext = os.path.splitext(file)
+    ext = os.path.splitext(str(filename or ""))[1]
     if ext.lower() in ('.json'):
         entity = read_json_w3.readEntFile(filename)
     elif ext.lower().endswith('.w2ent') or ext.lower().endswith('.w3app'):
@@ -1755,7 +1904,7 @@ def test_load_entity(filename, append_dlc_appearances=True, load_dlc_appearances
     return entity
 
 def _try_import_armature_from_item_appearances(entity, parent_transform=None, source_game="", target_collection=None,
-                                               mesh_import_settings=None):
+                                               mesh_import_settings=None, component_import_options=None):
     """For CItemEntity (no MovingPhysicalAgentComponent), try to find a skeleton
     inside the first appearance's included templates.  Returns an armature object
     if one is found, otherwise None."""
@@ -1767,12 +1916,24 @@ def _try_import_armature_from_item_appearances(entity, parent_transform=None, so
     for tmpl in templates:
         if isinstance(tmpl, dict):
             tmpl_filename = tmpl.get('templateFilename', '')
+            template_chunks = tmpl.get('chunks') or []
+            template_plan_complete = bool(tmpl.get('plan_complete', False))
         else:
             tmpl_filename = getattr(tmpl, 'templateFilename', '')
+            template_chunks = getattr(tmpl, 'chunks', None) or []
+            template_plan_complete = bool(getattr(tmpl, 'plan_complete', False))
         if not tmpl_filename:
             continue
         try:
-            (_, sub_entity) = LoadCEntityTemplateFile(tmpl_filename)
+            if template_chunks or template_plan_complete:
+                sub_entity = w3_types.Entity(
+                    name=Path(tmpl_filename).stem,
+                    staticMeshes={"chunks": copy.deepcopy(template_chunks)},
+                    version=getattr(entity, "version", 999),
+                    type=getattr(entity, "type", None),
+                )
+            else:
+                (_, sub_entity) = LoadCEntityTemplateFile(tmpl_filename, getattr(entity, "version", None))
             if sub_entity is None:
                 continue
             arm = import_MovingPhysicalAgentComponent(
@@ -1782,6 +1943,7 @@ def _try_import_armature_from_item_appearances(entity, parent_transform=None, so
                 source_game=source_game,
                 target_collection=target_collection,
                 mesh_import_settings=mesh_import_settings,
+                component_import_options=component_import_options,
             )
             if arm:
                 return arm
@@ -1800,7 +1962,7 @@ def _should_create_direct_entity_root(entity, parent_transform=None) -> bool:
     component_type = _entity_primary_component_type(entity)
     if component_type:
         return component_type != "CMovingPhysicalAgentComponent"
-    return bool(getattr(entity, "cookedEffects", None) or getattr(entity, "isLightOn", None) is not None)
+    return True
 
 
 def _find_layer_collection_for_collection(layer_collection, target_collection):
@@ -2013,16 +2175,37 @@ def _bind_unbound_skinned_meshes_to_merged_armature(objects, target_armature) ->
     return bound
 
 
-def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
-                        parent_transform = None, selected_appearance_name = "",
-                        mesh_import_settings = None, entity_namespace = ""):
+_foliage_dedupe_keys = None
+
+
+def _with_foliage_dedupe_scope(func):
+    def wrapper(*args, **kwargs):
+        global _foliage_dedupe_keys
+        owner = _foliage_dedupe_keys is None
+        if owner:
+            _foliage_dedupe_keys = set()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            if owner:
+                _foliage_dedupe_keys = None
+    return wrapper
+
+
+@_with_foliage_dedupe_scope
+def _materialize_entity_asset(filename, load_face_poses = False, import_apperance = 0,
+                              parent_transform = None, selected_appearance_name = "",
+                              mesh_import_settings = None, entity_namespace = "",
+                              entity_override = None, component_import_options = None,
+                              load_appearance_equipment = False,
+                              existing_root_skeleton = None, entity_overlay = False):
     base_context = bpy.context
     mesh_import_settings = get_entity_mesh_import_settings(mesh_import_settings)
-    if not getattr(import_ent_template, "_repo_context_active", False):
-        import_ent_template._repo_context_active = True
+    if not getattr(_materialize_entity_asset, "_repo_context_active", False):
+        _materialize_entity_asset._repo_context_active = True
         try:
             with redkit_repo_context(filename):
-                return import_ent_template(
+                return _materialize_entity_asset(
                     filename,
                     load_face_poses,
                     import_apperance,
@@ -2030,9 +2213,14 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                     selected_appearance_name,
                     mesh_import_settings=mesh_import_settings,
                     entity_namespace=entity_namespace,
+                    entity_override=entity_override,
+                    component_import_options=component_import_options,
+                    load_appearance_equipment=load_appearance_equipment,
+                    existing_root_skeleton=existing_root_skeleton,
+                    entity_overlay=entity_overlay,
                 )
         finally:
-            import_ent_template._repo_context_active = False
+            _materialize_entity_asset._repo_context_active = False
     # Keep isolation at the public entry point.  The existing entity import
     # implementation below should stay unaware of the temporary session.
     if import_isolation.needs_isolation_session(base_context):
@@ -2042,7 +2230,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
             target_collection,
             label=Path(filename).stem,
         ):
-            result = import_ent_template(
+            result = _materialize_entity_asset(
                 filename,
                 load_face_poses,
                 import_apperance,
@@ -2050,16 +2238,22 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                 selected_appearance_name,
                 mesh_import_settings=mesh_import_settings,
                 entity_namespace=entity_namespace,
+                entity_override=entity_override,
+                component_import_options=component_import_options,
+                load_appearance_equipment=load_appearance_equipment,
+                existing_root_skeleton=existing_root_skeleton,
+                entity_overlay=entity_overlay,
             )
         if result is not None:
             _focus_main_armature(base_context, result)
         return result
 
-    clear_template_cache()
     context = bpy.context
     target_collection = _get_import_target_collection(context)
     _activate_target_collection(context, target_collection)
-    entity = test_load_entity(filename)
+    entity = copy.deepcopy(entity_override) if entity_override is not None else test_load_entity(filename)
+    if entity is None:
+        raise ValueError(f"Could not parse entity asset: {filename}")
     namespace_override = str(entity_namespace or "").strip().rstrip(":")
     if namespace_override:
         entity.name = namespace_override
@@ -2080,8 +2274,15 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
             target_collection=target_collection,
         )
         created_entity_root = entity_root
+        entity_class = str(getattr(entity, "type", "") or "CEntity")
+        entity_root["witcher_type"] = entity_class
+        entity_root["witcher_redkit_class"] = entity_class
 
-    merged_armature_context = _new_merged_armature_context(context)
+    merged_armature_context = _new_merged_armature_context(
+        context,
+        root_armature=existing_root_skeleton,
+        force=existing_root_skeleton is not None,
+    )
     base_animation_skeleton = import_MovingPhysicalAgentComponent(
         entity,
         entity_root,
@@ -2091,8 +2292,11 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
         target_collection=target_collection,
         mesh_import_settings=mesh_import_settings,
         merged_armature_context=merged_armature_context,
+        component_import_options=component_import_options,
+        existing_root_skeleton=existing_root_skeleton,
+        append_entity_slots=bool(entity_overlay and existing_root_skeleton is not None),
     )
-    main_arm_obj = base_animation_skeleton
+    main_arm_obj = existing_root_skeleton or base_animation_skeleton
 
     if not main_arm_obj:
         # Only handle entities that actually have appearance variants (e.g. CItemEntity dye
@@ -2106,6 +2310,7 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                 source_game=entity_source_game,
                 target_collection=target_collection,
                 mesh_import_settings=mesh_import_settings,
+                component_import_options=component_import_options,
             )
             if arm_from_tmpl:
                 main_arm_obj = arm_from_tmpl
@@ -2121,11 +2326,28 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                 if entity_root and getattr(main_arm_obj, "parent", None) is None:
                     main_arm_obj.parent = entity_root
         else:
-            if created_entity_root and not created_entity_root.children:
-                bpy.data.objects.remove(created_entity_root, do_unlink=True)
-            return None
+            return created_entity_root
     elif entity_root and getattr(main_arm_obj, "parent", None) is None:
         main_arm_obj.parent = entity_root
+    if entity_overlay and existing_root_skeleton is not None:
+        try:
+            from ..ui.ui_equipment import refresh_slot_constraints
+            refresh_slot_constraints(existing_root_skeleton)
+        except Exception:
+            pass
+        try:
+            armature_merge.unify_character_armatures(existing_root_skeleton, context=context)
+        except Exception:
+            log.warning(
+                "Failed to unify overlay armatures for '%s'.",
+                getattr(existing_root_skeleton, "name", ""),
+                exc_info=True,
+            )
+        _focus_main_armature(context, existing_root_skeleton)
+        return existing_root_skeleton
+    entity_class = str(getattr(entity, "type", "") or "CEntity")
+    main_arm_obj["witcher_type"] = entity_class
+    main_arm_obj["witcher_redkit_class"] = entity_class
     _focus_main_armature(context, main_arm_obj)
     main_arm_obj["_w3_entity_import_in_progress"] = True
     try:
@@ -2140,7 +2362,12 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
         app_idx = -1 if entity_state is None else int(entity_state.get("app_idx", -1))
         if rig_settings and getattr(entity, "appearances", None) and app_idx >= 0:
             item = rig_settings.app_list[app_idx]
-            import_from_list_item(context, item)
+            import_from_list_item(
+                context,
+                item,
+                component_import_options=component_import_options,
+                load_appearance_equipment=load_appearance_equipment,
+            )
 
         # Refresh slot constraints after all components are imported
         try:
@@ -2179,6 +2406,45 @@ def import_ent_template(filename, load_face_poses = False, import_apperance = 0,
                 del main_arm_obj["_w3_entity_import_in_progress"]
         except Exception:
             pass
+
+
+def import_entity_file(filename, load_face_poses=False, import_apperance=0,
+                       parent_transform=None, selected_appearance_name="",
+                       mesh_import_settings=None, entity_namespace="",
+                       load_appearance_equipment=False):
+    from . import import_blender_fun
+
+    entity = test_load_entity(filename, load_dlc_appearances=True)
+    if entity is None:
+        raise ValueError(f"Could not parse entity file: {filename}")
+    plan = import_blender_fun.build_entity_import_plan(
+        entity,
+        source_path=filename,
+        selected_appearance=selected_appearance_name,
+    )
+    return import_blender_fun.materialize_entity_import_plan(
+        plan,
+        context=bpy.context,
+        target_collection=_get_import_target_collection(bpy.context),
+        options={
+            "load_face_poses": bool(load_face_poses),
+            "import_apperance": int(import_apperance),
+            "parent_transform": parent_transform,
+            "mesh_import_settings": mesh_import_settings,
+            "entity_namespace": entity_namespace,
+            "load_appearance_equipment": bool(load_appearance_equipment),
+            "_entity_import_parse_cache_ready": True,
+        },
+    )
+
+
+def entity_import_result_errors(result):
+    errors = [str(error) for error in (getattr(result, "errors", None) or []) if str(error)]
+    ok = bool(getattr(result, "main_object", None) or getattr(result, "created_objects", None))
+    if not ok and not errors:
+        errors = ["Entity import produced no objects."]
+    return ok, errors
+
 
 def inList(name, mylist):
     for el in mylist:
@@ -3086,6 +3352,7 @@ def _w2_mimic_metadata_from_chunk(chunk):
         "float_track_skeleton": str(_get_entry_attr(chunk, "w2_mimic_float_track_skeleton", "") or ""),
         "skeleton_embedded_source": str(_get_entry_attr(chunk, "w2_mimic_skeleton_embedded_source", "") or ""),
         "skeleton_embedded_chunk_index": _get_entry_attr(chunk, "w2_mimic_skeleton_embedded_chunk_index", -1),
+        "embedded_skeleton_data": _get_entry_attr(chunk, "w2_mimic_embedded_skeleton_data", None),
         "faces": str(_get_entry_attr(chunk, "w2_mimic_faces", "") or ""),
         "faces_high": str(_get_entry_attr(chunk, "w2_mimic_faces_high", "") or ""),
         "faces_low": str(_get_entry_attr(chunk, "w2_mimic_faces_low", "") or ""),
@@ -4789,7 +5056,7 @@ def length_to_fov( length:float, crop:float = 1.0 ):
 def create_camera_drivers(armobj, camera, name):
     setup_camera_preview_drivers(armobj, camera)
 
-def do_constraints(constrains, objdict, meshdict, HardAttachments, group_parent=None):
+def do_constraints(constrains, objdict, meshdict, HardAttachments, group_parent=None, entity_name=""):
     """
     Process constraints and hard attachments, applying constraints between objects and setting up parenting.
 
@@ -4799,11 +5066,12 @@ def do_constraints(constrains, objdict, meshdict, HardAttachments, group_parent=
         meshdict (dict): Dictionary mapping mesh names to Blender mesh objects
         HardAttachments (list): List of constraints with 'parent_name', 'parentSlotName', 'child_name', 'relativeTransform'
         group_parent (str, optional): Optional parent object name for grouping
+        entity_name (str, optional): Owning entity name for skeleton-less root pairs
 
     Returns:
         list: List of objects that are parented to the group_parent
     """
-    return_objs = process_constraints(constrains, objdict, group_parent)
+    return_objs = process_constraints(constrains, objdict, group_parent, entity_name=entity_name)
     process_hard_attachments(HardAttachments, objdict, meshdict)
     return return_objs
 
@@ -4987,7 +5255,7 @@ def _merged_parent_armature(obj):
     return None
 
 
-def process_constraints(constrains, objdict, group_parent=None):
+def process_constraints(constrains, objdict, group_parent=None, entity_name=""):
     """
     Process and apply constraints between parent and child objects.
 
@@ -4995,6 +5263,8 @@ def process_constraints(constrains, objdict, group_parent=None):
         constrains (list): List of tuples [(parent_obj_name, child_obj_name), ...]
         objdict (dict): Dictionary mapping object names to Blender objects
         group_parent (str, optional): Optional parent object name for grouping
+        entity_name (str, optional): Owning entity name; root pairs targeting it
+            resolve via parent_transform when the entity has no skeleton object
 
     Returns:
         list: List of objects that are parented to the group_parent
@@ -5060,6 +5330,8 @@ def process_constraints(constrains, objdict, group_parent=None):
                 _set_parent_keep_world(child_obj, parent_obj)
                 if group_parent and parent_obj_name == group_parent:
                     return_objs.append(child_obj)
+        elif parent_obj_name == entity_name and parent_obj_name not in objdict:
+            log.debug('Root component %s binds via parent_transform (no root skeleton object)', child_obj_name)
         else:
             log.info(f'Failed to constrain {child_obj_name} to {parent_obj_name}')
     return return_objs
@@ -5402,7 +5674,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                  selectedAppearance=None, import_redcloth_enabled=True, morphs_todo=None,
                  bind_root_chunks_to_entity=True, direct_entity_path="", source_game="",
                  source_entity_path="", target_collection=None, mesh_import_settings=None,
-                 merged_armature_context=None):
+                 merged_armature_context=None, component_import_options=None):
     if morphs_todo is None:
         morphs_todo = []
     if target_collection is None:
@@ -5623,10 +5895,17 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 _store_w2_mimic_metadata(imported_armature, metadata, armature_name=imported_armature.name)
                 objdict[f"{chunk_ns}:rig"] = imported_armature
             except Exception:
-                embedded_skeleton = _load_w2_embedded_skeleton_data(
-                    skeleton_embedded_source,
-                    skeleton_embedded_chunk_index,
-                )
+                embedded_skeleton = metadata.get("embedded_skeleton_data")
+                if isinstance(embedded_skeleton, dict):
+                    embedded_skeleton = w3_types.CSkeleton(
+                        bones=embedded_skeleton.get("bones", []) or [],
+                        tracks=embedded_skeleton.get("tracks", []) or [],
+                    )
+                if embedded_skeleton is None:
+                    embedded_skeleton = _load_w2_embedded_skeleton_data(
+                        skeleton_embedded_source,
+                        skeleton_embedded_chunk_index,
+                    )
                 if embedded_skeleton is not None:
                     try:
                         imported_armature = import_rig.create_armature(
@@ -5662,7 +5941,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     )
 
         mesh_repo = str(metadata.get("mesh", "") or chunk.get("mesh", "") or "").strip()
-        if mesh_repo:
+        if mesh_repo and _entity_chunk_mesh_enabled(chunk, component_import_options):
             embedded_source_path = str(_get_entry_attr(chunk, "_embedded_source_path", "") or "")
             embedded_cmesh_chunk_index = _get_entry_attr(
                 chunk,
@@ -6079,7 +6358,7 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             continue
 
         # Import meshes
-        if "mesh" in chunk:
+        if "mesh" in chunk and _entity_chunk_mesh_enabled(chunk, component_import_options):
             mesh_path = chunk['mesh']
             embedded_source_path = str(_get_entry_attr(chunk, "_embedded_source_path", "") or "")
             embedded_cmesh_chunk_index = _get_entry_attr(
@@ -6199,6 +6478,44 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                             if target_obj is not None:
                                 target_obj["witcher_w2_head_slot_attachment_count"] = head_slot_attached
 
+        if chunk.get('srt') and _entity_chunk_mesh_enabled(chunk, component_import_options):
+            srt_key = str(chunk['srt']).replace("/", "\\").lower()
+            chunk_transform = _coerce_engine_transform(chunk.get("transform"))
+            transform_sig = (
+                json.dumps(normalize_engine_transform(chunk_transform), separators=(",", ":"))
+                if chunk_transform is not None else None
+            )
+            dedupe_key = (srt_key, transform_sig)
+            if _foliage_dedupe_keys is not None and dedupe_key in _foliage_dedupe_keys:
+                log.debug(
+                    "Skipping duplicate foliage component %s #%s (%s)",
+                    chunk.get('type'), chunk.get('chunkIndex'), chunk.get('srt'),
+                )
+                continue
+            component_name = _get_chunk_component_name(chunk)
+            foliage_obj = None
+            try:
+                foliage_obj = _import_srt_chunk_object(chunk['srt'], chunk_ns)
+            except Exception:
+                log.warning(
+                    "Failed to import foliage SRT %s for %s #%s",
+                    chunk.get('srt'), chunk.get('type'), chunk.get('chunkIndex'), exc_info=True,
+                )
+            if foliage_obj is None:
+                log.warning(
+                    "Skipping %s #%s: no mesh from SRT %s",
+                    chunk.get('type'), chunk.get('chunkIndex'), chunk.get('srt'),
+                )
+            else:
+                add_chunk_metadata(foliage_obj, chunk, chunk['srt'], component_name=component_name)
+                if chunk.get('srt_entry'):
+                    foliage_obj['witcher_foliage_entry'] = chunk['srt_entry']
+                    foliage_obj['witcher_foliage_entries'] = json.dumps(chunk.get('srt_entries') or {})
+                meshdict[chunk_ns] = foliage_obj
+                _apply_chunk_transform_to_import_roots(chunk, meshes=[foliage_obj])
+                if _foliage_dedupe_keys is not None:
+                    _foliage_dedupe_keys.add(dedupe_key)
+
         # Handle cloth resources
         if "resource" in chunk and not import_redcloth_enabled:
             redcloth_resource = str(chunk.get("resource", "") or "")
@@ -6228,7 +6545,11 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                             redcloth_resource,
                         )
 
-        if "resource" in chunk and import_redcloth_enabled:
+        if "resource" in chunk and _entity_chunk_cloth_enabled(
+            chunk.get("resource", ""),
+            component_import_options,
+            import_redcloth_enabled,
+        ):
             redcloth_resource = chunk["resource"]
             redcloth_mat_path = repo_file(redcloth_resource, resource_version)
             component_name = _get_chunk_component_name(chunk)
@@ -6258,7 +6579,11 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     _apply_coloring_lookup_to_objects(cloth_meshes, coloring_entry_lookup)
 
         # Handle morphs
-        if mesh_import_settings.get("import_morphs", True) and "morphComponentId" in chunk:
+        if (
+            mesh_import_settings.get("import_morphs", True)
+            and _component_import_option(component_import_options, "do_import_Mesh", True)
+            and "morphComponentId" in chunk
+        ):
             morph_source_path = repo_file(chunk['morphSource'], resource_version)
             morph_target_path = repo_file(chunk['morphTarget'], resource_version)
             if (
@@ -6267,15 +6592,12 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                 or not os.path.exists(win_safe_path(morph_source_path))
                 or not os.path.exists(win_safe_path(morph_target_path))
             ):
-                log.warning(
-                    "Skipping morph '%s' because source/target mesh is missing: %s -> %s, %s -> %s",
-                    chunk.get('morphComponentId'),
-                    chunk.get('morphSource'),
-                    morph_source_path,
-                    chunk.get('morphTarget'),
-                    morph_target_path,
+                raise FileNotFoundError(
+                    "Morph source/target mesh is missing for "
+                    f"{chunk.get('morphComponentId')}: "
+                    f"{chunk.get('morphSource')} -> {morph_source_path}, "
+                    f"{chunk.get('morphTarget')} -> {morph_target_path}"
                 )
-                continue
             try:
                 merged_morph_target = None
                 if not _merged_chunk_keeps_own_skeleton(chunk):
@@ -6303,15 +6625,11 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
                     target_armature=merged_morph_target,
                 )
             except Exception as morph_err:
-                log.warning(
-                    "Failed to import morph meshes for chunk %s #%s (source=%s, target=%s): %s. Skipping morph.",
-                    chunk.get('type'),
-                    chunk.get('chunkIndex'),
-                    morph_source_path,
-                    morph_target_path,
-                    morph_err,
-                )
-                continue
+                raise RuntimeError(
+                    f"Failed to import morph meshes for {chunk.get('type')} "
+                    f"#{chunk.get('chunkIndex')} "
+                    f"(source={morph_source_path}, target={morph_target_path}): {morph_err}"
+                ) from morph_err
             
             morphs_todo.append([chunk['morphComponentId'], (morph_source_meshes, morph_source_arms)])
             join_as_shape_keys(morph_source_meshes, morph_target_meshes, chunk['morphComponentId'])
@@ -6450,7 +6768,11 @@ def import_chunks(entity, ent_namespace, cur_chunks, constrains, objdict, meshdi
             add_chunk_metadata(camera_object, chunk)
             objdict[chunk_ns] = camera_object
 
-        if chunk['type'] in {"CPointLightComponent", "CSpotLightComponent"}:
+        if chunk['type'] in {"CPointLightComponent", "CSpotLightComponent"} and _component_import_option(
+            component_import_options,
+            "do_import_SpotLight" if chunk['type'] == "CSpotLightComponent" else "do_import_PointLight",
+            True,
+        ):
             light_obj = _import_light_component(chunk)
             if light_obj is not None:
                 add_chunk_metadata(light_obj, chunk)
@@ -6670,18 +6992,20 @@ def set_empty_bone_offset(
 
 def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_entity_path="", source_game="", source_entity_path="",
                                         target_collection=None, mesh_import_settings=None,
-                                        merged_armature_context=None):
+                                        merged_armature_context=None, component_import_options=None,
+                                        existing_root_skeleton=None, append_entity_slots=False):
     #entity = fixed_chunk_paths(entity, entity.version)
     ent_namespace = entity.name+":"
     if target_collection is None:
         target_collection = _get_import_target_collection(bpy.context)
     _activate_target_collection(bpy.context, target_collection)
     mesh_import_settings = get_entity_mesh_import_settings(mesh_import_settings)
+    import_redcloth_enabled = bool(get_do_import_redcloth(bpy.context))
 
     #OPTIONS
     hide_shadowmesh = True
     mimic_namespace = False
-    root_skeleton = False
+    root_skeleton = existing_root_skeleton or False
     faceData = False
 
     #CONTRAINT ARRAYS
@@ -6707,12 +7031,14 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
             hide_shadowmesh,
             root_skeleton,
             i='',
+            import_redcloth_enabled=import_redcloth_enabled,
             direct_entity_path=direct_entity_path,
             source_game=source_game,
             source_entity_path=source_entity_path,
             target_collection=target_collection,
             mesh_import_settings=mesh_import_settings,
             merged_armature_context=merged_armature_context,
+            component_import_options=component_import_options,
         )
 
     if not root_skeleton:
@@ -6739,27 +7065,44 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
     if entity.slots and root_skeleton and root_skeleton.type == 'ARMATURE':
         import json
         rig_settings = root_skeleton.data.witcherui_RigSettings
-        rig_settings.entity_slots.clear()
+        if not append_entity_slots:
+            rig_settings.entity_slots.clear()
+        existing_slot_keys = {
+            (
+                str(getattr(slot, "slot_name", "") or "").strip().lower(),
+                str(getattr(slot, "component_name", "") or "").strip().lower(),
+                str(getattr(slot, "bone_name", "") or "").strip().lower(),
+            )
+            for slot in rig_settings.entity_slots
+        }
         
-        # Always create a per-import slot container so repeated imports of the
-        # same entity stay isolated and never reuse another instance's slots.
-        slots_parent_name = f"{entity.name}_slots" if entity.name else "entity_slots"
-        slots_parent = bpy.data.objects.new(slots_parent_name, None)
-        _link_object_to_collection(slots_parent, target_collection)
-        slots_parent.empty_display_type = 'PLAIN_AXES'
-        slots_parent.empty_display_size = 0.1
-        slots_parent["witcher_slots_parent"] = True
-        slots_parent["witcher_entity_name"] = entity.name or ""
-        slots_parent["witcher_owner_armature"] = getattr(root_skeleton, "name_full", root_skeleton.name)
-        
-        # Parent slots container to root skeleton
-        slots_parent.parent = root_skeleton
-        slots_parent.hide_set(True)  # Hidden by default
+        slots_parent = None
 
         # Process each slot
         for slot in entity.slots:
             this_slot = slot if isinstance(slot, w3_types.EntitySlot) else w3_types.EntitySlot(True, slot)
             componentName = this_slot.componentName
+            slot_key = (
+                str(this_slot.name or "").strip().lower(),
+                str(componentName or "").strip().lower(),
+                str(this_slot.boneName or "").strip().lower(),
+            )
+            if slot_key in existing_slot_keys:
+                continue
+            existing_slot_keys.add(slot_key)
+            if slots_parent is None:
+                slots_parent_name = f"{entity.name}_slots" if entity.name else "entity_slots"
+                slots_parent = bpy.data.objects.new(slots_parent_name, None)
+                _link_object_to_collection(slots_parent, target_collection)
+                slots_parent.empty_display_type = 'PLAIN_AXES'
+                slots_parent.empty_display_size = 0.1
+                slots_parent["witcher_slots_parent"] = True
+                slots_parent["witcher_entity_name"] = entity.name or ""
+                slots_parent["witcher_owner_armature"] = getattr(
+                    root_skeleton, "name_full", root_skeleton.name
+                )
+                slots_parent.parent = root_skeleton
+                slots_parent.hide_set(True)
 
             # Store slot data in rig_settings for persistence
             slot_entry = rig_settings.entity_slots.add()
@@ -6842,8 +7185,8 @@ def import_MovingPhysicalAgentComponent(entity, parent_transform = None, direct_
             empty_obj.hide_set(True)
 
     #objdict.update({entity.name:root_skeleton}) # TODO this shouldn't be required if it reads the entity constraints full
-    
-    do_constraints(constrains, objdict, meshdict, HardAttachments)
+
+    do_constraints(constrains, objdict, meshdict, HardAttachments, entity_name=str(getattr(entity, "name", "") or ""))
 
     if source_game == "w2" and root_skeleton is not None and getattr(root_skeleton, "type", "") == 'ARMATURE':
         imported_roots = _get_import_root_objects(
@@ -6913,7 +7256,8 @@ def add_app_template(   entity,
                                  morphs_todo_accum=None,
                                  bind_root_chunks_to_entity=True,
                                  target_collection=None,
-                                 merged_armature_context=None):
+                                 merged_armature_context=None,
+                                 component_import_options=None):
     source_context_path = templateFilename if templateFilename and os.path.isabs(str(templateFilename)) else _repo_context_source_for_armature(base_animation_skeleton)
     if source_context_path and not getattr(add_app_template, "_repo_context_active", False):
         add_app_template._repo_context_active = True
@@ -6938,6 +7282,7 @@ def add_app_template(   entity,
                     bind_root_chunks_to_entity=bind_root_chunks_to_entity,
                     target_collection=target_collection,
                     merged_armature_context=merged_armature_context,
+                    component_import_options=component_import_options,
                 )
         finally:
             add_app_template._repo_context_active = False
@@ -6956,12 +7301,16 @@ def add_app_template(   entity,
     template_chunks = None
     if isinstance(template_data, dict):
         template_chunks = template_data.get('chunks')
+        template_plan_complete = bool(template_data.get('plan_complete', False))
     elif hasattr(template_data, 'chunks'):
         template_chunks = getattr(template_data, 'chunks', None)
-    if template_chunks:
-        templateMesh = {'chunks': template_chunks}
+        template_plan_complete = bool(getattr(template_data, 'plan_complete', False))
     else:
-        (templateMesh, entity_back) = LoadCEntityTemplateFile(templateFilename)
+        template_plan_complete = False
+    if template_chunks or template_plan_complete or not str(templateFilename or "").strip():
+        templateMesh = {'chunks': list(template_chunks or [])}
+    else:
+        (templateMesh, entity_back) = LoadCEntityTemplateFile(templateFilename, getattr(entity, "version", None))
     
     cur_chunks = templateMesh['chunks']
     _arm_rig = getattr(getattr(base_animation_skeleton, "data", None), "witcherui_RigSettings", None)
@@ -6990,6 +7339,7 @@ def add_app_template(   entity,
         target_collection=target_collection,
         mesh_import_settings=mesh_import_settings,
         merged_armature_context=merged_armature_context,
+        component_import_options=component_import_options,
     )
     if morphs_todo_accum is not None and local_morphs_todo:
         morphs_todo_accum.extend(local_morphs_todo)
@@ -7014,7 +7364,14 @@ def add_app_template(   entity,
         if repaired:
             log.info("Repaired %d placeholder rest transforms on %s", repaired, target_armature.name)
     #TODO do_constraints after each chunk not all together
-    apperance_level_objects = do_constraints(constrains, objdict, meshdict, HardAttachments, group_parent)
+    apperance_level_objects = do_constraints(
+        constrains,
+        objdict,
+        meshdict,
+        HardAttachments,
+        group_parent,
+        entity_name=str(getattr(entity, "name", "") or ""),
+    )
 
     # Propagate face skeleton from equipment template if not already set
     if 'mimicFaceFile' in base_animation_skeleton:
@@ -7080,14 +7437,23 @@ def _apply_coloring_entries_to_objects(objects, coloring_entries, appearance_nam
 def import_app(context,
                selectedAppearance,
                entity,
-               base_animation_skeleton):
+               base_animation_skeleton,
+               component_import_options=None,
+               load_appearance_equipment=True):
     base_context = context or bpy.context
     source_context_path = _repo_context_source_for_armature(base_animation_skeleton)
     if source_context_path and not getattr(import_app, "_repo_context_active", False):
         import_app._repo_context_active = True
         try:
             with redkit_repo_context(source_context_path):
-                return import_app(context, selectedAppearance, entity, base_animation_skeleton)
+                return import_app(
+                    context,
+                    selectedAppearance,
+                    entity,
+                    base_animation_skeleton,
+                    component_import_options=component_import_options,
+                    load_appearance_equipment=load_appearance_equipment,
+                )
         finally:
             import_app._repo_context_active = False
     # Appearance import is another public boundary.  Wrap once here instead of
@@ -7101,7 +7467,14 @@ def import_app(context,
             label=f"{getattr(base_animation_skeleton, 'name', 'Character')}_{getattr(selectedAppearance, 'name', 'Appearance')}",
             visible_objects=visible_objects,
         ) as session:
-            result = import_app(session.context, selectedAppearance, entity, base_animation_skeleton)
+            result = import_app(
+                session.context,
+                selectedAppearance,
+                entity,
+                base_animation_skeleton,
+                component_import_options=component_import_options,
+                load_appearance_equipment=load_appearance_equipment,
+            )
         _focus_main_armature(base_context, base_animation_skeleton)
         return result
 
@@ -7257,7 +7630,8 @@ def import_app(context,
                              template_appearances,
                              morphs_todo_accum=morphs_todo,
                              target_collection=target_collection,
-                             merged_armature_context=merged_armature_context)
+                             merged_armature_context=merged_armature_context,
+                             component_import_options=component_import_options)
 
             new_objects = _tag_new_collection_objects_with_guid(
                 target_collection,
@@ -7306,7 +7680,8 @@ def import_app(context,
                          template_appearances,
                          morphs_todo_accum=morphs_todo,
                          target_collection=target_collection,
-                         merged_armature_context=merged_armature_context)
+                         merged_armature_context=merged_armature_context,
+                         component_import_options=component_import_options)
 
         new_objects = _tag_new_collection_objects_with_guid(
             target_collection,
@@ -7471,22 +7846,22 @@ def import_app(context,
             deferred_default_slot_indices.append(slot_index)
             continue
 
-    # Apply inventory-mounted items (overrides defaults when present).
-    _apply_inventory_mounts(
-        context,
-        base_animation_skeleton,
-        selectedAppearance,
-        rig_settings,
-        entity,
-        shared_inventory=True,
-        prepared_context=equipment_load_context,
-        post_refresh=not deferred_default_slot_indices,
-    )
+    if load_appearance_equipment:
+        _apply_inventory_mounts(
+            context,
+            base_animation_skeleton,
+            selectedAppearance,
+            rig_settings,
+            entity,
+            shared_inventory=True,
+            prepared_context=equipment_load_context,
+            post_refresh=not deferred_default_slot_indices,
+        )
 
     # Defaults must be loaded through the shared equipment loader so
     # they get mounted to their equip_slot immediately on import.
     slots_to_reload = list(dict.fromkeys(deferred_default_slot_indices + persistent_slot_indices))
-    if slots_to_reload:
+    if load_appearance_equipment and slots_to_reload:
         try:
             from ..ui.ui_equipment import refresh_slot_constraints, load_equipment_items_batch
             refresh_slot_constraints(base_animation_skeleton)
@@ -7578,7 +7953,8 @@ def import_app(context,
     base_animation_skeleton.scale = save_scale
     base_animation_skeleton.data.pose_position = current_pose_position
 
-def import_from_list_item(context, item):
+def import_from_list_item(context, item, component_import_options=None,
+                          load_appearance_equipment=True):
     base_animation_skeleton, rig_settings = get_main_armature_and_rig_settings(
         context,
         prefer_active=True,
@@ -7599,7 +7975,14 @@ def import_from_list_item(context, item):
                     return
                 if was_lazy_dlc_app:
                     cache_rig_entity_state(rig_settings, entity, update_json=True)
-                import_app(context, app, entity, base_animation_skeleton)
+                import_app(
+                    context,
+                    app,
+                    entity,
+                    base_animation_skeleton,
+                    component_import_options=component_import_options,
+                    load_appearance_equipment=load_appearance_equipment,
+                )
                 _focus_main_armature(context, base_animation_skeleton)
                 #bpy.ops.witcher.load_face_morphs()
                 return

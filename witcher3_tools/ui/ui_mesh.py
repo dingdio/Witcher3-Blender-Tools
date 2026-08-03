@@ -574,9 +574,11 @@ def import_redapex_resource(
         for coll in (getattr(parent_collection, "children", []) or [])
     }
     from io_mesh_apx.importer.import_destruction import read_destruction
+    from ..cloth.importer import surgical_external_joins
     try:
         import_started = time.perf_counter()
-        read_destruction(context, apx_filepath, rotate_180)
+        with surgical_external_joins():
+            read_destruction(context, apx_filepath, rotate_180)
         import_seconds = time.perf_counter() - import_started
     except Exception:
         try:
@@ -625,16 +627,17 @@ def import_redapex_resource(
             imported_objects.append(obj)
     imported_meshes = [obj for obj in imported_objects if getattr(obj, "type", None) == 'MESH']
 
-    base_mesh = _postprocess_redapex_import(
-        context,
-        redapex_path,
-        imported_objects,
-        imported_collections,
-        target_collection,
-        import_chunks=import_chunks,
-        import_floor=import_floor,
-        collections_as_empties=collections_as_empties,
-    )
+    with surgical_external_joins():
+        base_mesh = _postprocess_redapex_import(
+            context,
+            redapex_path,
+            imported_objects,
+            imported_collections,
+            target_collection,
+            import_chunks=import_chunks,
+            import_floor=import_floor,
+            collections_as_empties=collections_as_empties,
+        )
 
     # Drop references invalidated by postprocessing.
     imported_objects = [obj for obj in imported_objects if _redapex_object_alive(obj)]

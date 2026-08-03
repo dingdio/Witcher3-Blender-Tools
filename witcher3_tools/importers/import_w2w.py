@@ -4433,7 +4433,6 @@ def import_world_tile_with_foliage(
     multires_level=TERRAIN_TILE_PREVIEW_LEVEL,
     world_root_collection=None,
     include_foliage=True,
-    foliage_mode="PROXY",
     detail_material=None,
 ):
     """Import one terrain tile and treat foliage failure as partial success."""
@@ -4468,7 +4467,6 @@ def import_world_tile_with_foliage(
                 int(spec.x_tiles),
                 int(spec.y_tiles),
                 float(spec.terrain_size),
-                source_mode=str(foliage_mode or "PROXY"),
             )
         except Exception as exc:
             foliage_error = str(exc)

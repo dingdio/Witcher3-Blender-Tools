@@ -1,4 +1,5 @@
 import logging
+import copy
 import csv
 import os
 import math
@@ -22,26 +23,92 @@ from .bin_helpers import (ReadUlong48, readUShort,
                         ReadFloat16)
 
 from .CR2W_helpers import Enums
-from .CR2W_types import ( getCR2W, is_entity_chunk, W_CLASS )
+from .CR2W_types import (
+    W_CLASS,
+    _is_direct_layer_entity_export,
+    getCR2W,
+    is_entity_chunk,
+)
 
 from .bStream import *
 
 _ENTITY_DIRECT_COMPONENT_TYPES = {
+    "CClothComponent",
     "CDestructionComponent",
+    "CDestructionSystemComponent",
     "CPointLightComponent",
     "CSpotLightComponent",
     "CMeshComponent",
     "CStaticMeshComponent",
-    "CAreaComponent",
-    "CWaterComponent",
 }
+
+_RICH_INLINE_ENTITY_CHUNK_TYPES = {
+    "CAnimatedAttachment",
+    "CAnimatedComponent",
+    "CAnimAnimsetsParam",
+    "CAnimDangleBufferComponent",
+    "CAnimDangleComponent",
+    "CAnimMimicParam",
+    "CEntityExternalAppearance",
+    "CEntityTemplateParam",
+    "CExternalProxyAttachment",
+    "CExternalProxyComponent",
+    "CFXDefinition",
+    "CHardAttachment",
+    "CMeshSkinningAttachment",
+    "CMimicComponent",
+    "CMorphedMeshComponent",
+    "CMovingPhysicalAgentComponent",
+    "CSkeletonBoneSlot",
+}
+
+
+def _cr2w_has_rich_inline_entity_graph(file):
+    chunks = list(getattr(getattr(file, "CHUNKS", None), "CHUNKS", None) or [])
+    for chunk in chunks:
+        chunk_type = str(
+            getattr(chunk, "Type", "") or getattr(chunk, "name", "") or ""
+        ).strip()
+        if (
+            chunk_type in _RICH_INLINE_ENTITY_CHUNK_TYPES
+            or chunk_type.startswith("CAnimDangleConstraint_")
+        ):
+            return True
+        if (
+            chunk_type
+            and chunk_type not in _ENTITY_DIRECT_COMPONENT_TYPES
+            and not is_entity_chunk(chunk)
+        ):
+            return True
+    return False
+
+
+def _compile_inline_entity_asset(file, source_name):
+    try:
+        from .dc_entity import create_CEntity
+
+        entity_asset = create_CEntity(file)
+        if entity_asset is not None:
+            entity_asset.version = int(
+                getattr(getattr(file, "HEADER", None), "version", 999) or 999
+            )
+        return entity_asset, ""
+    except Exception as exc:
+        message = f"inline entity graph could not be compiled: {exc}"
+        log.warning("Could not compile inline entity graph %s: %s", source_name, exc)
+        return None, message
 
 
 def _entity_component_parent_map(file, chunks):
     by_parent = {}
     exports = list(getattr(file, "CR2WExport", []) or [])
+    entity_chunk_ids = {
+        chunk_index
+        for chunk_index, chunk in enumerate(chunks, start=1)
+        if _is_level_entity_chunk(file, chunk, chunk_index)
+    }
     for chunk_index, chunk in enumerate(chunks, start=1):
-        if getattr(chunk, "name", "") not in _ENTITY_DIRECT_COMPONENT_TYPES:
+        if chunk_index in entity_chunk_ids:
             continue
         export_index = chunk_index - 1
         if export_index < 0 or export_index >= len(exports):
@@ -50,14 +117,241 @@ def _entity_component_parent_map(file, chunks):
             parent_id = int(getattr(exports[export_index], "parentID", 0) or 0)
         except Exception:
             parent_id = 0
-        if parent_id <= 0 or parent_id == chunk_index:
-            continue
-        by_parent.setdefault(parent_id, []).append(chunk)
+        visited = {chunk_index}
+        while parent_id > 0 and parent_id not in visited:
+            visited.add(parent_id)
+            if parent_id in entity_chunk_ids:
+                by_parent.setdefault(parent_id, []).append((chunk_index, chunk))
+                break
+            parent_export_index = parent_id - 1
+            if parent_export_index < 0 or parent_export_index >= len(exports):
+                break
+            try:
+                parent_id = int(
+                    getattr(exports[parent_export_index], "parentID", 0) or 0
+                )
+            except Exception:
+                break
     return by_parent
 
 
+_ENTITY_GRAPH_REFERENCE_PROPERTIES = (
+    "parent",
+    "child",
+    "constraint",
+    "transformParent",
+    "parentSlot",
+    "originalAttachment",
+)
+
+
+def _entity_graph_reference_chunk_ids(chunk, chunk_count):
+    references = set()
+    for component_id in getattr(chunk, "Components", None) or []:
+        if isinstance(component_id, int) and 0 < component_id <= chunk_count:
+            references.add(component_id)
+    for prop_name in _ENTITY_GRAPH_REFERENCE_PROPERTIES:
+        try:
+            prop = chunk.GetVariableByName(prop_name)
+        except Exception:
+            prop = None
+        if prop is None:
+            continue
+        value = getattr(prop, "Value", None)
+        if isinstance(value, int) and 0 < value <= chunk_count:
+            references.add(value)
+        for handle in getattr(prop, "Handles", None) or []:
+            reference = getattr(handle, "Reference", None)
+            if isinstance(reference, int) and 0 <= reference < chunk_count:
+                references.add(reference + 1)
+    return references
+
+
+def _layer_entity_ownership(chunks, parent_component_map):
+    entity_chunk_ids = {
+        chunk_id
+        for chunk_id, chunk in enumerate(chunks, start=1)
+        if is_entity_chunk(chunk)
+    }
+    owners_by_chunk_id = {}
+    for owner_id, children in parent_component_map.items():
+        for child_id, _chunk in children:
+            owners_by_chunk_id.setdefault(child_id, set()).add(owner_id)
+    for owner_id in entity_chunk_ids:
+        for child_id in getattr(chunks[owner_id - 1], "Components", None) or []:
+            if (
+                isinstance(child_id, int)
+                and 0 < child_id <= len(chunks)
+                and child_id not in entity_chunk_ids
+            ):
+                owners_by_chunk_id.setdefault(child_id, set()).add(owner_id)
+    return entity_chunk_ids, owners_by_chunk_id
+
+
+def _scoped_layer_entity_chunk_ids(
+    chunks,
+    entity_chunk_id,
+    parent_component_map,
+    ownership=None,
+):
+    entity_chunk_ids, owners_by_chunk_id = (
+        ownership or _layer_entity_ownership(chunks, parent_component_map)
+    )
+    scope = {int(entity_chunk_id)}
+    scope.update(
+        child_id
+        for child_id, _chunk in parent_component_map.get(int(entity_chunk_id), ())
+    )
+    root_chunk = chunks[int(entity_chunk_id) - 1]
+    malformed = []
+    for component_id in getattr(root_chunk, "Components", None) or []:
+        if not isinstance(component_id, int) or not (0 < component_id <= len(chunks)):
+            malformed.append(component_id)
+        else:
+            scope.add(component_id)
+    if malformed:
+        return scope, (
+            "malformed scoped entity component reference(s): "
+            + ", ".join(repr(value) for value in malformed)
+        )
+
+    queue = list(scope)
+    visited = set()
+    while queue:
+        chunk_id = queue.pop()
+        if chunk_id in visited:
+            continue
+        visited.add(chunk_id)
+        for referenced_id in _entity_graph_reference_chunk_ids(
+            chunks[chunk_id - 1],
+            len(chunks),
+        ):
+            if referenced_id in entity_chunk_ids and referenced_id != entity_chunk_id:
+                return scope, (
+                    f"entity graph reference crosses into sibling entity chunk #{referenced_id}"
+                )
+            owner_ids = owners_by_chunk_id.get(referenced_id, set())
+            if len(owner_ids) > 1:
+                owners = ", ".join(f"#{owner_id}" for owner_id in sorted(owner_ids))
+                return scope, (
+                    f"component #{referenced_id} is claimed by sibling entities {owners}"
+                )
+            owner_id = next(iter(owner_ids), None)
+            if owner_id is not None and owner_id != entity_chunk_id:
+                return scope, (
+                    f"entity graph reference crosses into component #{referenced_id} "
+                    f"owned by entity #{owner_id}"
+                )
+            if referenced_id not in scope:
+                scope.add(referenced_id)
+                queue.append(referenced_id)
+    return scope, ""
+
+
+def _copy_scoped_entity_cr2w(file, chunks, scope_ids):
+    scoped_file = copy.copy(file)
+    scoped_container = copy.copy(file.CHUNKS)
+    scoped_chunks = []
+    for chunk_id, chunk in enumerate(chunks, start=1):
+        if chunk_id in scope_ids:
+            scoped_chunk = copy.copy(chunk)
+            if hasattr(scoped_chunk, "PROPS"):
+                scoped_chunk.PROPS = list(getattr(chunk, "PROPS", None) or [])
+            if hasattr(scoped_chunk, "Components"):
+                scoped_chunk.Components = list(getattr(chunk, "Components", None) or [])
+        else:
+            scoped_chunk = SimpleNamespace(
+                Type="CEntityTemplateParam",
+                name="CEntityTemplateParam",
+                ChunkIndex=chunk_id - 1,
+                PROPS=[],
+                GetVariableByName=lambda _name: None,
+            )
+        scoped_chunks.append(scoped_chunk)
+    scoped_container.CHUNKS = scoped_chunks
+    scoped_file.CHUNKS = scoped_container
+    for scoped_chunk in scoped_chunks:
+        try:
+            setattr(scoped_chunk, "_W_CLASS__CR2WFILE", scoped_file)
+        except Exception:
+            pass
+    return scoped_file
+
+
+def _compile_scoped_layer_entity_asset(
+    file,
+    chunks,
+    entity_chunk_id,
+    parent_component_map,
+    filename,
+    ownership=None,
+):
+    scope_ids, scope_error = _scoped_layer_entity_chunk_ids(
+        chunks,
+        entity_chunk_id,
+        parent_component_map,
+        ownership=ownership,
+    )
+    rich_scope = any(
+        chunk_id != entity_chunk_id
+        and str(
+            getattr(chunks[chunk_id - 1], "Type", "")
+            or getattr(chunks[chunk_id - 1], "name", "")
+            or ""
+        ) not in _ENTITY_DIRECT_COMPONENT_TYPES
+        for chunk_id in scope_ids
+    )
+    if not rich_scope and not scope_error:
+        return None, "", False
+    if scope_error:
+        return None, scope_error, True
+    try:
+        from .dc_entity import create_CEntity
+
+        scoped_file = _copy_scoped_entity_cr2w(file, chunks, scope_ids)
+        asset = create_CEntity(
+            scoped_file,
+            _allow_unscoped_import_fallbacks=False,
+        )
+        if asset is None:
+            return None, "scoped entity compiler returned no entity asset", True
+        root_chunk = chunks[int(entity_chunk_id) - 1]
+        asset.type = str(
+            getattr(root_chunk, "Type", "") or getattr(root_chunk, "name", "") or "CEntity"
+        )
+        try:
+            root_name = str(root_chunk.get_name_prop_string() or "").strip()
+        except Exception:
+            root_name = ""
+        if root_name:
+            asset.name = root_name
+        return asset, "", True
+    except Exception as exc:
+        log.warning(
+            "Could not compile scoped entity graph #%s in %s: %s",
+            entity_chunk_id,
+            filename,
+            exc,
+        )
+        return None, f"scoped entity graph could not be compiled: {exc}", True
+
+
+def _is_level_entity_chunk(file, chunk, chunk_index):
+    if is_entity_chunk(chunk):
+        return True
+    return _is_direct_layer_entity_export(
+        file,
+        int(chunk_index) - 1,
+        getattr(chunk, "Type", None) or getattr(chunk, "name", ""),
+    )
+
+
 def _append_unique_entity_component(entity, component, seen_ids):
-    if component is None or getattr(component, "name", "") not in _ENTITY_DIRECT_COMPONENT_TYPES:
+    component_type = (
+        getattr(component, "Type", None)
+        or getattr(component, "name", "")
+    )
+    if component is None or component_type not in _ENTITY_DIRECT_COMPONENT_TYPES:
         return False
     identity = id(component)
     if identity in seen_ids:
@@ -69,43 +363,31 @@ def _append_unique_entity_component(entity, component, seen_ids):
 
 def _append_entity_components(entity, entity_chunk, chunks, parent_component_map, filename, chunk_index):
     seen_ids = set()
-    malformed_refs = 0
-    unsupported_refs = []
+    malformed_refs = []
     for chunk_id in list(getattr(entity_chunk, "Components", []) or []):
         try:
             component_index = int(chunk_id)
         except Exception:
-            malformed_refs += 1
+            malformed_refs.append(f"malformed component reference {chunk_id!r}")
             continue
         if component_index <= 0 or component_index > len(chunks):
-            malformed_refs += 1
+            malformed_refs.append(f"malformed component reference #{component_index}")
             continue
-        sub_chunk = chunks[component_index - 1]
-        if not _append_unique_entity_component(entity, sub_chunk, seen_ids):
-            unsupported_refs.append((component_index, getattr(sub_chunk, "name", "<unknown>")))
+        _append_unique_entity_component(entity, chunks[component_index - 1], seen_ids)
 
-    for sub_chunk in parent_component_map.get(int(chunk_index), []) or []:
+    for _component_index, sub_chunk in parent_component_map.get(int(chunk_index), []) or []:
         _append_unique_entity_component(entity, sub_chunk, seen_ids)
 
     if malformed_refs:
+        existing = list(getattr(entity, "unsupportedComponents", None) or [])
+        existing.extend(malformed_refs)
+        entity.unsupportedComponents = list(dict.fromkeys(existing))
         log.warning(
             "Ignoring %d malformed component reference(s) on %s in %s; using export parent links where available.",
-            malformed_refs,
+            len(malformed_refs),
             getattr(entity, "name", getattr(entity_chunk, "name", "<entity>")),
             filename,
         )
-    if unsupported_refs:
-        preview = ", ".join(f"#{idx}:{name}" for idx, name in unsupported_refs[:6])
-        if len(unsupported_refs) > 6:
-            preview += f", ... (+{len(unsupported_refs) - 6} more)"
-        log.warning(
-            "Skipping unsupported component reference(s) on %s in %s: %s",
-            getattr(entity, "name", getattr(entity_chunk, "name", "<entity>")),
-            filename,
-            preview,
-        )
-
-
 def _stream_chunk_props_summary(chunk, limit=8):
     props = getattr(chunk, "PROPS", None) or []
     out = []
@@ -134,6 +416,43 @@ def _stream_chunk_string_prop(stream_chunk, *prop_names):
             continue
         return value
     return ""
+
+
+def _entity_chunk_string_prop(entity_chunk, *prop_names):
+    for prop_name in prop_names:
+        try:
+            prop = entity_chunk.GetVariableByName(prop_name)
+        except Exception:
+            prop = None
+        if prop is None:
+            continue
+        guid = getattr(prop, "GUID", None)
+        if guid is not None:
+            value = str(getattr(guid, "GuidString", "") or "").strip()
+        else:
+            value = str(prop_to_string(prop) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _entity_chunk_visible_prop(entity_chunk):
+    for prop_name in ("visible", "isVisible"):
+        try:
+            prop = entity_chunk.GetVariableByName(prop_name)
+        except Exception:
+            prop = None
+        if prop is None:
+            continue
+        value = getattr(prop, "Value", None)
+        if value is not None:
+            return bool(value)
+        text = str(prop_to_string(prop) or "").strip().lower()
+        if text in {"true", "1"}:
+            return True
+        if text in {"false", "0"}:
+            return False
+    return None
 
 
 def _should_suppress_streaming_name_warning(stream_chunk, resource_path="", mesh_path=""):
@@ -433,6 +752,7 @@ class LEVEL():
         self.version = 999
         self.expectedEntityCount = 0
         self.parsedEntityCount = 0
+        self.entityAsset = None
 
 class CLayerInfo(object):
     def __init__(self, name = "", depotFilePath = "", layerBuildTag = ""):
@@ -452,6 +772,13 @@ class CEntity():
         self.BufferV2 = False
         self.isCreatedFromTemplate = False
         self.streamingDataBuffer = False
+        self.guid = ""
+        self.id = ""
+        self.actionName = ""
+        self.visible = None
+        self.unsupportedComponents = []
+        self.entityAsset = None
+        self.entityAssetError = ""
 
     def show(self):
         log.debug("Inside Parent")
@@ -973,13 +1300,24 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
     Entities = []
     level.name = CHUNKS[0].name
     level.type = CHUNKS[0].name
-    expected_entities = sum(1 for chunk in CHUNKS if is_entity_chunk(chunk))
+    expected_entities = sum(
+        1
+        for chunk_index, chunk in enumerate(CHUNKS, start=1)
+        if _is_level_entity_chunk(file, chunk, chunk_index)
+    )
+    unresolved_dependencies = []
+    included_entity_assets = {}
     template_static_mesh_chunks = []
     parent_component_map = _entity_component_parent_map(file, CHUNKS)
+    layer_entity_ownership = None
 
     #only create a LEVEL for these types otherwise return entire file
     top_level_list = [ "CLayer", "CEntityTemplate", "CFoliageResource" ]
     if level.type not in top_level_list:
+        if _cr2w_has_rich_inline_entity_graph(file):
+            entity_asset, compile_error = _compile_inline_entity_asset(file, filename)
+            file.entityAsset = entity_asset
+            file.entityAssetError = compile_error
         return file
         
     for chunk_index, chunk in enumerate(CHUNKS, start=1):
@@ -993,6 +1331,11 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                     try:
                         include_path = getattr(include, "DepotPath", None)
                         if not include_path:
+                            unresolved_dependencies.append({
+                                "path": "",
+                                "source": str(filename or ""),
+                                "reason": "entity-template include has no depot path",
+                            })
                             continue
                         fileName = _resolve_level_dependency_path(
                             include_path,
@@ -1006,9 +1349,24 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                             dependency_resolver=dependency_resolver,
                         )
                         if entity is None:
+                            unresolved_dependencies.append({
+                                "path": str(include_path),
+                                "source": str(filename or ""),
+                                "reason": "entity-template include could not be loaded",
+                            })
                             continue
                         level.includes.append(entity)
+                        included_asset = getattr(entity, "entityAsset", None)
+                        if included_asset is not None:
+                            include_key = str(include_path or "").replace("/", "\\").strip().lower()
+                            if include_key:
+                                included_entity_assets[include_key] = included_asset
                     except Exception as e:
+                        unresolved_dependencies.append({
+                            "path": str(getattr(include, "DepotPath", "") or ""),
+                            "source": str(filename or ""),
+                            "reason": str(e),
+                        })
                         log.exception("Problem Importing an include")
         if chunk.name == "CSectorData":
             CSectorData = chunk
@@ -1020,23 +1378,49 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
             mesh_path = _first_handle_depot_path(mesh_prop) or str(prop_to_string(mesh_prop) or "").strip()
             if mesh_path:
                 template_static_mesh_chunks.append(chunk)
-        if is_entity_chunk(chunk):
+        if _is_level_entity_chunk(file, chunk, chunk_index):
             class_ = getattr(CR2W_file, chunk.name, CEntity)
             Entity = class_()
             Entity.is_entity = True
             Entity.type = chunk.name
             Entity.name = chunk.get_name_prop_string()
+            Entity.guid = _entity_chunk_string_prop(chunk, "guid")
+            Entity.id = _entity_chunk_string_prop(chunk, "id", "entityId")
+            Entity.actionName = _entity_chunk_string_prop(chunk, "actionName")
+            Entity.visible = _entity_chunk_visible_prop(chunk)
+            Entity.BufferV1 = getattr(chunk, "BufferV1", False)
+            Entity.BufferV2 = getattr(chunk, "BufferV2", False)
+            scoped_asset_owns_components = False
+            if level.type == "CLayer":
+                if layer_entity_ownership is None:
+                    layer_entity_ownership = _layer_entity_ownership(CHUNKS, parent_component_map)
+                (
+                    Entity.entityAsset,
+                    Entity.entityAssetError,
+                    scoped_asset_owns_components,
+                ) = _compile_scoped_layer_entity_asset(
+                    file,
+                    CHUNKS,
+                    chunk_index,
+                    parent_component_map,
+                    filename,
+                    ownership=layer_entity_ownership,
+                )
             if chunk.GetVariableByName('transform'):
                 Entity.transform = chunk.GetVariableByName('transform').EngineTransform
             #each transform should have it's own equlivant blender object.
             if hasattr(chunk, "isCreatedFromTemplate") and chunk.isCreatedFromTemplate:
-                Entity.BufferV2 = chunk.BufferV2
                 Entity.isCreatedFromTemplate = chunk.isCreatedFromTemplate
                 #broken template? Need to read include files if can't find mesh buffer?
                 if chunk.Template.Handles[0].DepotPath == r"gameplay\containers\new_locations\novigrad\indoors\average\simple_dresser_table.w2ent":
                     chunk.Template.Handles[0].DepotPath = r"environment\decorations\containers\dressers\simple_dresser\simple_dresser_table.w2ent"
                 template_path = getattr(chunk.Template.Handles[0], "DepotPath", None)
                 if not template_path:
+                    unresolved_dependencies.append({
+                        "path": "",
+                        "source": str(filename or ""),
+                        "reason": f"entity {Entity.name or Entity.type} has no template path",
+                    })
                     log.warning("Skipping template entity %s in %s: empty template path", Entity.name, filename)
                     continue
                 try:
@@ -1052,8 +1436,18 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                         dependency_resolver=dependency_resolver,
                     )
                     if entity is None:
+                        unresolved_dependencies.append({
+                            "path": str(template_path),
+                            "source": str(filename or ""),
+                            "reason": "entity template could not be loaded",
+                        })
                         continue
                 except Exception as exc:
+                    unresolved_dependencies.append({
+                        "path": str(template_path),
+                        "source": str(filename or ""),
+                        "reason": str(exc),
+                    })
                     log.warning(
                         "Skipping template entity %s for %s: %s",
                         template_path,
@@ -1063,12 +1457,21 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                     continue
                 Entity.template = entity
                 Entity.templatePath = template_path
+                if not scoped_asset_owns_components:
+                    _append_entity_components(
+                        Entity,
+                        chunk,
+                        CHUNKS,
+                        parent_component_map,
+                        filename,
+                        chunk_index,
+                    )
                 Entities.append(Entity)
             else:
                 # Entity chunk has no Template handle — occurs with inline/streamed entities
                 # (e.g. CWitcherSword, Crossbow). Read from streamingDataBuffer instead.
                 streaming_data_prop = chunk.GetVariableByName('streamingDataBuffer')
-                if streaming_data_prop:
+                if streaming_data_prop and not scoped_asset_owns_components:
                     buffer_bytes = _extract_streaming_buffer_bytes(file, streaming_data_prop)
                     if buffer_bytes:
                         f = bReadStream(buffer_bytes, name="DATA_BUFFER")
@@ -1123,14 +1526,15 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
                             Entity.name,
                             getattr(file, "fileName", "<memory>"),
                         )
-                _append_entity_components(
-                    Entity,
-                    chunk,
-                    CHUNKS,
-                    parent_component_map,
-                    filename,
-                    chunk_index,
-                )
+                if not scoped_asset_owns_components:
+                    _append_entity_components(
+                        Entity,
+                        chunk,
+                        CHUNKS,
+                        parent_component_map,
+                        filename,
+                        chunk_index,
+                    )
                 Entities.append(Entity)
     if level.type == "CLayer":
         try:
@@ -1148,6 +1552,25 @@ def create_level(file, filename, dependency_loader=None, dependency_resolver=Non
     level.Entities = Entities
     level.expectedEntityCount = expected_entities
     level.parsedEntityCount = len(Entities)
+    level.unresolvedDependencies = unresolved_dependencies
+    if level.type == "CEntityTemplate" and getattr(file, "fileName", None):
+        try:
+            from .dc_entity import create_CEntity
+
+            level.entityAsset = create_CEntity(
+                file,
+                _included_entity_assets=included_entity_assets,
+            )
+            if level.entityAsset is not None:
+                level.entityAsset.version = level.version
+        except Exception as exc:
+            level.entityAsset = None
+            unresolved_dependencies.append({
+                "path": str(filename or ""),
+                "source": str(filename or ""),
+                "reason": f"entity template could not be compiled: {exc}",
+            })
+            log.warning("Could not compile entity template %s: %s", filename, exc)
     if level.type == "CLayer" and expected_entities != len(Entities):
         log.warning(
             "Layer entity parse mismatch for %s: parsed %d/%d supported entity chunks; skipped %d. "

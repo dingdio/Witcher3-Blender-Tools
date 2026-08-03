@@ -3274,14 +3274,14 @@ class WITCH_OT_W2SceneImportActorItem(bpy.types.Operator):
             if item_type == "ACTOR":
                 appearance_filter = str(getattr(item, "appearance_filter", "") or "")
                 preferred_appearance = appearance_filter.split(",")[0].strip() if appearance_filter else ""
-                imported = import_entity.import_ent_template(
+                imported = import_entity.import_entity_file(
                     resolved_path,
                     load_face_poses=True,
                     import_apperance=1,
                     selected_appearance_name=preferred_appearance,
-                )
+                ).main_object
             else:
-                imported = import_entity.import_ent_template(resolved_path)
+                imported = import_entity.import_entity_file(resolved_path).main_object
         except Exception as exc:
             log.exception("Failed to import %s '%s' from %s", item_type.lower(), getattr(item, "actor_id", "?"), resolved_path)
             self.report({'ERROR'}, f"Import failed: {exc}")
@@ -3518,7 +3518,11 @@ class WITCH_OT_LoadDialogsetSlotActor(bpy.types.Operator):
         actor_obj = check_if_actor_already_in_scene(slot.actor_template_path)
         if not actor_obj:
             try:
-                actor_obj = import_entity.import_ent_template(resolved_path, load_face_poses=True, import_apperance=1)
+                actor_obj = import_entity.import_entity_file(
+                    resolved_path,
+                    load_face_poses=True,
+                    import_apperance=1,
+                ).main_object
             except Exception as exc:
                 log.exception("Failed to import actor for dialogset slot '%s'", slot.slot_name)
                 self.report({'ERROR'}, f"Import failed: {exc}")

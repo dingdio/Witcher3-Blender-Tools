@@ -7,7 +7,7 @@ try:
 except Exception:
     bpy = None
 
-from ..CR2W.common_blender import repo_file, redkit_repo_context
+from ..CR2W.common_blender import repo_file, redkit_repo_context, win_safe_path
 from ..CR2W.dc_entity import load_bin_entity
 from ..CR2W import w3_types
 from ..CR2W.witcher_cache.DLC import LoadDLCManager
@@ -250,6 +250,37 @@ def build_dlc_mounter_cache_signature(context=None):
     return DLCManager.BuildSourceSignature(_dlc_manager_source_roots(context))
 
 
+def build_dlc_mounter_plan_signature(context=None):
+    w3app_dependencies = {}
+    try:
+        appearance_table = _get_dlc_mounter_index(context).get("appearance_table") or {}
+        for entries in appearance_table.values():
+            for entry in entries or []:
+                logical_path = str(entry.get("w3app_path", "") or "").strip()
+                resolved_path, _repo_roots = _resolve_dlc_w3app_path(entry)
+                normalized_path = os.path.normcase(os.path.normpath(str(resolved_path or "")))
+                try:
+                    stat = os.stat(resolved_path)
+                    identity = (int(stat.st_mtime_ns), int(stat.st_size))
+                except OSError:
+                    identity = (0, -1)
+                key = (logical_path.lower(), normalized_path)
+                w3app_dependencies[key] = (
+                    logical_path,
+                    normalized_path,
+                    identity,
+                )
+    except Exception:
+        log.debug("Failed to build DLC appearance dependency signature.", exc_info=True)
+    return {
+        "enabled": _dlc_mounters_enabled(context),
+        "replace_appearances": _dlc_replace_appearances_enabled(context),
+        "source": build_dlc_mounter_cache_signature(context),
+        "enabled_map": sorted(_dlc_enabled_map_from_prefs(context).items()),
+        "w3app_dependencies": [w3app_dependencies[key] for key in sorted(w3app_dependencies)],
+    }
+
+
 def refresh_dlc_mounter_cache(context=None, sync_sources=False):
     if sync_sources:
         sync_dlc_mounter_sources(context)
@@ -452,13 +483,13 @@ def _resolve_dlc_w3app_path(entry: dict):
             continue
         _add_unique_path(roots, repo_root)
         candidate = os.path.join(repo_root, w3app_path)
-        if os.path.isfile(candidate):
+        if os.path.isfile(win_safe_path(candidate)):
             return candidate, roots
     try:
         resolved = repo_file(w3app_path)
     except Exception:
         resolved = ""
-    if resolved and os.path.isfile(resolved):
+    if resolved and os.path.isfile(win_safe_path(resolved)):
         return resolved, roots
     return resolved or w3app_path, roots
 
@@ -473,14 +504,27 @@ def _dlc_w3app_entity_cache_key(path: str, repo_roots=None) -> tuple:
     return file_key + (roots_key,)
 
 
+_DLC_W3APP_ENTITY_FAILED = {}
+
+
 def _load_dlc_w3app_entity(w3app_abs: str, repo_roots=None):
+    # Cached entities are shared; callers deepcopy before customization.
     cache_key = _dlc_w3app_entity_cache_key(w3app_abs, repo_roots)
     cached = _DLC_W3APP_ENTITY_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    # Cache failures to avoid repeated parsing and warnings.
+    if cache_key in _DLC_W3APP_ENTITY_FAILED:
+        return None
 
-    with redkit_repo_context(w3app_abs, roots=repo_roots):
-        dlc_entity = load_bin_entity(w3app_abs)
+    try:
+        with redkit_repo_context(w3app_abs, roots=repo_roots):
+            dlc_entity = load_bin_entity(w3app_abs)
+    except Exception:
+        _DLC_W3APP_ENTITY_FAILED[cache_key] = True
+        while len(_DLC_W3APP_ENTITY_FAILED) > _DLC_W3APP_ENTITY_CACHE_MAX:
+            _DLC_W3APP_ENTITY_FAILED.pop(next(iter(_DLC_W3APP_ENTITY_FAILED)))
+        raise
 
     _DLC_W3APP_ENTITY_CACHE[cache_key] = dlc_entity
     while len(_DLC_W3APP_ENTITY_CACHE) > _DLC_W3APP_ENTITY_CACHE_MAX:
@@ -491,14 +535,17 @@ def _load_dlc_w3app_entity(w3app_abs: str, repo_roots=None):
 def _load_dlc_appearance_from_entry(entry: dict):
     appearance_name = str(entry.get("appearance_name", "") or "").strip()
     w3app_abs, repo_roots = _resolve_dlc_w3app_path(entry)
-    if not w3app_abs or not os.path.isfile(w3app_abs):
+    if not w3app_abs or not os.path.isfile(win_safe_path(w3app_abs)):
         log.warning("DLC appearance file not found: %s", entry.get("w3app_path", ""))
         return None
 
     try:
         dlc_entity = _load_dlc_w3app_entity(w3app_abs, repo_roots)
-    except Exception:
-        log.warning("Failed to load DLC appearance file: %s", w3app_abs, exc_info=True)
+    except Exception as exc:
+        log.warning("Failed to load DLC appearance file %s: %s", w3app_abs, exc)
+        log.debug("DLC appearance load traceback for %s", w3app_abs, exc_info=True)
+        return None
+    if dlc_entity is None:
         return None
 
     dlc_apps = list(getattr(dlc_entity, "appearances", None) or [])
@@ -508,6 +555,16 @@ def _load_dlc_appearance_from_entry(entry: dict):
 
     dlc_app = copy.deepcopy(dlc_apps[0])
     dlc_app.name = appearance_name
+    dlc_app._dlc_mounter_entry = copy.deepcopy(entry)
+    dlc_app._dlc_mounter_lazy = False
+    dependency_paths = [
+        w3app_abs,
+        str(entry.get("reddlc_path", "") or "").strip(),
+        *(getattr(dlc_entity, "template_dependency_paths", None) or []),
+    ]
+    dlc_app.template_dependency_paths = list(dict.fromkeys(
+        path for path in dependency_paths if path
+    ))
     return dlc_app
 
 
@@ -679,6 +736,13 @@ def append_dlc_entity_template_params(entity, filename: str, context=None) -> in
                 continue
 
             current_params.append(new_param)
+            dependency_paths = getattr(entity, "template_dependency_paths", None)
+            if dependency_paths is None:
+                dependency_paths = []
+                entity.template_dependency_paths = dependency_paths
+            reddlc_path = str(entry.get("reddlc_path", "") or "").strip()
+            if reddlc_path and reddlc_path not in dependency_paths:
+                dependency_paths.append(reddlc_path)
             added += 1
 
     if added:

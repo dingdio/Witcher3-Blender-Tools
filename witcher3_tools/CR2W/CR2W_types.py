@@ -82,6 +82,112 @@ Entity_Type_List = ["CEntity",
                     ]
 
 
+_NON_ENTITY_LAYER_EXPORT_TYPES = frozenset({
+    "CLayer",
+    "CLayerGroup",
+    "CLayerInfo",
+    "CWorld",
+    "CGameWorld",
+    "CEntityTemplate",
+    "CSectorData",
+    "CFoliageResource",
+    "CAnimatedAttachment",
+    "CAnimAnimsetsParam",
+    "CAnimMimicParam",
+    "CEntityExternalAppearance",
+    "CEntityTemplateParam",
+    "CExternalProxyAttachment",
+    "CFXDefinition",
+    "CHardAttachment",
+    "CMeshSkinningAttachment",
+    "CSkeletonBoneSlot",
+})
+
+
+def _is_non_entity_layer_export_type(chunk_type):
+    chunk_type = str(chunk_type or "").strip()
+    return bool(
+        not chunk_type
+        or chunk_type in _NON_ENTITY_LAYER_EXPORT_TYPES
+        or chunk_type.startswith("CAnimDangleConstraint_")
+        or chunk_type.endswith((
+            "Attachment",
+            "Component",
+            "Definition",
+            "Param",
+            "Resource",
+            "Slot",
+        ))
+    )
+
+
+def _is_direct_layer_entity_export(cr2w_file, export_index, chunk_type=""):
+    exports = getattr(cr2w_file, "CR2WExport", None) or []
+    try:
+        export_index = int(export_index)
+        export = exports[export_index]
+        export_type = chunk_type or getattr(export, "name", "")
+        return bool(
+            export_index > 0
+            and getattr(exports[0], "name", "") == "CLayer"
+            and int(getattr(export, "parentID", 0) or 0) == 1
+            and not _is_non_entity_layer_export_type(export_type)
+        )
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
+def _is_direct_entity_asset_root(cr2w_file, export_index, chunk_type="", source_name=""):
+    try:
+        export_index = int(export_index)
+    except (TypeError, ValueError):
+        return False
+    filename = str(source_name or getattr(cr2w_file, "fileName", "") or "")
+    return bool(
+        export_index == 0
+        and filename.lower().endswith(".w2ent")
+        and not _is_non_entity_layer_export_type(chunk_type)
+    )
+
+
+def _property_export_reference_index(prop, export_count):
+    if prop is None:
+        return None
+    value = getattr(prop, "Value", None)
+    if isinstance(value, int) and 0 < value <= export_count:
+        return value - 1
+    for handle in getattr(prop, "Handles", None) or []:
+        reference = getattr(handle, "Reference", None)
+        if isinstance(reference, int) and 0 <= reference < export_count:
+            return reference
+    return None
+
+
+def _is_w2_template_entity_root(cr2w_file, parsed_chunks, export_index):
+    if int(getattr(getattr(cr2w_file, "HEADER", None), "version", 999) or 999) > 115:
+        return False
+    export_count = len(getattr(cr2w_file, "CR2WExport", None) or [])
+    roots, scanned = getattr(cr2w_file, "_w2_template_root_scan", (set(), 0))
+    chunks = list(parsed_chunks or ())
+    for template_chunk in chunks[scanned:]:
+        if getattr(template_chunk, "Type", None) != "CEntityTemplate":
+            continue
+        for prop_name in ("cookedEntityObject", "entityObject"):
+            try:
+                prop = template_chunk.GetVariableByName(prop_name)
+            except (AttributeError, TypeError):
+                prop = None
+            reference = _property_export_reference_index(prop, export_count)
+            if reference is not None:
+                roots.add(reference)
+                break
+    try:
+        cr2w_file._w2_template_root_scan = (roots, len(chunks))
+    except Exception:
+        pass
+    return export_index in roots
+
+
 def is_entity_chunk(chunk):
     if isinstance(chunk, str):
         return chunk in Entity_Type_List
@@ -97,11 +203,41 @@ def is_entity_chunk(chunk):
         result = True
     else:
         try:
+            template_prop = chunk.GetVariableByName("template")
+        except (AttributeError, TypeError):
+            template_prop = next(
+                (
+                    prop for prop in (getattr(chunk, "PROPS", None) or [])
+                    if getattr(prop, "theName", None) == "template"
+                ),
+                None,
+            )
+        result = bool(
+            getattr(chunk, "isCreatedFromTemplate", False)
+            or template_prop is not None
+            or getattr(chunk, "BufferV1", False)
+            or getattr(chunk, "BufferV2", False)
+        )
+    if not result:
+        try:
             result = chunk.GetVariableByName("streamingDataBuffer") is not None
         except (AttributeError, TypeError):
             result = any(
                 getattr(prop, "theName", None) == "streamingDataBuffer"
                 for prop in (getattr(chunk, "PROPS", None) or [])
+            )
+    if not result:
+        cr2w_file = getattr(chunk, "_W_CLASS__CR2WFILE", None)
+        result = _is_direct_layer_entity_export(
+            cr2w_file,
+            getattr(chunk, "ChunkIndex", -1),
+            chunk_type,
+        )
+        if not result:
+            result = _is_direct_entity_asset_root(
+                cr2w_file,
+                getattr(chunk, "ChunkIndex", -1),
+                chunk_type,
             )
     # cache the negative too: this runs per chunk in the parse hot loop
     try:
@@ -2010,7 +2146,7 @@ class SEntityBufferType2():
             raise ValueError(
                 f"Invalid CEntity instance component CName index {component_name_index}"
             )
-        self.componentName = self.CR2WFILE.CNAMES[component_name_index].name
+        self.componentName = self.CR2WFILE.CNAMES[component_name_index].name.value
 
         variable_count = readU32(f)
         if variable_count > (block_end - f.tell()) // 8:
@@ -2485,7 +2621,11 @@ class W_CLASS:
                     break
                 self.PROPS.append(prop)
                 
-            if is_entity_chunk(self):
+            if is_entity_chunk(self) or _is_w2_template_entity_root(
+                CR2WFILE,
+                getattr(parent, "CHUNKS", ()),
+                idx,
+            ):
                 self.is_entity = True
                 CR2WFILE.entity_count +=1
                 self.isCreatedFromTemplate = False

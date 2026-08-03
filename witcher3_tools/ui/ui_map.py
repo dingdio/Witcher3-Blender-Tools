@@ -1,4 +1,5 @@
 import logging
+import copy
 import os
 import time
 import json
@@ -26,7 +27,6 @@ from ..importers import import_w2w
 from ..importers import import_isolation
 from ..importers import import_blender_fun
 from ..terrain_core import (
-    TERRAIN_FOLIAGE_MODE_ITEMS,
     TERRAIN_IMPORT_MODE_ITEMS,
     terrain_native_level,
     terrain_tile_from_world_position,
@@ -38,12 +38,12 @@ from ..CR2W.common_blender import repo_file, redkit_repo_context
 from ..exporters import export_radish
 
 _LEVEL_FILE_CACHE = {}
+_LAYER_PLAN_VERDICT_CACHE = {}
 _WORLD_LAYER_INDEX_CACHE = {}
 _WORLD_LAYER_RUNTIME_CACHE = {}
 _LAYER_VISIBILITY_CACHE = {}
 _DEFAULT_HIDDEN_GROUP_CACHE = {}
-# 15: refreshed entities, lights, and native REDdest meshes
-_WORLD_LAYER_SCAN_CACHE_VERSION = 15
+_WORLD_LAYER_SCAN_CACHE_VERSION = 17
 _WORLD_LAYER_SPATIAL_CELL_SIZE = 10.0
 _LAYER_SCAN_BATCH_SIZE = 16
 _LAYER_LOAD_BATCH_SIZE = 8
@@ -79,6 +79,7 @@ _LAYER_QUERY_FILTER_KINDS = frozenset({
     "component_point_light",
     "component_spot_light",
     "cloth",
+    "entity_asset",
     "entity_template",
 })
 W2LAYER_PATH_PROP = "w2layer_path"
@@ -760,12 +761,6 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
         description="Load foliage instances owned by the selected terrain tile",
         default=True,
     )
-    terrain_foliage_mode: EnumProperty(
-        name="Foliage Detail",
-        description="Choose a fast viewer-ready foliage set or load every source",
-        items=TERRAIN_FOLIAGE_MODE_ITEMS,
-        default='PROXY',
-    )
     terrain_build_layer_tree: BoolProperty(
         name="Build Layer Tree",
         description="Create the complete world layer collection tree during import",
@@ -821,7 +816,6 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
             self.terrain_tile_y = int(getattr(tool, "terrain_tile_y", self.terrain_tile_y))
             self.terrain_lod_radius = int(getattr(tool, "terrain_lod_radius", self.terrain_lod_radius))
             self.terrain_include_foliage = bool(getattr(tool, "terrain_include_foliage", self.terrain_include_foliage))
-            self.terrain_foliage_mode = str(getattr(tool, "terrain_foliage_mode", self.terrain_foliage_mode))
             self.terrain_build_layer_tree = bool(getattr(tool, "terrain_build_layer_tree", self.terrain_build_layer_tree))
             self.terrain_material_roughness = float(getattr(tool, "terrain_material_roughness", self.terrain_material_roughness))
             self.terrain_material_specular = float(getattr(tool, "terrain_material_specular", self.terrain_material_specular))
@@ -845,8 +839,6 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
                 tool.terrain_lod_radius = int(self.terrain_lod_radius)
             if hasattr(tool, "terrain_include_foliage"):
                 tool.terrain_include_foliage = bool(self.terrain_include_foliage)
-            if hasattr(tool, "terrain_foliage_mode"):
-                tool.terrain_foliage_mode = str(self.terrain_foliage_mode)
             if hasattr(tool, "terrain_build_layer_tree"):
                 tool.terrain_build_layer_tree = bool(self.terrain_build_layer_tree)
             if hasattr(tool, "terrain_material_roughness"):
@@ -882,9 +874,6 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
             coords.prop(self, "terrain_tile_x", text="Tile X")
             coords.prop(self, "terrain_tile_y", text="Tile Y")
             box.prop(self, "terrain_include_foliage")
-            foliage_detail = box.row()
-            foliage_detail.enabled = bool(self.terrain_include_foliage)
-            foliage_detail.prop(self, "terrain_foliage_mode", text="Foliage")
         elif self.terrain_import_mode == 'TILES':
             box.label(text="Advanced: loads every tile at one level", icon='ERROR')
         box.prop(self, "terrain_build_layer_tree")
@@ -946,7 +935,6 @@ class WITCH_OT_w2w(bpy.types.Operator, ImportHelper):
                         multires_level=int(self.terrain_multires_level),
                         world_root_collection=world_collection,
                         include_foliage=bool(self.terrain_include_foliage),
-                        foliage_mode=str(self.terrain_foliage_mode),
                         detail_material=bool(self.terrain_detail_material),
                     )
                 except Exception as exc:
@@ -1019,7 +1007,6 @@ class WITCH_OT_import_world_tile(bpy.types.Operator):
         tile_y = int(getattr(settings, "terrain_tile_y", 0))
         detail = int(getattr(settings, "terrain_multires_level", 8))
         include_foliage = bool(getattr(settings, "terrain_include_foliage", True))
-        foliage_mode = str(getattr(settings, "terrain_foliage_mode", "PROXY"))
 
         try:
             world_file = CR2W.CR2W_reader.load_w2w(resolved_world, include_groups=False)
@@ -1075,7 +1062,6 @@ class WITCH_OT_import_world_tile(bpy.types.Operator):
                 multires_level=detail,
                 world_root_collection=root_coll,
                 include_foliage=include_foliage,
-                foliage_mode=foliage_mode,
             )
         except Exception as exc:
             log.exception("Selected terrain tile import failed")
@@ -1479,8 +1465,10 @@ def _resolve_level_file(context, level_path: str, root_collection=None) -> str:
         os.path.normcase(raw),
     )
     cached = _LEVEL_FILE_CACHE.get(cache_key)
-    if cached is not None:
+    if cached and os.path.isfile(cached):
         return cached
+    if cached is not None:
+        _LEVEL_FILE_CACHE.pop(cache_key, None)
 
     if os.path.isabs(raw) and os.path.isfile(raw):
         resolved = os.path.normpath(raw)
@@ -1670,7 +1658,20 @@ def _world_layer_cache_key(context, root_collection):
     world_id = world_path or f"collection:{root_collection.name}"
     primary_roots, secondary_roots, prefer_repo_extract = _level_search_roots(context, root_collection)
     roots_id = "\n".join(primary_roots + ["--"] + secondary_roots)
-    payload = f"{_WORLD_LAYER_SCAN_CACHE_VERSION}\n{world_id}\n{int(prefer_repo_extract)}\n{roots_id}"
+    try:
+        from ..importers.dlc_mounters import build_dlc_mounter_plan_signature
+
+        dlc_signature = json.dumps(
+            build_dlc_mounter_plan_signature(context),
+            sort_keys=True,
+            default=str,
+        )
+    except Exception:
+        dlc_signature = ""
+    payload = (
+        f"{_WORLD_LAYER_SCAN_CACHE_VERSION}\n{world_id}\n"
+        f"{int(prefer_repo_extract)}\n{roots_id}\n{dlc_signature}"
+    )
     return hashlib.sha1(payload.encode("utf-8", "ignore")).hexdigest()
 
 
@@ -1710,6 +1711,12 @@ def _resolve_level_dependency_for_scan(level_path, version, resolve_config):
         return ""
 
     raw = raw.replace("/", os.sep).replace("\\", os.sep)
+    # Positive-only memo: repo_file can extract files mid-pass, so misses must re-probe.
+    memo = resolve_config.setdefault("_resolve_memo", {}) if isinstance(resolve_config, dict) else {}
+    memo_key = (os.path.normcase(raw), version)
+    cached = memo.get(memo_key)
+    if cached:
+        return cached
     if os.path.isabs(raw) and os.path.isfile(raw):
         return os.path.normpath(raw)
 
@@ -1738,22 +1745,133 @@ def _resolve_level_dependency_for_scan(level_path, version, resolve_config):
         return ""
 
     resolved = try_roots(primary_roots)
-    if resolved:
-        return resolved
-    if prefer_repo_extract:
+    if not resolved and prefer_repo_extract:
         resolved = try_repo_file()
-        if resolved:
-            return resolved
-
-    resolved = try_roots(secondary_roots)
-    if resolved:
-        return resolved
-    if not prefer_repo_extract:
+    if not resolved:
+        resolved = try_roots(secondary_roots)
+    if not resolved and not prefer_repo_extract:
         resolved = try_repo_file()
-        if resolved:
-            return resolved
+    if resolved:
+        memo[memo_key] = resolved
+    return resolved
 
-    return ""
+
+_LAYER_PLAN_DEPENDENCY_EXTENSIONS = (".w2ent", ".w2ent.json", ".w3app", ".reddlc", ".w2l")
+
+
+def _collect_layer_plan_dependency_signatures(items, resolve_config):
+    signatures = {}
+
+    def iter_dependency_paths(value):
+        if isinstance(value, str):
+            if value.strip().lower().endswith(_LAYER_PLAN_DEPENDENCY_EXTENSIONS):
+                yield value.strip()
+            return
+        if isinstance(value, dict):
+            for nested_value in value.values():
+                yield from iter_dependency_paths(nested_value)
+            return
+        if isinstance(value, (list, tuple)):
+            for nested_value in value:
+                yield from iter_dependency_paths(nested_value)
+
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            version = int(
+                item.get("cr2w_version")
+                or (item.get("entity_data") or {}).get("version")
+                or 999
+            )
+        except Exception:
+            version = 999
+        dependency_paths = list(iter_dependency_paths({
+            "repo_path": item.get("repo_path", ""),
+            "source_path": item.get("source_path", ""),
+            "template_dependency_paths": item.get("template_dependency_paths"),
+            "entity_data": item.get("entity_data"),
+        }))
+        for depot_path in dependency_paths:
+            resolved_path = _resolve_level_dependency_for_scan(depot_path, version, resolve_config or {})
+            if not resolved_path:
+                continue
+            resolved_path = os.path.normpath(os.path.abspath(resolved_path))
+            try:
+                stat = os.stat(resolved_path)
+            except OSError:
+                continue
+            key = os.path.normcase(resolved_path)
+            existing = signatures.get(key)
+            if (
+                existing is not None
+                and not os.path.isabs(str(existing.get("depot_path", "") or ""))
+                and os.path.isabs(depot_path)
+            ):
+                continue
+            signatures[key] = {
+                "depot_path": depot_path,
+                "resolved_path": resolved_path,
+                "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
+                "size": int(stat.st_size),
+                "game_version": version,
+            }
+    return [signatures[key] for key in sorted(signatures)]
+
+
+def _layer_plan_dependency_signatures_current(signatures, resolve_config):
+    for signature in signatures or []:
+        if not isinstance(signature, dict):
+            return False
+        depot_path = str(signature.get("depot_path", "") or "").strip()
+        expected_path = str(signature.get("resolved_path", "") or "").strip()
+        if not depot_path or not expected_path:
+            return False
+        try:
+            version = int(signature.get("game_version", 999) or 999)
+        except Exception:
+            version = 999
+        resolved_path = _resolve_level_dependency_for_scan(depot_path, version, resolve_config or {})
+        if not resolved_path:
+            return False
+        resolved_path = os.path.normpath(os.path.abspath(resolved_path))
+        if os.path.normcase(resolved_path) != os.path.normcase(os.path.normpath(expected_path)):
+            return False
+        try:
+            stat = os.stat(resolved_path)
+        except OSError:
+            return False
+        mtime_ns = int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)))
+        if mtime_ns != int(signature.get("mtime_ns", -1) or -1):
+            return False
+        if int(stat.st_size) != int(signature.get("size", -1) or -1):
+            return False
+    return True
+
+
+def _world_layer_cache_entry_current(cache_entry, resolved_path, file_mtime, file_size, resolve_config):
+    if not isinstance(cache_entry, dict):
+        return False
+    cached_path = str(cache_entry.get("resolved_path", "") or "").strip()
+    if os.path.normcase(os.path.normpath(cached_path)) != os.path.normcase(os.path.normpath(resolved_path)):
+        return False
+    if float(cache_entry.get("file_mtime", -1.0)) != float(file_mtime):
+        return False
+    if int(cache_entry.get("file_size", -1)) != int(file_size):
+        return False
+    return _layer_plan_dependency_signatures_current(
+        cache_entry.get("dependency_signatures", []) or [],
+        resolve_config,
+    )
+
+
+def _attach_layer_plan_dependency_signatures(entry, resolve_config):
+    if isinstance(entry, dict):
+        entry["dependency_signatures"] = _collect_layer_plan_dependency_signatures(
+            entry.get("items", []) or [],
+            resolve_config or {},
+        )
+    return entry
 
 
 def _open_world_layer_cache_db(cache_path):
@@ -1790,6 +1908,7 @@ def _open_world_layer_cache_db(cache_path):
             resolved_path TEXT NOT NULL,
             file_mtime REAL NOT NULL,
             file_size INTEGER NOT NULL,
+            dependency_signatures_json TEXT NOT NULL DEFAULT '[]',
             has_bounds INTEGER NOT NULL,
             min_x REAL,
             min_y REAL,
@@ -1819,6 +1938,14 @@ def _open_world_layer_cache_db(cache_path):
             ON item_spatial (level_key);
         """
     )
+    layer_columns = {
+        str(row[1] or "")
+        for row in conn.execute("PRAGMA table_info(layers)").fetchall()
+    }
+    if "dependency_signatures_json" not in layer_columns:
+        conn.execute(
+            "ALTER TABLE layers ADD COLUMN dependency_signatures_json TEXT NOT NULL DEFAULT '[]'"
+        )
     return conn
 
 
@@ -1875,7 +2002,7 @@ def _load_world_layer_cache_entry(conn, level_key, *, include_items=False):
     items_column = ", items_json" if include_items else ""
     row = conn.execute(
         f"""
-        SELECT level_path, resolved_path, file_mtime, file_size,
+        SELECT level_path, resolved_path, file_mtime, file_size, dependency_signatures_json,
                has_bounds, min_x, min_y, max_x, max_y,
                object_count, has_manifest, manifest_complete, import_item_count,
                scan_backend, unresolved_json, plan_hash{items_column}
@@ -1901,6 +2028,11 @@ def _load_world_layer_cache_entry(conn, level_key, *, include_items=False):
         "scan_backend": str(row["scan_backend"] or ""),
         "plan_hash": str(row["plan_hash"] or ""),
     }
+    try:
+        dependency_signatures = json.loads(str(row["dependency_signatures_json"] or "[]"))
+    except Exception:
+        dependency_signatures = []
+    entry["dependency_signatures"] = dependency_signatures if isinstance(dependency_signatures, list) else []
     try:
         unresolved = json.loads(str(row["unresolved_json"] or "[]"))
     except Exception:
@@ -1942,15 +2074,29 @@ def _store_world_layer_cache_entry(conn, level_key, entry):
     if conn is None or not level_key or not isinstance(entry, dict):
         return
     items = list(entry.get("items", []) or [])
+    items_json_error = ""
     try:
         items_json = json.dumps(items, separators=(",", ":"))
-    except Exception:
+    except Exception as exc:
         items_json = "[]"
+        items_json_error = str(exc) or exc.__class__.__name__
+    try:
+        dependency_signatures_json = json.dumps(
+            list(entry.get("dependency_signatures", []) or []),
+            separators=(",", ":"),
+        )
+    except Exception:
+        dependency_signatures_json = "[]"
     has_bounds = bool(entry.get("has_bounds", False))
     has_manifest = bool(entry.get("has_manifest", False))
     manifest_complete = has_manifest and bool(entry.get("manifest_complete", True))
     unresolved_dependencies = list(entry.get("unresolved_dependencies", []) or [])
-    if unresolved_dependencies:
+    if items_json_error:
+        unresolved_dependencies.append({
+            "path": str(entry.get("resolved_path", "") or ""),
+            "source": "entity import plan",
+            "reason": f"plan is not JSON-safe: {items_json_error}",
+        })
         manifest_complete = False
     try:
         unresolved_json = json.dumps(unresolved_dependencies, separators=(",", ":"))
@@ -1961,15 +2107,17 @@ def _store_world_layer_cache_entry(conn, level_key, entry):
         """
         INSERT INTO layers (
             level_key, level_path, resolved_path, file_mtime, file_size,
+            dependency_signatures_json,
             has_bounds, min_x, min_y, max_x, max_y,
             object_count, has_manifest, manifest_complete, import_item_count,
             scan_backend, unresolved_json, plan_hash, items_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(level_key) DO UPDATE SET
             level_path = excluded.level_path,
             resolved_path = excluded.resolved_path,
             file_mtime = excluded.file_mtime,
             file_size = excluded.file_size,
+            dependency_signatures_json = excluded.dependency_signatures_json,
             has_bounds = excluded.has_bounds,
             min_x = excluded.min_x,
             min_y = excluded.min_y,
@@ -1990,6 +2138,7 @@ def _store_world_layer_cache_entry(conn, level_key, entry):
             str(entry.get("resolved_path", "") or ""),
             float(entry.get("file_mtime", 0.0) or 0.0),
             int(entry.get("file_size", 0) or 0),
+            dependency_signatures_json,
             1 if has_bounds else 0,
             float(entry.get("min_x", 0.0) or 0.0) if has_bounds else None,
             float(entry.get("min_y", 0.0) or 0.0) if has_bounds else None,
@@ -2046,6 +2195,9 @@ def _make_world_layer_index_entry(collection_name, level_path, level_key, cache_
         "level_key": level_key,
         "level_path": level_path,
         "resolved_path": str(cache_entry.get("resolved_path", "") or ""),
+        "file_mtime": float(cache_entry.get("file_mtime", 0.0) or 0.0),
+        "file_size": int(cache_entry.get("file_size", 0) or 0),
+        "dependency_signatures": list(cache_entry.get("dependency_signatures", []) or []),
         "object_count": int(cache_entry.get("object_count", 0) or 0),
         "import_item_count": int(cache_entry.get("import_item_count", 0) or 0),
         "has_manifest": bool(cache_entry.get("has_manifest", False)),
@@ -2489,8 +2641,10 @@ def _scan_logger_names():
     if not package_name:
         return ()
     return (
+        f"{package_name}.bStream",
         f"{package_name}.CR2W_types",
         f"{package_name}.CR2W_file",
+        f"{package_name}.dc_entity",
     )
 
 
@@ -2765,6 +2919,7 @@ def _build_fast_empty_layer_cache_entry(level_path, resolved_path, file_mtime, f
         "has_manifest": False,
         "manifest_complete": True,
         "unresolved_dependencies": [],
+        "dependency_signatures": [],
         "scan_backend": "empty",
         "import_item_count": 0,
         "items": [],
@@ -2806,8 +2961,8 @@ def _new_layer_scan_dependency_cache():
     }
 
 
-def _layer_scan_dependency_state(dependency_cache):
-    thread_local = dependency_cache.get("thread_local")
+def _layer_scan_active_set(dependency_cache, prefix):
+    thread_local = dependency_cache.get(prefix + "thread_local")
     active = getattr(thread_local, "active", None)
     if active is None:
         active = set()
@@ -2815,30 +2970,21 @@ def _layer_scan_dependency_state(dependency_cache):
     return active
 
 
-def _layer_scan_fast_dependency_state(dependency_cache):
-    thread_local = dependency_cache.get("fast_thread_local")
-    active = getattr(thread_local, "active", None)
-    if active is None:
-        active = set()
-        thread_local.active = active
-    return active
-
-
-def _load_layer_scan_fast_dependency(resolved_path, dependency_cache, resolve_config=None):
+def _load_layer_scan_dependency_shared(resolved_path, dependency_cache, resolve_config, prefix, label, parse_body):
     path_value = str(resolved_path or "").strip()
     if not path_value:
         return None
     cache_key = os.path.normcase(os.path.abspath(path_value))
-    levels = dependency_cache["fast_levels"]
-    inflight = dependency_cache["fast_inflight"]
-    stats = dependency_cache["fast_stats"]
+    levels = dependency_cache[prefix + "levels"]
+    inflight = dependency_cache[prefix + "inflight"]
+    stats = dependency_cache[prefix + "stats"]
     lock = dependency_cache["lock"]
-    active = _layer_scan_fast_dependency_state(dependency_cache)
+    active = _layer_scan_active_set(dependency_cache, prefix)
 
     if cache_key in active:
         with lock:
             stats["cycles"] += 1
-        log.warning("Detected recursive fast layer-template dependency while scanning %s", resolved_path)
+        log.warning("Detected recursive %s dependency while scanning %s", label, resolved_path)
         return None
 
     owner = False
@@ -2848,20 +2994,29 @@ def _load_layer_scan_fast_dependency(resolved_path, dependency_cache, resolve_co
             cached = levels.get(cache_key)
             if cached is not None:
                 stats["hits"] += 1
-                return cached
-            wait_event = inflight.get(cache_key)
-            if wait_event is None:
+                return copy.deepcopy(cached)
+            pending = inflight.get(cache_key)
+            if pending is None:
                 wait_event = threading.Event()
-                inflight[cache_key] = wait_event
+                inflight[cache_key] = {
+                    "event": wait_event,
+                    "owner": threading.get_ident(),
+                }
                 stats["misses"] += 1
                 owner = True
                 break
-        wait_event.wait()
+            wait_event = pending["event"]
+        if not wait_event.wait(timeout=60.0):
+            with lock:
+                stats["cycles"] += 1
+            log.warning("Timed out waiting for concurrent %s dependency at %s", label, resolved_path)
+            return None
 
     dependency_result = None
     active.add(cache_key)
     dep_started = time.perf_counter()
     parse_seconds = 0.0
+    create_level_seconds = 0.0
     try:
         dependency_resolver = None
         if resolve_config is not None:
@@ -2872,17 +3027,7 @@ def _load_layer_scan_fast_dependency(resolved_path, dependency_cache, resolve_co
                     resolve_config,
                 )
             )
-        parse_started = time.perf_counter()
-        dependency_result = fast_cache_scan.scan_dependency_file(
-            resolved_path,
-            dependency_resolver=dependency_resolver,
-            dependency_loader=lambda dep_path: _load_layer_scan_fast_dependency(
-                dep_path,
-                dependency_cache,
-                resolve_config=resolve_config,
-            ),
-        )
-        parse_seconds = time.perf_counter() - parse_started
+        dependency_result, parse_seconds, create_level_seconds = parse_body(dependency_resolver)
         return dependency_result
     finally:
         dep_total_seconds = time.perf_counter() - dep_started
@@ -2890,12 +3035,13 @@ def _load_layer_scan_fast_dependency(resolved_path, dependency_cache, resolve_co
         if owner and wait_event is not None:
             with lock:
                 stats["parse_seconds"] = float(stats.get("parse_seconds", 0.0) or 0.0) + parse_seconds
+                stats["create_level_seconds"] = float(stats.get("create_level_seconds", 0.0) or 0.0) + create_level_seconds
                 stats["total_seconds"] = float(stats.get("total_seconds", 0.0) or 0.0) + dep_total_seconds
                 if dep_total_seconds > float(stats.get("slowest_total_seconds", 0.0) or 0.0):
                     stats["slowest_total_seconds"] = dep_total_seconds
                     stats["slowest_path"] = path_value
                 if dependency_result is not None:
-                    levels[cache_key] = dependency_result
+                    levels[cache_key] = copy.deepcopy(dependency_result)
                     stats["stores"] += 1
                 inflight.pop(cache_key, None)
             wait_event.set()
@@ -2905,8 +3051,27 @@ def _load_layer_scan_fast_dependency(resolved_path, dependency_cache, resolve_co
                     os.path.basename(path_value) or path_value,
                     _format_layer_scan_timing(dep_total_seconds),
                     _format_layer_scan_timing(parse_seconds),
-                    _format_layer_scan_timing(0.0),
+                    _format_layer_scan_timing(create_level_seconds),
                 )
+
+
+def _load_layer_scan_fast_dependency(resolved_path, dependency_cache, resolve_config=None):
+    def parse_body(dependency_resolver):
+        parse_started = time.perf_counter()
+        result = fast_cache_scan.scan_dependency_file(
+            resolved_path,
+            dependency_resolver=dependency_resolver,
+            dependency_loader=lambda dep_path: _load_layer_scan_fast_dependency(
+                dep_path,
+                dependency_cache,
+                resolve_config=resolve_config,
+            ),
+        )
+        return result, time.perf_counter() - parse_started, 0.0
+
+    return _load_layer_scan_dependency_shared(
+        resolved_path, dependency_cache, resolve_config, "fast_", "fast layer-template", parse_body
+    )
 
 
 def _combined_layer_scan_dependency_stats(dependency_cache):
@@ -2943,59 +3108,12 @@ def _combined_layer_scan_dependency_stats(dependency_cache):
 
 
 def _load_layer_scan_dependency(resolved_path, dependency_cache, resolve_config=None):
-    path_value = str(resolved_path or "").strip()
-    if not path_value:
-        return None
-    cache_key = os.path.normcase(os.path.abspath(path_value))
-    levels = dependency_cache["levels"]
-    inflight = dependency_cache["inflight"]
-    stats = dependency_cache["stats"]
-    lock = dependency_cache["lock"]
-    active = _layer_scan_dependency_state(dependency_cache)
-
-    if cache_key in active:
-        with lock:
-            stats["cycles"] += 1
-        log.warning("Detected recursive layer-template dependency while scanning %s", resolved_path)
-        return None
-
-    owner = False
-    wait_event = None
-    while True:
-        with lock:
-            cached = levels.get(cache_key)
-            if cached is not None:
-                stats["hits"] += 1
-                return cached
-            wait_event = inflight.get(cache_key)
-            if wait_event is None:
-                wait_event = threading.Event()
-                inflight[cache_key] = wait_event
-                stats["misses"] += 1
-                owner = True
-                break
-        wait_event.wait()
-
-    level_file = None
-    active.add(cache_key)
-    dep_started = time.perf_counter()
-    parse_seconds = 0.0
-    create_level_seconds = 0.0
-    try:
+    def parse_body(dependency_resolver):
         parse_started = time.perf_counter()
         cr2w_file = _parse_level_cr2w(resolved_path)
         parse_seconds = time.perf_counter() - parse_started
         if cr2w_file is None:
-            return None
-        dependency_resolver = None
-        if resolve_config is not None:
-            dependency_resolver = (
-                lambda depot_path, version=999: _resolve_level_dependency_for_scan(
-                    depot_path,
-                    version,
-                    resolve_config,
-                )
-            )
+            return None, parse_seconds, 0.0
         create_started = time.perf_counter()
         level_file = CR2W.CR2W_file.create_level(
             cr2w_file,
@@ -3007,32 +3125,11 @@ def _load_layer_scan_dependency(resolved_path, dependency_cache, resolve_config=
             ),
             dependency_resolver=dependency_resolver,
         )
-        create_level_seconds = time.perf_counter() - create_started
-        return level_file
-    finally:
-        dep_total_seconds = time.perf_counter() - dep_started
-        active.discard(cache_key)
-        if owner and wait_event is not None:
-            with lock:
-                stats["parse_seconds"] = float(stats.get("parse_seconds", 0.0) or 0.0) + parse_seconds
-                stats["create_level_seconds"] = float(stats.get("create_level_seconds", 0.0) or 0.0) + create_level_seconds
-                stats["total_seconds"] = float(stats.get("total_seconds", 0.0) or 0.0) + dep_total_seconds
-                if dep_total_seconds > float(stats.get("slowest_total_seconds", 0.0) or 0.0):
-                    stats["slowest_total_seconds"] = dep_total_seconds
-                    stats["slowest_path"] = path_value
-                if level_file is not None:
-                    levels[cache_key] = level_file
-                    stats["stores"] += 1
-                inflight.pop(cache_key, None)
-            wait_event.set()
-            if dep_total_seconds >= _LAYER_SCAN_DEP_WARN_THRESHOLD:
-                _log_layer_scan_timing_warning(
-                    "dependency %s total %s (parse %s, create_level %s)",
-                    os.path.basename(path_value) or path_value,
-                    _format_layer_scan_timing(dep_total_seconds),
-                    _format_layer_scan_timing(parse_seconds),
-                    _format_layer_scan_timing(create_level_seconds),
-                )
+        return level_file, parse_seconds, time.perf_counter() - create_started
+
+    return _load_layer_scan_dependency_shared(
+        resolved_path, dependency_cache, resolve_config, "", "layer-template", parse_body
+    )
 
 
 def _sync_layer_scan_dependency_cache_stats(scan):
@@ -3071,6 +3168,7 @@ def _build_level_and_manifest(
     manifest_started = time.perf_counter()
     create_level_seconds = 0.0
     resolve_plan_seconds = 0.0
+    resolution_errors = []
     try:
         dependency_resolver = None
         if resolve_config is not None:
@@ -3107,6 +3205,16 @@ def _build_level_and_manifest(
             _mesh_fbx_uncook_path=mesh_fbx_uncook_path,
             _mesh_uncook_path=mesh_uncook_path,
         )
+        resolution_errors = [
+            str(error)
+            for error in import_blender_fun.level_entity_resolution_errors(level_file)
+            if str(error)
+        ]
+        resolution_errors.extend(
+            error
+            for error in import_blender_fun._entity_import_plan_preflight_errors(plan)
+            if error not in resolution_errors
+        )
         resolve_plan_seconds = time.perf_counter() - resolve_started
     except Exception as exc:
         log.warning("Failed to resolve layer manifest for %s: %s", resolved_path, exc)
@@ -3135,10 +3243,18 @@ def _build_level_and_manifest(
     for item in items:
         if isinstance(item, dict) and _manifest_countable_item(item) and _manifest_item_position(item) is not None:
             import_item_count += 1
+    # Unresolved items are skipped during materialization, not fatal to the manifest.
     return {
         "has_manifest": True,
         "manifest_complete": True,
-        "unresolved_dependencies": [],
+        "unresolved_dependencies": [
+            {
+                "path": str(resolved_path or ""),
+                "source": str(resolved_path or ""),
+                "reason": str(error),
+            }
+            for error in resolution_errors
+        ],
         "scan_backend": "full",
         "import_item_count": int(import_item_count),
         "items": items,
@@ -3188,7 +3304,7 @@ def _scan_level_cache_entry(
             "resolve_plan_seconds": 0.0,
             "total_seconds": time.perf_counter() - layer_started,
         }
-        return entry
+        return _attach_layer_plan_dependency_signatures(entry, resolve_config)
 
     dependency_resolver = None
     if resolve_config is not None:
@@ -3212,7 +3328,7 @@ def _scan_level_cache_entry(
                 else None
             ),
         )
-        if fast_entry is not None:
+        if fast_entry is not None and not bool(fast_entry.get("requires_rich_entity", False)):
             parse_seconds = time.perf_counter() - parse_started
             fast_entry["_timing"] = {
                 "parse_seconds": parse_seconds,
@@ -3223,7 +3339,7 @@ def _scan_level_cache_entry(
                 "total_seconds": time.perf_counter() - layer_started,
             }
             fast_entry["_fast_scan"] = True
-            return fast_entry
+            return _attach_layer_plan_dependency_signatures(fast_entry, resolve_config)
 
     cr2w_file = _parse_level_cr2w(resolved_path)
     parse_seconds = time.perf_counter() - parse_started
@@ -3259,13 +3375,13 @@ def _scan_level_cache_entry(
         "resolve_plan_seconds": float(timing_info.get("resolve_plan_seconds", 0.0) or 0.0),
         "total_seconds": time.perf_counter() - layer_started,
     }
-    return entry
+    return _attach_layer_plan_dependency_signatures(entry, resolve_config)
 
 
 def _get_world_layer_index(context, root_collection, rebuild=False, show_progress=False, progress_title="Layer Scan"):
     cache_key = _world_layer_cache_key(context, root_collection)
     if not rebuild:
-        cached_index = _WORLD_LAYER_INDEX_CACHE.get(cache_key)
+        cached_index = _get_validated_world_layer_index(context, root_collection)
         if cached_index is not None:
             return cached_index
 
@@ -3336,11 +3452,12 @@ def _get_world_layer_index(context, root_collection, rebuild=False, show_progres
                     continue
 
                 cache_entry = None if rebuild else _load_world_layer_cache_entry(conn, level_key, include_items=False)
-                if (
-                    cache_entry
-                    and cache_entry.get("resolved_path", "") == resolved_path
-                    and float(cache_entry.get("file_mtime", -1.0)) == file_mtime
-                    and int(cache_entry.get("file_size", -1)) == file_size
+                if _world_layer_cache_entry_current(
+                    cache_entry,
+                    resolved_path,
+                    file_mtime,
+                    file_size,
+                    resolve_config,
                 ):
                     stats["cache_hits"] += 1
                     updated_entry = dict(cache_entry)
@@ -3459,6 +3576,11 @@ def _hydrate_world_layer_index_from_disk(context, root_collection):
                     _format_layer_scan_timing(query_seconds),
                 )
                 return None
+            resolved_path = _resolve_level_file(context, level_path, root_collection)
+            if not resolved_path or not os.path.isfile(resolved_path):
+                stats["missing"] += 1
+                continue
+            # Validate selected entries at load time instead of rescanning the world.
             if not cache_entry.get("has_bounds", False):
                 stats["no_bounds"] += 1
                 stats["cache_hits"] += 1
@@ -3481,20 +3603,53 @@ def _hydrate_world_layer_index_from_disk(context, root_collection):
         "cache_key": cache_key,
         "cache_path": cache_path,
         "cache_backend": "sqlite",
+        "cache_file_identity": _world_layer_cache_file_identity(cache_path),
         "entries": entries,
         "stats": stats,
     }
     _WORLD_LAYER_INDEX_CACHE[cache_key] = index
     _build_world_layer_runtime_index(index)
     _log_layer_load_timing_warning(
-        "hydrate index total %s (query %s, layers %d, indexed %d, no bounds %d)",
+        "hydrate index total %s (query %s, layers %d, indexed %d, no bounds %d, missing %d)",
         _format_layer_scan_timing(total_seconds),
         _format_layer_scan_timing(query_seconds),
         int(stats.get("layers_total", 0) or 0),
         int(stats.get("indexed", 0) or 0),
         int(stats.get("no_bounds", 0) or 0),
+        int(stats.get("missing", 0) or 0),
     )
     return index
+
+
+def _world_layer_cache_file_identity(cache_path):
+    # SQLite WAL changes are part of cache identity.
+    parts = []
+    for path_value in (cache_path, f"{cache_path}-wal"):
+        try:
+            stat = os.stat(path_value)
+            parts.append((int(getattr(stat, "st_mtime_ns", 0) or 0), int(stat.st_size)))
+        except OSError:
+            parts.append(None)
+    return tuple(parts)
+
+
+def _get_validated_world_layer_index(context, root_collection):
+    cache_key = _world_layer_cache_key(context, root_collection)
+    cache_path = _world_layer_cache_path(context, root_collection)
+    cached_index = _WORLD_LAYER_INDEX_CACHE.get(cache_key)
+    if (
+        cached_index is not None
+        and cached_index.get("cache_file_identity")
+        and cached_index.get("cache_file_identity") == _world_layer_cache_file_identity(cache_path)
+    ):
+        return cached_index
+    index = _hydrate_world_layer_index_from_disk(context, root_collection)
+    if index is not None:
+        return index
+    _WORLD_LAYER_INDEX_CACHE.pop(cache_key, None)
+    _WORLD_LAYER_RUNTIME_CACHE.pop(cache_key, None)
+    _LEVEL_FILE_CACHE.clear()
+    return None
 
 
 def _clear_world_layer_index_cache(context, root_collection):
@@ -3522,6 +3677,12 @@ def _reset_layer_stream_job():
         except Exception:
             pass
         _restore_map_import_profile_loggers(_LAYER_STREAM_JOB)
+    join_guard = _LAYER_STREAM_JOB.pop("join_guard", None)
+    if join_guard is not None:
+        try:
+            join_guard.close()
+        except Exception:
+            pass
     load = _LAYER_STREAM_JOB.get("load", {}) or {}
     stack = load.get("batch_isolation_stack")
     if stack is not None:
@@ -3637,6 +3798,14 @@ def draw_layer_stream_job_ui(layout, context) -> None:
                 f"Skipped Complete: {int(load.get('skipped_complete', 0)):,}"
             )
         )
+    elif job.get("phase") == "materials":
+        load = job.get("load", {}) or {}
+        box.label(
+            text=(
+                f"Layers imported: {int(load.get('imported', 0)):,}   "
+                f"Building materials for remaining meshes..."
+            )
+        )
 
 
 def _start_layer_stream_job(context, mode, root_collection):
@@ -3649,6 +3818,14 @@ def _start_layer_stream_job(context, mode, root_collection):
         pass
     import_blender_fun.set_deferred_materials_paused(True)
     job = _LAYER_STREAM_JOB
+    # Suppress per-join orphan purges for the whole job.
+    join_guard = ExitStack()
+    try:
+        from ..cloth.importer import surgical_external_joins
+        join_guard.enter_context(surgical_external_joins())
+    except Exception:
+        pass
+    job["join_guard"] = join_guard
     job["running"] = True
     job["mode"] = str(mode or "").strip()
     job["context"] = context
@@ -3714,11 +3891,12 @@ def _start_layer_scan_phase(job, context, root_collection, rebuild=False, title=
         item["resolved_path"] = resolved_path
 
         cache_entry = None if rebuild else _load_world_layer_cache_entry(cache_conn, item["level_key"], include_items=False)
-        if (
-            cache_entry
-            and cache_entry.get("resolved_path", "") == resolved_path
-            and float(cache_entry.get("file_mtime", -1.0)) == item["file_mtime"]
-            and int(cache_entry.get("file_size", -1)) == item["file_size"]
+        if _world_layer_cache_entry_current(
+            cache_entry,
+            resolved_path,
+            item["file_mtime"],
+            item["file_size"],
+            resolve_config,
         ):
             item["cached_entry"] = cache_entry
             cache_hit_count += 1
@@ -4301,7 +4479,35 @@ def _load_cached_plan_items_for_entry(index, entry):
     return entry["items"]
 
 
-def _repair_incomplete_layer_manifest_for_load(context, root_collection, index, entry):
+def _layer_index_entry_current_for_load(context, root_collection, entry):
+    if root_collection is None or not isinstance(entry, dict):
+        return False
+    level_path = str(entry.get("level_path", "") or "").strip()
+    resolved_path = _resolve_level_file(context, level_path, root_collection)
+    if not resolved_path or not os.path.isfile(resolved_path):
+        return False
+    try:
+        file_mtime = float(os.path.getmtime(resolved_path))
+        file_size = int(os.path.getsize(resolved_path))
+    except OSError:
+        return False
+    return _world_layer_cache_entry_current(
+        entry,
+        resolved_path,
+        file_mtime,
+        file_size,
+        _build_scan_resolve_config(context, root_collection),
+    )
+
+
+def _repair_incomplete_layer_manifest_for_load(
+    context,
+    root_collection,
+    index,
+    entry,
+    *,
+    dependency_cache=None,
+):
     if _entry_manifest_complete(entry):
         return True
     if root_collection is None or not isinstance(index, dict) or not isinstance(entry, dict):
@@ -4332,12 +4538,14 @@ def _repair_incomplete_layer_manifest_for_load(context, root_collection, index, 
         mesh_uncook_path = ""
 
     repair_started = time.perf_counter()
+    if dependency_cache is None:
+        dependency_cache = _new_layer_scan_dependency_cache()
     repaired_entry = _scan_level_cache_entry(
         level_path,
         resolved_path,
         file_mtime,
         file_size,
-        dependency_cache=_new_layer_scan_dependency_cache(),
+        dependency_cache=dependency_cache,
         resolve_config=_build_scan_resolve_config(context, root_collection),
         mesh_fbx_uncook_path=mesh_fbx_uncook_path,
         mesh_uncook_path=mesh_uncook_path,
@@ -4627,6 +4835,19 @@ def _process_layer_load_batch(job, context):
             resolved = ""
             err = "Collection no longer exists"
         else:
+            if (
+                _entry_manifest_complete(entry)
+                and not _layer_index_entry_current_for_load(context, root_collection, entry)
+            ):
+                entry["manifest_complete"] = False
+                entry["has_manifest"] = False
+                entry["plan_hash"] = ""
+                entry.pop("items", None)
+                entry.setdefault("unresolved_dependencies", []).append({
+                    "path": str(entry.get("level_path", "") or ""),
+                    "source": str(entry.get("level_path", "") or ""),
+                    "reason": "cached layer or entity dependency changed during loading",
+                })
             if not _entry_manifest_complete(entry):
                 _set_layer_stream_progress(
                     job,
@@ -4635,11 +4856,16 @@ def _process_layer_load_batch(job, context):
                     total,
                     f"Rebuilding layer manifest {load['index']}/{total}: {collection_name}",
                 )
+                repair_dependency_cache = job.get("repair_dependency_cache")
+                if repair_dependency_cache is None:
+                    repair_dependency_cache = _new_layer_scan_dependency_cache()
+                    job["repair_dependency_cache"] = repair_dependency_cache
                 _repair_incomplete_layer_manifest_for_load(
                     context,
                     root_collection,
                     job.get("index_data") or {},
                     entry,
+                    dependency_cache=repair_dependency_cache,
                 )
             plan_started = time.perf_counter()
             cached_plan_items = _load_cached_plan_items_for_entry(job.get("index_data") or {}, entry)
@@ -4739,6 +4965,182 @@ def _process_layer_load_batch(job, context):
     return False
 
 
+def _teardown_layer_load_phase(job, context, failed=False):
+    if job.get("load_teardown_done"):
+        return
+    job["load_teardown_done"] = True
+    teardown_started = time.perf_counter()
+    load = job.get("load", {}) or {}
+    join_guard = job.pop("join_guard", None)
+    if join_guard is not None:
+        try:
+            join_guard.close()
+        except Exception:
+            pass
+    isolation_started = time.perf_counter()
+    _close_layer_load_batch_isolation(job)
+    isolation_seconds = time.perf_counter() - isolation_started
+    unpause_started = time.perf_counter()
+    import_blender_fun.set_deferred_materials_paused(False)
+    import_blender_fun.ensure_deferred_material_timer()
+    unpause_seconds = time.perf_counter() - unpause_started
+    previous_active_layer_collection = load.get("previous_active_layer_collection")
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is not None and previous_active_layer_collection is not None:
+        try:
+            view_layer.active_layer_collection = previous_active_layer_collection
+        except Exception:
+            pass
+
+    visibility_started = time.perf_counter()
+    if job.get("phase") == "load" and not failed:
+        _apply_layer_post_import_visibility(job, context)
+    visibility_seconds = time.perf_counter() - visibility_started
+
+    hidden_groups_started = time.perf_counter()
+    _restore_default_hidden_layer_groups(context)
+    hidden_groups_seconds = time.perf_counter() - hidden_groups_started
+    total_seconds = time.perf_counter() - teardown_started
+    job["teardown_seconds"] = total_seconds
+    if total_seconds >= 0.25:
+        _log_layer_load_timing_warning(
+            "teardown total %s (isolation flush %s, deferred unpause %s, visibility %s, hidden groups %s)",
+            _format_layer_scan_timing(total_seconds),
+            _format_layer_scan_timing(isolation_seconds),
+            _format_layer_scan_timing(unpause_seconds),
+            _format_layer_scan_timing(visibility_seconds),
+            _format_layer_scan_timing(hidden_groups_seconds),
+        )
+
+
+def _begin_layer_material_drain_phase(job, context):
+    if job.get("mode") == "scan_cache" or job.get("phase") != "load":
+        return False
+    nearby_started_at = job.get("nearby_load_started_at")
+    if nearby_started_at is not None:
+        try:
+            job["layers_elapsed"] = time.perf_counter() - float(nearby_started_at)
+        except Exception:
+            pass
+    import_blender_fun.reset_deferred_material_stats()
+    import_blender_fun.set_deferred_material_burst(True)
+    _teardown_layer_load_phase(job, context)
+    remaining = import_blender_fun.deferred_material_queue_size()
+    if remaining <= 0:
+        import_blender_fun.set_deferred_material_burst(False)
+        return False
+    job["phase"] = "materials"
+    job["materials_started_at"] = time.perf_counter()
+    job["materials_total"] = remaining
+    job["materials_progress_token"] = None
+    job["materials_progress_at"] = time.perf_counter()
+    log.info(
+        "%s (layers took %.2fs); streaming materials for %d meshes (%d mesh objects)...",
+        job.get("summary") or "Nearby layers imported",
+        float(job.get("layers_elapsed", 0.0) or 0.0),
+        import_blender_fun.deferred_material_entry_count(),
+        remaining,
+    )
+    _set_layer_stream_progress(
+        job,
+        "Streaming materials",
+        0,
+        remaining,
+        f"Building materials 0/{remaining:,} mesh objects",
+    )
+    return True
+
+
+def _process_layer_material_drain(job, context):
+    remaining = import_blender_fun.deferred_material_queue_size()
+    total = max(int(job.get("materials_total", 0) or 0), remaining)
+    job["materials_total"] = total
+    done = max(0, total - remaining)
+    _set_layer_stream_progress(
+        job,
+        "Streaming materials",
+        done,
+        total,
+        f"Building materials {done:,}/{total:,} mesh objects",
+    )
+    if remaining <= 0:
+        return True
+    import_blender_fun.ensure_deferred_material_timer()
+    stats = import_blender_fun.deferred_material_stats()
+    progress_token = (remaining, int(stats.get("entries_done", 0) or 0))
+    if progress_token != job.get("materials_progress_token"):
+        job["materials_progress_token"] = progress_token
+        job["materials_progress_at"] = time.perf_counter()
+        return False
+    stalled_for = time.perf_counter() - float(job.get("materials_progress_at") or time.perf_counter())
+    if stalled_for > 60.0:
+        log.error(
+            "Deferred material streaming made no progress for %.0fs (%d meshes remaining); returning control",
+            stalled_for,
+            remaining,
+        )
+        job["materials_stalled"] = True
+        return True
+    return False
+
+
+def _settle_viewport_after_load(job, context):
+    """Force deferred Blender work into the measured load time."""
+    settle_started = time.perf_counter()
+    try:
+        bpy.ops.ed.undo_push(message="Load Nearby Layers")
+    except Exception:
+        pass
+    try:
+        view_layer = getattr(context, "view_layer", None)
+        if view_layer is not None:
+            view_layer.update()
+    except Exception:
+        pass
+    eval_seconds = time.perf_counter() - settle_started
+    draw_started = time.perf_counter()
+    try:
+        if getattr(context, "window", None) is not None and not bpy.app.background:
+            bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+    except Exception:
+        pass
+    draw_seconds = time.perf_counter() - draw_started
+    total_seconds = time.perf_counter() - settle_started
+    job["viewport_seconds"] = total_seconds
+    if total_seconds >= 0.25:
+        _log_layer_load_timing_warning(
+            "viewport settle total %s (scene evaluation %s, first draw %s)",
+            _format_layer_scan_timing(total_seconds),
+            _format_layer_scan_timing(eval_seconds),
+            _format_layer_scan_timing(draw_seconds),
+        )
+
+
+def _register_post_import_stall_probe():
+    state = {"start": time.perf_counter(), "last": time.perf_counter(), "blocked": 0.0}
+
+    def _probe():
+        now = time.perf_counter()
+        gap = now - state["last"]
+        if gap > 0.5:
+            state["blocked"] += gap
+            log.info(
+                "[post-import] UI was blocked for %.2fs after completion (total %.2fs) - "
+                "remaining shader compiles/GPU uploads",
+                gap,
+                state["blocked"],
+            )
+        state["last"] = now
+        if now - state["start"] > 60.0:
+            return None
+        return 0.1
+
+    try:
+        bpy.app.timers.register(_probe, first_interval=0.1)
+    except Exception:
+        pass
+
+
 def _finish_layer_stream_job(operator, context, cancelled=False, failed=False):
     job = dict(_LAYER_STREAM_JOB)
     wm = job.get("wm")
@@ -4751,21 +5153,11 @@ def _finish_layer_stream_job(operator, context, cancelled=False, failed=False):
             pass
 
     load = job.get("load", {}) or {}
-    _close_layer_load_batch_isolation(job)
-    import_blender_fun.set_deferred_materials_paused(False)
-    import_blender_fun.ensure_deferred_material_timer()
-    previous_active_layer_collection = load.get("previous_active_layer_collection")
-    view_layer = getattr(context, "view_layer", None)
-    if view_layer is not None and previous_active_layer_collection is not None:
-        try:
-            view_layer.active_layer_collection = previous_active_layer_collection
-        except Exception:
-            pass
-
-    if job.get("phase") == "load" and not failed:
-        _apply_layer_post_import_visibility(job, context)
-
-    _restore_default_hidden_layer_groups(context)
+    _teardown_layer_load_phase(_LAYER_STREAM_JOB, context, failed=failed)
+    import_blender_fun.set_deferred_material_burst(False)
+    if job.get("mode") != "scan_cache" and not cancelled and not failed:
+        _settle_viewport_after_load(_LAYER_STREAM_JOB, context)
+        job["viewport_seconds"] = _LAYER_STREAM_JOB.get("viewport_seconds")
 
     if failed:
         message = job.get("error", "") or "Layer scan/load failed."
@@ -4810,6 +5202,9 @@ def _finish_layer_stream_job(operator, context, cancelled=False, failed=False):
                 f"across {int(stats.get('template_cache_stores', 0)):,} unique dependencies."
             )
             level = 'WARNING'
+        elif cancelled and job.get("phase") == "materials":
+            message = job.get("summary", "") or "Nearby layer load complete."
+            level = 'WARNING'
         elif cancelled:
             message = (
                 f"Nearby layer load cancelled at {int(load.get('index', 0)):,}/{int(load.get('total', 0)):,}: "
@@ -4821,6 +5216,26 @@ def _finish_layer_stream_job(operator, context, cancelled=False, failed=False):
             message = job.get("summary", "") or "Nearby layer load complete."
             level = 'WARNING' if int(load.get("failed", 0) or 0) > 0 else 'INFO'
 
+        materials_started_at = job.get("materials_started_at")
+        if materials_started_at is not None:
+            stats = import_blender_fun.deferred_material_stats()
+            entries_done = int(stats.get("entries_done", 0) or 0)
+            message += f"; materials built for {entries_done} meshes"
+            remaining_entries = import_blender_fun.deferred_material_entry_count()
+            if remaining_entries > 0:
+                message += f", {remaining_entries} still streaming in background"
+                if job.get("materials_stalled"):
+                    level = 'WARNING'
+        if foliage_busy():
+            message += "; foliage import still running in background"
+        else:
+            try:
+                from .. import w3_asset_browser
+                if w3_asset_browser.location_foliage_pending():
+                    message += "; location foliage streams next (final 'fully ready' line follows in console)"
+            except Exception:
+                pass
+
     if profile_log_path:
         message = f"{message} Log: {Path(profile_log_path).name}"
         _stop_map_import_profile_log(_LAYER_STREAM_JOB, f"Map import profile log saved to {profile_log_path}")
@@ -4829,12 +5244,34 @@ def _finish_layer_stream_job(operator, context, cancelled=False, failed=False):
     if nearby_started_at is not None:
         try:
             elapsed = time.perf_counter() - float(nearby_started_at)
-            message = f"{message} (took {elapsed:.2f}s)"
+            if job.get("mode") != "scan_cache" and not cancelled and not failed:
+                parts = []
+                layers_elapsed = job.get("layers_elapsed")
+                if layers_elapsed is not None:
+                    parts.append(f"layers {float(layers_elapsed):.2f}s")
+                teardown_seconds = job.get("teardown_seconds")
+                if teardown_seconds:
+                    parts.append(f"finalize {float(teardown_seconds):.2f}s")
+                materials_started_at = job.get("materials_started_at")
+                if materials_started_at is not None:
+                    materials_seconds = time.perf_counter() - float(materials_started_at)
+                    viewport_seconds = float(job.get("viewport_seconds") or 0.0)
+                    materials_seconds = max(0.0, materials_seconds - viewport_seconds)
+                    parts.append(f"materials {materials_seconds:.2f}s")
+                viewport_seconds = job.get("viewport_seconds")
+                if viewport_seconds:
+                    parts.append(f"viewport {float(viewport_seconds):.2f}s")
+                breakdown = f" ({', '.join(parts)})" if parts else ""
+                message = f"Location fully imported in {elapsed:.2f}s{breakdown}. {message}"
+            else:
+                message = f"{message} (took {elapsed:.2f}s)"
         except Exception:
             pass
 
     _reset_layer_stream_job()
     _tag_layer_stream_redraw(context, wm=wm)
+    if profile_log_path and job.get("mode") != "scan_cache":
+        _register_post_import_stall_probe()
     operator.report({level}, message)
     return {'CANCELLED'} if (cancelled or failed) else {'FINISHED'}
 
@@ -4983,7 +5420,12 @@ def _layer_visibility_object_key(obj):
 
 
 def _layer_visibility_descendant_engine_states(objects):
-    """Return descendant visibility summaries without Blender's O(scene) child map."""
+    children_map = {}
+    for candidate in bpy.data.objects:
+        parent = getattr(candidate, "parent", None)
+        if parent is not None:
+            children_map.setdefault(_layer_visibility_object_key(parent), []).append(candidate)
+
     subtree_states = {}
     visiting = set()
 
@@ -5007,7 +5449,7 @@ def _layer_visibility_descendant_engine_states(objects):
         value = direct_value(candidate)
         has_value = value is not None
         any_visible = bool(value) if has_value else False
-        for child in list(getattr(candidate, "children", []) or []):
+        for child in children_map.get(key, ()):
             child_has_value, child_any_visible = subtree_state(child)
             has_value = has_value or child_has_value
             any_visible = any_visible or child_any_visible
@@ -5017,13 +5459,14 @@ def _layer_visibility_descendant_engine_states(objects):
 
     descendant_states = {}
     for obj in objects or []:
+        key = _layer_visibility_object_key(obj)
         has_value = False
         any_visible = False
-        for child in list(getattr(obj, "children", []) or []):
+        for child in children_map.get(key, ()):
             child_has_value, child_any_visible = subtree_state(child)
             has_value = has_value or child_has_value
             any_visible = any_visible or child_any_visible
-        descendant_states[_layer_visibility_object_key(obj)] = (has_value, any_visible)
+        descendant_states[key] = (has_value, any_visible)
     return descendant_states
 
 
@@ -5646,10 +6089,7 @@ def select_nearby_w2l_paths(
         load_limit = int(getattr(scene_settings, "terrain_layer_max_load_count", 0) or 0)
     load_limit = max(0, int(load_limit))
 
-    cache_key = _world_layer_cache_key(context, root_collection)
-    index = _WORLD_LAYER_INDEX_CACHE.get(cache_key)
-    if index is None:
-        index = _hydrate_world_layer_index_from_disk(context, root_collection)
+    index = _get_validated_world_layer_index(context, root_collection)
     if index is None:
         raise ValueError(
             "World layer scan cache is not built. Run a layer scan (or "
@@ -5770,10 +6210,7 @@ def _compute_nearby_cache_summary_label(context, camera_position, root_collectio
     if root_collection is None:
         return "Scan Cache Nearby: no world root selected"
 
-    cache_key = _world_layer_cache_key(context, root_collection)
-    index = _WORLD_LAYER_INDEX_CACHE.get(cache_key)
-    if index is None:
-        index = _hydrate_world_layer_index_from_disk(context, root_collection)
+    index = _get_validated_world_layer_index(context, root_collection)
     if index is None:
         return "Scan Cache Nearby: rebuild cache for exact counts"
 
@@ -5876,7 +6313,25 @@ def _import_level_from_collection(
     import_settings = dict(import_settings or {})
     full_cached_plan = False
     if cached_plan_items is not None and not dev_empty_only:
-        full_cached_plan = import_blender_fun.cached_plan_can_use_full_import(
+        # A valid full plan guarantees every proximity subset is valid.
+        verdict_key = None
+        verdict = None
+        if plan_hash and mode_signature:
+            verdict_key = (str(plan_hash), str(mode_signature))
+            verdict = _LAYER_PLAN_VERDICT_CACHE.get(verdict_key)
+        if verdict is None:
+            verdict = import_blender_fun.entity_import_plan_can_materialize(
+                cached_plan_items,
+                camera_position=None,
+                radius=0.0,
+                import_kwargs=import_settings,
+                context=context,
+            )
+            if verdict_key is not None:
+                if len(_LAYER_PLAN_VERDICT_CACHE) > 16384:
+                    _LAYER_PLAN_VERDICT_CACHE.clear()
+                _LAYER_PLAN_VERDICT_CACHE[verdict_key] = verdict
+        full_cached_plan = verdict or import_blender_fun.entity_import_plan_can_materialize(
             cached_plan_items,
             camera_position=camera_position,
             radius=radius,
@@ -6312,13 +6767,10 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
         if write_profile_log:
             _start_map_import_profile_log(job, root_collection)
 
-        cache_key = _world_layer_cache_key(context, root_collection)
-        cached_index = _WORLD_LAYER_INDEX_CACHE.get(cache_key)
-        if cached_index is None:
-            hydrate_started = time.perf_counter()
-            cached_index = _hydrate_world_layer_index_from_disk(context, root_collection)
-            hydrate_seconds = time.perf_counter() - hydrate_started
-            index_source = "disk" if cached_index is not None else "scan"
+        hydrate_started = time.perf_counter()
+        cached_index = _get_validated_world_layer_index(context, root_collection)
+        hydrate_seconds = time.perf_counter() - hydrate_started
+        index_source = "disk" if cached_index is not None else "scan"
         if cached_index is not None:
             job["index_data"] = cached_index
             prepare_started = time.perf_counter()
@@ -6382,6 +6834,10 @@ class WITCH_OT_load_layers_around_camera(bpy.types.Operator):
                         return _finish_layer_stream_job(self, context)
             elif _LAYER_STREAM_JOB.get("phase") == "load":
                 if _process_layer_load_batch(_LAYER_STREAM_JOB, context):
+                    if not _begin_layer_material_drain_phase(_LAYER_STREAM_JOB, context):
+                        return _finish_layer_stream_job(self, context)
+            elif _LAYER_STREAM_JOB.get("phase") == "materials":
+                if _process_layer_material_drain(_LAYER_STREAM_JOB, context):
                     return _finish_layer_stream_job(self, context)
             else:
                 return _finish_layer_stream_job(self, context)
@@ -6408,7 +6864,6 @@ _FOLIAGE_JOB = {
     "foliage_root_name": None,
     "world_root_name": None,
     "foliage_dir": None,
-    "source_mode": "FULL",
     "wm": None,
     "timer": None,
     "error": None,
@@ -6433,7 +6888,6 @@ def _start_foliage_job(
     foliage_root,
     world_root,
     foliage_dir: str,
-    source_mode: str = "FULL",
 ):
     _FOLIAGE_JOB.clear()
     _FOLIAGE_JOB.update({
@@ -6447,7 +6901,6 @@ def _start_foliage_job(
         "foliage_root_name": foliage_root.name,
         "world_root_name": world_root.name,
         "foliage_dir": foliage_dir,
-        "source_mode": str(source_mode or "FULL"),
         "wm": None,
         "timer": None,
         "error": None,
@@ -6466,20 +6919,6 @@ def _finish_foliage_job(operator, context, cancelled=False, failed=False):
     loaded = int(_FOLIAGE_JOB.get("loaded_count", 0))
     instances = int(_FOLIAGE_JOB.get("instance_count", 0))
     error = _FOLIAGE_JOB.get("error")
-    source_mode = str(_FOLIAGE_JOB.get("source_mode", "FULL") or "FULL")
-    foliage_root_name = str(_FOLIAGE_JOB.get("foliage_root_name", "") or "")
-
-    if source_mode == "PROXY" and not failed and not cancelled:
-        foliage_root = bpy.data.collections.get(foliage_root_name) if foliage_root_name else None
-        if foliage_root is not None:
-            try:
-                from ..importers import import_foliage as _if
-
-                _if.apply_viewer_source_budget(foliage_root, context)
-            except Exception as exc:
-                failed = True
-                error = f"Viewer foliage hydration failed: {exc}"
-                log.exception("Viewer foliage hydration failed")
 
     _FOLIAGE_JOB.clear()
     _FOLIAGE_JOB.update({
@@ -6493,7 +6932,6 @@ def _finish_foliage_job(operator, context, cancelled=False, failed=False):
         "foliage_root_name": None,
         "world_root_name": None,
         "foliage_dir": None,
-        "source_mode": "FULL",
         "wm": None,
         "timer": None,
         "error": None,
@@ -6633,13 +7071,11 @@ class WITCH_OT_load_foliage_around_camera(bpy.types.Operator):
             self.report({"INFO"}, f"No new foliage cells to load in this area (radius {radius:.0f})")
             return {"FINISHED"}
 
-        source_mode = str(getattr(scene_settings, "terrain_foliage_mode", "PROXY"))
         _start_foliage_job(
             pending,
             foliage_root,
             root_coll,
             foliage_prefix,
-            source_mode=source_mode,
         )
 
         wm = context.window_manager
@@ -6681,8 +7117,6 @@ class WITCH_OT_load_foliage_around_camera(bpy.types.Operator):
                 batch,
                 foliage_root,
                 context,
-                source_mode=str(_FOLIAGE_JOB.get("source_mode", "FULL")),
-                hydrate_viewer_sources=False,
             )
             _FOLIAGE_JOB["loaded_count"] = (
                 int(_FOLIAGE_JOB.get("loaded_count", 0)) + len(result.loaded_cells)
@@ -6757,8 +7191,8 @@ _FOLIAGE_HYDRATION_RUNNING = False
 
 class WITCH_OT_hydrate_foliage_sources(bpy.types.Operator):
     bl_idname = "witcher.hydrate_foliage_sources"
-    bl_label = "Load Full Foliage Sources"
-    bl_description = "Progressively replace fast foliage proxies with full source meshes"
+    bl_label = "Retry Missing Foliage Sources"
+    bl_description = "Retry importing foliage source meshes that previously failed and are hidden"
     bl_options = {'REGISTER'}
 
     @classmethod

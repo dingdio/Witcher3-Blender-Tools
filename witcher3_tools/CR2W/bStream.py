@@ -34,7 +34,15 @@ class bReadStream(io.BytesIO):
 
 
 def open_cr2w_read_stream(path):
-    with open(path, "rb") as fh:
+    open_path = path
+    # Normalize long Windows paths only when Blender helpers are available.
+    try:
+        from .common_blender import win_safe_path
+    except Exception:
+        pass
+    else:
+        open_path = win_safe_path(path)
+    with open(open_path, "rb") as fh:
         data = fh.read()
     return bReadStream(data, name=path)
 

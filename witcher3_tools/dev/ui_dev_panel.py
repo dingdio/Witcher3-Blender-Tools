@@ -227,8 +227,7 @@ DEV_OPERATOR_ITEMS = [
     ('nxs', 'NXS', 'Collision import test paths'),
     ('apx', 'APX', 'Cloth import test paths (Entity only)'),
     ('redapex', 'REDAPEX', 'Redapex import test paths'),
-    ('w2ent_chara', 'CHARACTER', 'Character entity import (.w2ent)'),
-    ('w2ent', 'ENTITY', 'Item/prop entity import (.w2ent)'),
+    ('w2ent', 'ENTITY', 'Entity import (.w2ent)'),
     ('w2anims', 'W2ANIMS', 'Animation import (.w2anims)'),
     ('w2rig', 'W2RIG', 'Rig/skeleton import (.w2rig)'),
     ('w2l', 'W2L', 'Layer import (.w2l)'),
@@ -784,54 +783,35 @@ class DEV_OT_ImportPath(Operator):
     section_index: IntProperty(default=0)
     path_index: IntProperty(default=0)
 
+    _IMPORT_OPS = {
+        'w2mesh': 'import_w2mesh',
+        'nxs': 'import_nxs',
+        'apx': 'import_redcloth_materials',
+        'redapex': 'import_redapex_materials',
+        'w2ent': 'import_w2ent',
+        'w2anims': 'import_w2_anims_json',
+        'w2rig': 'import_w2_rig',
+        'w2l': 'import_w2l',
+        'w2w': 'import_w2w',
+        'w2scene': 'import_w2_scene',
+        'w2cutscene': 'import_w2_cutscene',
+        'w2mi': 'import_w2mi',
+        'w2mg': 'import_w2mg',
+        'xbm': 'import_xbm',
+        'w2cube': 'import_w2cube',
+        'inventory': 'import_w2ent_inventory',
+        'w3app': 'import_w3app',
+        'fbx': 'import_witcher3_fbx',
+        'voice': 'import_w2_voice',
+        'flyr': 'import_flyr',
+        'srt': 'import_srt',
+    }
+
     def _dispatch_import(self, invoke_mode, filepath):
-        op = self.operator_type
-        if op == 'w2mesh':
-            bpy.ops.witcher.import_w2mesh(invoke_mode, filepath=filepath)
-        elif op == 'nxs':
-            bpy.ops.witcher.import_nxs(invoke_mode, filepath=filepath)
-        elif op == 'apx':
-            bpy.ops.witcher.import_redcloth_materials(invoke_mode, filepath=filepath)
-        elif op == 'redapex':
-            bpy.ops.witcher.import_redapex_materials(invoke_mode, filepath=filepath)
-        elif op == 'w2ent_chara':
-            bpy.ops.witcher.import_w2ent_character(invoke_mode, filepath=filepath)
-        elif op == 'w2ent':
-            bpy.ops.witcher.import_w2ent(invoke_mode, filepath=filepath)
-        elif op == 'w2anims':
-            bpy.ops.witcher.import_w2_anims_json(invoke_mode, filepath=filepath)
-        elif op == 'w2rig':
-            bpy.ops.witcher.import_w2_rig(invoke_mode, filepath=filepath)
-        elif op == 'w2l':
-            bpy.ops.witcher.import_w2l(invoke_mode, filepath=filepath)
-        elif op == 'w2w':
-            bpy.ops.witcher.import_w2w(invoke_mode, filepath=filepath)
-        elif op == 'w2scene':
-            bpy.ops.witcher.import_w2_scene(invoke_mode, filepath=filepath)
-        elif op == 'w2cutscene':
-            bpy.ops.witcher.import_w2_cutscene(invoke_mode, filepath=filepath)
-        elif op == 'w2mi':
-            bpy.ops.witcher.import_w2mi(invoke_mode, filepath=filepath)
-        elif op == 'w2mg':
-            bpy.ops.witcher.import_w2mg(invoke_mode, filepath=filepath)
-        elif op == 'xbm':
-            bpy.ops.witcher.import_xbm(invoke_mode, filepath=filepath)
-        elif op == 'w2cube':
-            bpy.ops.witcher.import_w2cube(invoke_mode, filepath=filepath)
-        elif op == 'inventory':
-            bpy.ops.witcher.import_w2ent_inventory(invoke_mode, filepath=filepath)
-        elif op == 'w3app':
-            bpy.ops.witcher.import_w3app(invoke_mode, filepath=filepath)
-        elif op == 'fbx':
-            bpy.ops.witcher.import_witcher3_fbx(invoke_mode, filepath=filepath)
-        elif op == 'voice':
-            bpy.ops.witcher.import_w2_voice(invoke_mode, filepath=filepath)
-        elif op == 'flyr':
-            bpy.ops.witcher.import_flyr(invoke_mode, filepath=filepath)
-        elif op == 'srt':
-            bpy.ops.witcher.import_srt(invoke_mode, filepath=filepath)
-        else:
-            raise ValueError(f"Unknown operator type: {op}")
+        op_name = self._IMPORT_OPS.get(self.operator_type)
+        if op_name is None:
+            raise ValueError(f"Unknown operator type: {self.operator_type}")
+        return getattr(bpy.ops.witcher, op_name)(invoke_mode, filepath=filepath)
 
     def execute(self, context):
         config = get_config()
@@ -870,9 +850,12 @@ class DEV_OT_ImportPath(Operator):
                         self.report({'ERROR'}, msg)
                         return {'CANCELLED'}
                     try:
-                        self._dispatch_import(invoke_mode, filepath)
+                        operator_result = self._dispatch_import(invoke_mode, filepath)
                     except Exception as e:
                         self.report({'ERROR'}, f"Import failed: {filepath} ({e})")
+                        return {'CANCELLED'}
+                    if operator_result and 'CANCELLED' in operator_result:
+                        self.report({'ERROR'}, f"Import cancelled: {filepath}")
                         return {'CANCELLED'}
 
                 return {'FINISHED'}

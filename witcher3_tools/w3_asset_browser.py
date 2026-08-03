@@ -1941,6 +1941,7 @@ def _build_location_entries() -> list[dict]:
             "map": map_name,
             "position": list(position) if position else [],
             "radius": radius,
+            "tiles": [str(t) for t in (loc.get("tiles") or []) if str(t or "").strip()],
             "user_location": bool(loc.get("_user_location", False)),
         })
 
@@ -2133,6 +2134,17 @@ def _terrain_tiles_within_radius(spec, position, radius):
     return tuple((tile_x, tile_y) for _center, _distance, tile_y, tile_x in hits)
 
 
+def _parse_location_tile_names(tile_names):
+    tiles = []
+    for value in tile_names or []:
+        match = re.fullmatch(r"tile_(\d+)_x_(\d+)", str(value or "").strip().lower())
+        if match is None:
+            log.warning("Ignoring unrecognized location tile name: %r", value)
+            continue
+        tiles.append((int(match.group(2)), int(match.group(1))))
+    return tiles
+
+
 def _ensure_location_world_anchor(world_root, world_abs: str):
     root_name = str(getattr(world_root, "name", "") or "")
     for obj in list(getattr(world_root, "all_objects", ()) or ()):
@@ -2243,69 +2255,105 @@ def _activate_world_root(context, world_root):
         return False
 
 
-def _schedule_location_tile_foliage(
+_PENDING_LOCATION_FOLIAGE = 0
+
+
+def location_foliage_pending() -> bool:
+    return _PENDING_LOCATION_FOLIAGE > 0
+
+
+def _consume_pending_location_foliage():
+    global _PENDING_LOCATION_FOLIAGE
+    _PENDING_LOCATION_FOLIAGE = max(0, _PENDING_LOCATION_FOLIAGE - 1)
+
+
+def _schedule_location_foliage(
     world_abs: str,
     world_root_name: str,
     *,
-    tile_x: int,
-    tile_y: int,
+    tiles,
     x_tiles: int,
     y_tiles: int,
     terrain_size: float,
-    source_mode: str,
     name: str,
 ) -> bool:
     import time as _time
     from .ui import ui_map
+    global _PENDING_LOCATION_FOLIAGE
 
+    tiles = tuple((int(tx), int(ty)) for tx, ty in tiles)
+    if not tiles:
+        return False
     scheduled_at = _time.perf_counter()
 
     def _tick():
         if ui_map.layer_stream_job_running() or ui_map.foliage_busy():
             if _time.perf_counter() - scheduled_at > 3600.0:
                 log.warning("Location foliage timed out waiting for another job: %s", name)
+                _consume_pending_location_foliage()
                 return None
             return 0.25
         world_root = bpy.data.collections.get(world_root_name)
         if world_root is None:
             log.warning("Location foliage cancelled for %s: world root was removed", name)
+            _consume_pending_location_foliage()
             return None
+        _consume_pending_location_foliage()
         started = _time.perf_counter()
+        log.info(
+            "Importing location foliage for %s (%d tile(s))... Blender stays busy until this finishes.",
+            name,
+            len(tiles),
+        )
+        cells = 0
+        instances = 0
         try:
             from .importers import import_foliage
 
-            foliage_result = import_foliage.load_foliage_for_tile(
-                world_abs,
-                world_root,
-                bpy.context,
-                int(tile_x),
-                int(tile_y),
-                int(x_tiles),
-                int(y_tiles),
-                float(terrain_size),
-                source_mode=str(source_mode or "PROXY"),
-            )
+            for tile_x, tile_y in tiles:
+                foliage_result = import_foliage.load_foliage_for_tile(
+                    world_abs,
+                    world_root,
+                    bpy.context,
+                    tile_x,
+                    tile_y,
+                    int(x_tiles),
+                    int(y_tiles),
+                    float(terrain_size),
+                )
+                cells += len(getattr(foliage_result, "loaded_cells", ()) or ())
+                instances += int(getattr(foliage_result, "instance_count", 0) or 0)
+            now = _time.perf_counter()
             log.info(
-                "Location foliage ready for %s in %.2fs (queued %.2fs; tile %d,%d; %d cells / %d instances; %s)",
+                "Location '%s': foliage section fully loaded in %.2fs (waited %.2fs for layer job; %d tile(s) / %d cells / %d instances)",
                 name,
-                _time.perf_counter() - started,
+                now - started,
                 started - scheduled_at,
-                int(tile_x),
-                int(tile_y),
-                len(getattr(foliage_result, "loaded_cells", ()) or ()),
-                int(getattr(foliage_result, "instance_count", 0) or 0),
-                str(source_mode or "PROXY"),
+                len(tiles),
+                cells,
+                instances,
             )
         except Exception:
-            log.warning("Location tile foliage load failed for %s", name, exc_info=True)
+            log.warning("Location foliage load failed for %s", name, exc_info=True)
         return None
 
     try:
         bpy.app.timers.register(_tick, first_interval=0.1)
+        _PENDING_LOCATION_FOLIAGE += 1
         return True
     except Exception:
-        log.warning("Failed to schedule location tile foliage for %s", name, exc_info=True)
+        log.warning("Failed to schedule location foliage for %s", name, exc_info=True)
         return False
+
+
+def _position_location_viewport(context, world_root, position, radius):
+    window = getattr(context, "window", None)
+    area = _find_view3d_area(window) if window is not None else None
+    if area is None:
+        return None
+    eye_offset = _move_viewport_to_location(area, position, distance=max(30.0, radius * 0.5))
+    _activate_world_root(context, world_root)
+    return eye_offset
 
 
 def _start_location_stream(context, world_root, position, radius, name, report):
@@ -2316,13 +2364,11 @@ def _start_location_stream(context, world_root, position, radius, name, report):
     if ui_map.layer_stream_job_running() or ui_map.foliage_busy():
         report({'WARNING'}, "A layer/foliage job is already running; try again when it finishes.")
         return None
-    window = getattr(context, "window", None)
-    area = _find_view3d_area(window) if window is not None else None
-    if area is None:
+    eye_offset = _position_location_viewport(context, world_root, position, radius)
+    if eye_offset is None:
         return False
-
-    eye_offset = _move_viewport_to_location(area, position, distance=max(30.0, radius * 0.5))
-    _activate_world_root(context, world_root)
+    window = getattr(context, "window", None)
+    area = _find_view3d_area(window)
 
     scene_settings = getattr(context.scene, "witcher_file_browser", None)
     if scene_settings is not None:
@@ -2345,7 +2391,7 @@ def _start_location_stream(context, world_root, position, radius, name, report):
     return True
 
 
-def _open_location(context, world_path: str, name: str, report, position=None, radius=0.0):
+def _open_location(context, world_path: str, name: str, report, position=None, radius=0.0, tiles=None):
     import time as _time
     from . import CR2W
     from .importers import import_w2w
@@ -2390,7 +2436,16 @@ def _open_location(context, world_path: str, name: str, report, position=None, r
             scene_settings.terrain_import_mode = "SELECTED_TILE"
         except Exception:
             pass
-    report({'INFO'}, f"Opening {name}: terrain + nearby world layers…")
+    _loc_sections = [
+        label
+        for label, enabled in (
+            ("terrain", bool(getattr(scene_settings, "location_import_terrain", False))),
+            ("foliage", bool(getattr(scene_settings, "location_import_foliage", True))),
+            ("nearby layers", bool(getattr(scene_settings, "location_import_layers", False))),
+        )
+        if enabled
+    ]
+    report({'INFO'}, f"Opening {name}: {' + '.join(_loc_sections) if _loc_sections else 'world only'}…")
     stage_started = _time.perf_counter()
     try:
         world_file = CR2W.CR2W_reader.load_w2w(
@@ -2440,7 +2495,24 @@ def _open_location(context, world_path: str, name: str, report, position=None, r
     _finish_stage("world_environment", stage_started)
 
     try:
-        terrain_tiles = _terrain_tiles_within_radius(spec, position, radius)
+        requested_tiles = _parse_location_tile_names(tiles)
+        valid_tiles = [
+            (tx, ty)
+            for tx, ty in requested_tiles
+            if 0 <= tx < int(spec.x_tiles) and 0 <= ty < int(spec.y_tiles)
+        ]
+        if requested_tiles and not valid_tiles:
+            report({'WARNING'}, f"{name}: configured tiles are outside this world's grid; using radius tiles")
+        if valid_tiles:
+            terrain_tiles = tuple(valid_tiles)
+            log.info(
+                "Location '%s': terrain restricted to %d configured tile(s): %s",
+                name,
+                len(valid_tiles),
+                ", ".join(f"tile_{ty}_x_{tx}" for tx, ty in valid_tiles),
+            )
+        else:
+            terrain_tiles = _terrain_tiles_within_radius(spec, position, radius)
         if not terrain_tiles:
             raise ValueError("Location radius does not intersect this world's terrain")
         tile_x, tile_y = terrain_tiles[0]
@@ -2455,80 +2527,96 @@ def _open_location(context, world_path: str, name: str, report, position=None, r
         except Exception:
             pass
 
+    include_terrain = bool(getattr(scene_settings, "location_import_terrain", False))
+    include_foliage = bool(getattr(scene_settings, "location_import_foliage", True))
+    include_layers = bool(getattr(scene_settings, "location_import_layers", False))
+
     detail = int(getattr(scene_settings, "terrain_multires_level", 8) or 8)
     terrain_results = []
     stage_started = _time.perf_counter()
-    for terrain_tile_x, terrain_tile_y in terrain_tiles:
-        try:
-            terrain_result = import_w2w.import_world_terrain_tile(
-                world_file,
-                world_abs,
-                terrain_tile_x,
-                terrain_tile_y,
-                multires_level=detail,
-                world_root_collection=world_root,
-            )
-            if terrain_result is None or not terrain_result.ok:
-                raise FileNotFoundError(
-                    getattr(terrain_result, "error", "")
-                    or f"Terrain tile {terrain_tile_x}, {terrain_tile_y} was not found"
+    if include_terrain:
+        for terrain_tile_x, terrain_tile_y in terrain_tiles:
+            try:
+                terrain_result = import_w2w.import_world_terrain_tile(
+                    world_file,
+                    world_abs,
+                    terrain_tile_x,
+                    terrain_tile_y,
+                    multires_level=detail,
+                    world_root_collection=world_root,
                 )
-            world_root = terrain_result.world_collection or world_root
-            terrain_results.append((terrain_tile_x, terrain_tile_y, terrain_result))
-        except Exception as exc:
-            log.warning(
-                "Location terrain tile %d,%d import failed for %s",
-                terrain_tile_x,
-                terrain_tile_y,
-                name,
-                exc_info=True,
-            )
-            report({'WARNING'}, f"Terrain tile {terrain_tile_x}, {terrain_tile_y} failed: {exc}")
-    if terrain_results:
-        try:
-            terrain_results[0][2].obj.select_set(True)
-            context.view_layer.objects.active = terrain_results[0][2].obj
-        except Exception:
-            pass
+                if terrain_result is None or not terrain_result.ok:
+                    raise FileNotFoundError(
+                        getattr(terrain_result, "error", "")
+                        or f"Terrain tile {terrain_tile_x}, {terrain_tile_y} was not found"
+                    )
+                world_root = terrain_result.world_collection or world_root
+                terrain_results.append((terrain_tile_x, terrain_tile_y, terrain_result))
+            except Exception as exc:
+                log.warning(
+                    "Location terrain tile %d,%d import failed for %s",
+                    terrain_tile_x,
+                    terrain_tile_y,
+                    name,
+                    exc_info=True,
+                )
+                report({'WARNING'}, f"Terrain tile {terrain_tile_x}, {terrain_tile_y} failed: {exc}")
+        if terrain_results:
+            try:
+                terrain_results[0][2].obj.select_set(True)
+                context.view_layer.objects.active = terrain_results[0][2].obj
+            except Exception:
+                pass
     _finish_stage("terrain_tiles", stage_started)
+    if include_terrain:
+        log.info(
+            "Location '%s': terrain section fully loaded in %.2fs (%d/%d tiles)",
+            name,
+            timings["terrain_tiles"],
+            len(terrain_results),
+            len(terrain_tiles),
+        )
+    else:
+        log.info("Location '%s': terrain section skipped (opt-in disabled)", name)
 
-    include_foliage = bool(getattr(scene_settings, "terrain_include_foliage", True))
-    foliage_source_mode = str(
-        getattr(scene_settings, "terrain_foliage_mode", "PROXY") or "PROXY"
-    )
     if world_root is None:
         report({'ERROR'}, "World import produced no root collection.")
         return {'CANCELLED'}
     _ensure_location_world_anchor(world_root, world_abs)
 
     stage_started = _time.perf_counter()
-    stream_status = _start_location_stream(
-        context,
-        world_root,
-        position,
-        radius,
-        name,
-        report,
-    )
+    if include_layers:
+        stream_status = _start_location_stream(
+            context,
+            world_root,
+            position,
+            radius,
+            name,
+            report,
+        )
+        if stream_status is None:
+            return {'CANCELLED'}
+        stream_started = bool(stream_status)
+    else:
+        _position_location_viewport(context, world_root, position, radius)
+        log.info("Location '%s': layers section skipped (opt-in disabled)", name)
+        stream_started = False
     _finish_stage("schedule_layers", stage_started)
-    if stream_status is None:
-        return {'CANCELLED'}
-    stream_started = bool(stream_status)
 
     foliage_scheduled = 0
     if include_foliage:
-        for terrain_tile_x, terrain_tile_y, _terrain_result in terrain_results:
-            foliage_scheduled += bool(_schedule_location_tile_foliage(
-                world_abs,
-                world_root.name,
-                tile_x=terrain_tile_x,
-                tile_y=terrain_tile_y,
-                x_tiles=int(spec.x_tiles),
-                y_tiles=int(spec.y_tiles),
-                terrain_size=float(spec.terrain_size),
-                source_mode=foliage_source_mode,
-                name=name,
-            ))
+        if _schedule_location_foliage(
+            world_abs,
+            world_root.name,
+            tiles=terrain_tiles,
+            x_tiles=int(spec.x_tiles),
+            y_tiles=int(spec.y_tiles),
+            terrain_size=float(spec.terrain_size),
+            name=name,
+        ):
+            foliage_scheduled = len(terrain_tiles)
+    else:
+        log.info("Location '%s': foliage section skipped (opt-in disabled)", name)
 
     timings["startup_total"] = _time.perf_counter() - started
     try:
@@ -2556,7 +2644,7 @@ def _open_location(context, world_path: str, name: str, report, position=None, r
         ),
     )
 
-    if not stream_started:
+    if include_layers and not stream_started:
         report({'ERROR'}, "Could not start Load Layers Around Camera in the 3D viewport.")
         return {'CANCELLED'}
     return {'FINISHED'}
@@ -3004,6 +3092,8 @@ class _JournalBrowserMixin:
                 if position is not None:
                     op.position = position
                 op.radius = float(entry.get("radius") or 0.0)
+                entry_tiles = entry.get("tiles")
+                op.tiles_text = json.dumps(entry_tiles) if entry_tiles else ""
                 details = action_row.operator(
                     MyLocationDetailsOperator.bl_idname,
                     text="",
@@ -3188,30 +3278,29 @@ class MyImageActionOperator(bpy.types.Operator):
             return {'CANCELLED'}
         metadata = import_entity.get_entity_appearance_metadata(abs_path)
         if self.open_import_dialog:
-            import_kind = import_entity.classify_entity_import_metadata(metadata, context=context)
-            if import_kind == "inventory":
-                return bpy.ops.witcher.import_w2ent_inventory(
-                    'INVOKE_DEFAULT',
-                    filepath=abs_path,
-                    import_mode='MOUNTS',
-                )
-            return bpy.ops.witcher.import_w2ent_character(
+            return bpy.ops.witcher.import_w2ent(
                 'INVOKE_DEFAULT',
                 filepath=abs_path,
                 appearance_metadata_json=json.dumps(metadata, sort_keys=False),
                 appearance_metadata_path=abs_path,
             )
-        if not import_entity.try_apply_inventory_file_to_selected_character(context, abs_path):
-            default_appearance_name = str(metadata.get("default_name", "") or "").strip()
-            arm_obj = import_entity.import_ent_template(
-                abs_path,
-                False,
-                0 if default_appearance_name else 1,
-                selected_appearance_name=default_appearance_name,
-            )
-            if arm_obj and get_all_addon_prefs(context).import_idle_animation:
-                from .importers.import_anims import load_idle_animation_for_armature as _load_idle_anim
-                _load_idle_anim(context, arm_obj)
+        default_appearance_name = str(metadata.get("default_name", "") or "").strip()
+        entity_result = import_entity.import_entity_file(
+            abs_path,
+            load_face_poses=False,
+            import_apperance=0 if default_appearance_name else 1,
+            selected_appearance_name=default_appearance_name,
+        )
+        ok, errors = import_entity.entity_import_result_errors(entity_result)
+        if not ok:
+            self.report({'ERROR'}, errors[0])
+            return {'CANCELLED'}
+        if errors:
+            self.report({'WARNING'}, errors[0])
+        arm_obj = getattr(entity_result, "main_armature", None)
+        if arm_obj and get_all_addon_prefs(context).import_idle_animation:
+            from .importers.import_anims import load_idle_animation_for_armature as _load_idle_anim
+            _load_idle_anim(context, arm_obj)
         return {'FINISHED'}
 
 
@@ -3327,6 +3416,7 @@ class MyLocationActionOperator(bpy.types.Operator):
     has_position: bpy.props.BoolProperty(default=False)
     position: bpy.props.FloatVectorProperty(size=3, default=(0.0, 0.0, 0.0))
     radius: bpy.props.FloatProperty(default=0.0)
+    tiles_text: bpy.props.StringProperty(default="")
     tooltip_text: bpy.props.StringProperty(default="")
 
     @classmethod
@@ -3339,6 +3429,12 @@ class MyLocationActionOperator(bpy.types.Operator):
 
     def execute(self, context):
         name = _safe_text(self.location_name) or "Location"
+        tiles = None
+        if self.tiles_text:
+            try:
+                tiles = json.loads(self.tiles_text)
+            except Exception:
+                log.warning("Invalid location tiles payload: %r", self.tiles_text)
         return _open_location(
             context,
             self.world_path,
@@ -3346,6 +3442,7 @@ class MyLocationActionOperator(bpy.types.Operator):
             self.report,
             position=tuple(self.position) if self.has_position else None,
             radius=float(self.radius),
+            tiles=tiles,
         )
 
 

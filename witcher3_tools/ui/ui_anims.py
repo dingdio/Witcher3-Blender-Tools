@@ -3340,11 +3340,11 @@ def _import_cutscene_camera_rig(context):
         return None
     before_names = {obj.name for obj in bpy.data.objects}
     try:
-        imported_obj = import_entity.import_ent_template(
+        imported_obj = import_entity.import_entity_file(
             materialize_entity_repo_path(repo_path, source_game="w3"),
             load_face_poses=False,
             import_apperance=0,
-        )
+        ).main_object
     except Exception:
         log.exception("Failed to auto-import cutscene camera '%s'.", repo_path)
         return None
@@ -3478,11 +3478,11 @@ class WITCH_OT_CutsceneScratchImportCamera(bpy.types.Operator):
 
         before_names = {obj.name for obj in bpy.data.objects}
         try:
-            imported_obj = import_entity.import_ent_template(
+            imported_obj = import_entity.import_entity_file(
                 materialize_entity_repo_path(repo_path, source_game="w3"),
                 load_face_poses=False,
                 import_apperance=0,
-            )
+            ).main_object
         except Exception as exc:
             log.exception("Failed to import cutscene camera '%s'.", repo_path)
             self.report({'ERROR'}, f"Could not import camera entity: {exc}")
