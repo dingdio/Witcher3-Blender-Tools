@@ -180,8 +180,8 @@ def _configured_depot_roots(context=None, *, world_path: str = "") -> list[str]:
         pass
 
     try:
-        from .. import ADDON_NAME
-        prefs = context.preferences.addons[ADDON_NAME].preferences
+        from .. import _get_prefs
+        prefs = _get_prefs(context)
     except Exception:
         prefs = None
     redkit_depot = str(getattr(prefs, "redkit_depot_path", "") or "").strip() if prefs else ""

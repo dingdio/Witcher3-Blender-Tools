@@ -32,13 +32,19 @@ def _get_addon_prefs():
     ctx = getattr(bpy, "context", None) if "bpy" in globals() else None
     prefs_root = getattr(ctx, "preferences", None) if ctx else None
     addons = getattr(prefs_root, "addons", None) if prefs_root else None
-    if not addons:
-        return None
+    if addons:
+        try:
+            addon_entry = addons.get(addon_name) if hasattr(addons, "get") else addons[addon_name]
+        except Exception:
+            addon_entry = None
+        prefs = getattr(addon_entry, "preferences", None)
+        if prefs is not None:
+            return prefs
     try:
-        addon_entry = addons.get(addon_name) if hasattr(addons, "get") else addons[addon_name]
+        from .. import _get_prefs
+        return _get_prefs(ctx)
     except Exception:
         return None
-    return getattr(addon_entry, "preferences", None)
 
 
 # Win32 has no single 260-char MAX_PATH limit: CreateDirectoryW (os.makedirs) rejects

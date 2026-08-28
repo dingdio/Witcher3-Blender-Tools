@@ -61,6 +61,21 @@ def _load_dev_pref_overrides():
 
     return defaults, redkit_projects, unreal_projects
 
+def _checked_dev_override(key, value):
+    """Replace an invalid dev game path with auto-detection."""
+    if key != "witcher_game_path" or not value or is_valid_witcher3_game_path(value):
+        return value
+    detected = auto_detect_witcher3_game_path() or ""
+    try:
+        from .dev import dev_config
+        config_path = dev_config.get_config_path()
+    except Exception:
+        config_path = "dev_config.json"
+    log.warning("%s: witcher_game_path %r has no witcher3.exe; using auto-detected %r",
+                config_path, value, detected)
+    return detected
+
+
 def _apply_dev_pref_overrides(prefs):
     """Apply dev-only defaults without overwriting existing user preferences."""
     defaults, redkit_projects, unreal_projects = _load_dev_pref_overrides()
@@ -77,7 +92,9 @@ def _apply_dev_pref_overrides(prefs):
             continue
         if current:
             continue
-        setattr(prefs, key, value)
+        value = _checked_dev_override(key, value)
+        if value:
+            setattr(prefs, key, value)
 
     if redkit_projects and hasattr(prefs, "redkit_projects") and len(prefs.redkit_projects) == 0:
         for path in redkit_projects:
@@ -217,50 +234,50 @@ def is_verbose_logging() -> bool:
     Safe to call even when no context is available."""
     try:
         import bpy
-        prefs = bpy.context.preferences.addons[ADDON_NAME].preferences
+        prefs = _get_prefs(bpy.context)
         return prefs.verbose_logging
     except Exception:
         return False
 
 def get_game_path(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     witcher_game_path = addon_prefs.witcher_game_path
     return witcher_game_path
 
 def get_witcher2_game_path(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     return addon_prefs.witcher2_game_path
 
 def get_uncook_path(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     uncook_path = addon_prefs.uncook_path
     return uncook_path
 
 def get_mod_directory(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     mod_directory = addon_prefs.mod_directory
     return mod_directory
 
 def get_wolvenkit(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     wolvenkit = addon_prefs.wolvenkit
     return wolvenkit
 
 def get_radish_tools_path(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     return addon_prefs.radish_tools_path
 
 def get_wwise_console_path(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     return getattr(addon_prefs, "wwise_console_path", "")
 
 def get_fbx_uncook_path(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     fbx_uncook_path = addon_prefs.fbx_uncook_path
     return fbx_uncook_path
 
 def get_texture_path(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     use_separate = bool(getattr(addon_prefs, "use_separate_texture_uncook_path", False))
     if use_separate:
         tex_uncook_path = str(getattr(addon_prefs, "tex_uncook_path", "") or "").strip()
@@ -269,33 +286,31 @@ def get_texture_path(context) -> str:
     return addon_prefs.uncook_path
 
 def get_w2_unbundle_path(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     w2_unbundle_path = addon_prefs.w2_unbundle_path
     return w2_unbundle_path
 
 def get_modded_texture_path(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     tex_mod_uncook_path = addon_prefs.tex_mod_uncook_path
     return tex_mod_uncook_path
 
 def get_tex_ext(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     tex_ext = addon_prefs.tex_ext
     return tex_ext
 
 def get_W3_VOICE_PATH(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     W3_VOICE_PATH = addon_prefs.W3_VOICE_PATH
     return W3_VOICE_PATH
 
 def get_W3_OGG_PATH(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     # Compatibility alias: audio conversions now use the same folder as lipsync extraction.
     return addon_prefs.W3_VOICE_PATH
 
 def get_vgmstream_path(context) -> str:
-    #addon_prefs = context.preferences.addons[ADDON_NAME].preferences
-    #vgmstream_path = addon_prefs.vgmstream_path
     script_dir = os.path.dirname(os.path.abspath(__file__))
     exe_name = r"CR2W\third_party_libs\vgmstream-win64\vgmstream-cli.exe"
     exe_path = os.path.join(script_dir, exe_name)
@@ -303,7 +318,7 @@ def get_vgmstream_path(context) -> str:
     return vgmstream_path
 
 def get_all_addon_prefs(context):
-    return context.preferences.addons[ADDON_NAME].preferences
+    return _get_prefs(context)
 
 
 def _get_registered_addon_prefs(context=None):
@@ -320,60 +335,88 @@ def _get_registered_addon_prefs(context=None):
             return addon.preferences
     return None
 
+
+class _HeadlessPrefs:
+    """Fallback preferences for headless Blender sessions."""
+
+    def __init__(self):
+        # bl_rna only carries the props once registered; the deferred annotations hold the defaults.
+        for name, prop in (getattr(Witcher3AddonPrefs, "__annotations__", None) or {}).items():
+            keywords = getattr(prop, "keywords", None) or {}
+            setattr(self, name, keywords.get("default", ""))
+        defaults, _, _ = _load_dev_pref_overrides()
+        for key, value in (defaults or {}).items():
+            value = _checked_dev_override(key, value)
+            if value:
+                setattr(self, key, value)
+
+
+_headless_prefs = None
+
+
+def _get_prefs(context=None):
+    prefs = _get_registered_addon_prefs(context)
+    if prefs is not None:
+        return prefs
+    global _headless_prefs
+    if _headless_prefs is None:
+        _headless_prefs = _HeadlessPrefs()
+    return _headless_prefs
+
 def get_do_import_redcloth(context) -> bool:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     return bool(getattr(addon_prefs, "do_import_redcloth", True))
 
 def get_DO_WEAR_CLOTH(context) -> bool:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     return bool(getattr(addon_prefs, "DO_WEAR_CLOTH", True))
 
 def get_redcloth_simulation_enabled(context) -> bool:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     return bool(getattr(addon_prefs, "redcloth_simulation_enabled", True))
 
 def get_redcloth_wind_velocity(context) -> float:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     try:
         return float(getattr(addon_prefs, "redcloth_wind_velocity", 0.0))
     except Exception:
         return 0.0
 
 def get_W3_FOLIAGE_PATH(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     W3_FOLIAGE_PATH = addon_prefs.W3_FOLIAGE_PATH or addon_prefs.uncook_path
     return W3_FOLIAGE_PATH
 
 def get_W3_REDCLOTH_PATH(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     W3_REDCLOTH_PATH = addon_prefs.W3_REDCLOTH_PATH or addon_prefs.uncook_path
     return W3_REDCLOTH_PATH
 
 def get_W3_REDFUR_PATH(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     W3_REDFUR_PATH = addon_prefs.W3_REDFUR_PATH or addon_prefs.uncook_path
     return W3_REDFUR_PATH
 
 def get_use_fbx_repo(context) -> str:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     use_fbx_repo = addon_prefs.use_fbx_repo
     return use_fbx_repo
 
 def get_do_fix_tail(context) -> bool:
-    addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+    addon_prefs = _get_prefs(context)
     do_fix_tail = addon_prefs.do_fix_tail
     return do_fix_tail
 
 def get_unify_character_armature(context) -> bool:
     try:
-        addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+        addon_prefs = _get_prefs(context)
         return bool(getattr(addon_prefs, "premerge_character_armature", False))
     except Exception:
         return False
 
 def get_import_physics_enabled(context) -> bool:
     try:
-        addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+        addon_prefs = _get_prefs(context)
         return bool(getattr(addon_prefs, "import_physics_enabled", True))
     except Exception:
         return True
@@ -4984,7 +5027,7 @@ class WITCH_PT_ExternalPaths(WITCH_PT_Base, bpy.types.Panel):
     # Reorganized path shortcuts into collapsible inspector sections so common paths stay on top.
     def draw(self, context):
         layout = self.layout
-        addon_prefs = context.preferences.addons[ADDON_NAME].preferences
+        addon_prefs = _get_prefs(context)
         _draw_external_path_sections(layout, addon_prefs, section_prefix="witcher_extpaths_legacy")
 
 class WITCH_PT_Quick(WITCH_PT_Base, bpy.types.Panel):
