@@ -31,7 +31,9 @@ def _load_catalog_functions(cache_root):
         "get_category_cache_file",
         "build_w3_category_cache_source_signature",
         "_bundle_xml_cache_has_xml",
+        "_bundle_xml_cache_is_complete",
         "_w3_bundle_xml_source_snapshot",
+        "_w3_bundle_xml_extraction_recovers",
         "_w3_category_cache_is_current",
         "_w3_loaded_category_cache_is_stale",
         "reset_w3_category_cache_runtime",
@@ -70,6 +72,8 @@ def _load_catalog_functions(cache_root):
         "_CATEGORY_CACHE_SCHEMA_VERSION": 2,
         "_CATEGORY_SOURCE_VALIDATION_INTERVAL_SECONDS": 5.0,
         "_CATEGORY_REFRESH_RETRY_INTERVAL_SECONDS": 30.0,
+        "_BUNDLE_XML_RETRY_INTERVAL_SECONDS": 300.0,
+        "_BUNDLE_XML_RECOVERY_STATE": {"checked_at": None},
         "_W3_CATEGORY_BUNDLE_STATE": {
             "loaded": False,
             "stale": False,
@@ -91,6 +95,16 @@ class _BundleItem:
         path = Path(file_name)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(self.contents, encoding="utf-8")
+
+
+class _FailingBundleItem:
+    def __init__(self, name):
+        self.name = name
+
+    def extract_to_file(self, file_name):
+        # Failed extraction can leave empty directories.
+        Path(file_name).parent.mkdir(parents=True, exist_ok=True)
+        raise OSError("simulated extraction failure")
 
 
 class EquipmentBundleXmlCacheTests(unittest.TestCase):
@@ -504,6 +518,99 @@ class EquipmentBundleXmlCacheTests(unittest.TestCase):
         self.assertEqual(checks, [True])
         self.assertEqual(refreshes, [True])
         self.assertEqual(self.attributes, {})
+
+    def test_failed_extraction_is_not_reported_as_source(self):
+        self.items = {
+            r"gameplay\items\defs.xml": _FailingBundleItem("defs"),
+            r"dlc\dlc10\data\gameplay\items\dlc10_wolf_swords.xml": _FailingBundleItem("wolf"),
+        }
+
+        result = self.namespace["extract_equipment_xmls_from_bundles"]()
+
+        self.assertEqual(result, "")
+        self.assertFalse(self.namespace["_bundle_xml_cache_has_xml"]())
+
+    def test_partial_extraction_is_incomplete_and_retried(self):
+        wolf = r"dlc\dlc10\data\gameplay\items\dlc10_wolf_swords.xml"
+        self.items = {
+            r"gameplay\items\defs.xml": _BundleItem("defs", "ok"),
+            wolf: _FailingBundleItem("wolf"),
+        }
+
+        result = self.namespace["extract_equipment_xmls_from_bundles"]()
+
+        self.assertEqual(Path(result), self._xml_root())
+        self.assertTrue(self.namespace["_bundle_xml_cache_has_xml"]())
+        self.assertFalse(self.namespace["_bundle_xml_cache_is_complete"]())
+        _signature, _source, present = self.namespace["_w3_bundle_xml_source_snapshot"]()
+        self.assertFalse(present)
+
+        self.items[wolf] = _BundleItem("wolf", "ok")
+        self.assertTrue(self.namespace["_w3_bundle_xml_extraction_recovers"]())
+        self.assertTrue(self.namespace["_bundle_xml_cache_is_complete"]())
+        self.assertEqual(self.reset_calls, [True, True])
+
+    def test_catalog_built_without_bundle_xml_rebuilds_once_extraction_recovers(self):
+        self._write_category_cache(signature_marker={})
+        self.items = {r"gameplay\items\defs.xml": _BundleItem("defs", "recovered")}
+
+        loaded = self.namespace["load_category_cache"]("w3")
+
+        self.assertFalse(loaded)
+        self.assertTrue(self.namespace["_W3_CATEGORY_BUNDLE_STATE"]["stale"])
+        self.assertTrue(self.namespace["_bundle_xml_cache_has_xml"]())
+
+    def test_catalog_built_without_bundle_xml_rebuilds_when_xml_completed_earlier(self):
+        # Extraction succeeded through another path before the catalog was reloaded;
+        # an already-complete XML cache must count as recovered, without re-extracting.
+        self._write_category_cache(signature_marker={})
+        self.items = {r"gameplay\items\defs.xml": _BundleItem("defs", "ok")}
+        self.namespace["extract_equipment_xmls_from_bundles"]()
+        self.assertTrue(self.namespace["_bundle_xml_cache_is_complete"]())
+        self.reset_calls.clear()
+
+        loaded = self.namespace["load_category_cache"]("w3")
+
+        self.assertFalse(loaded)
+        self.assertTrue(self.namespace["_W3_CATEGORY_BUNDLE_STATE"]["stale"])
+        self.assertEqual(self.reset_calls, [])
+
+    def test_legacy_cache_without_bundle_xml_rebuilds_once_extraction_recovers(self):
+        self._write_category_cache(signature_marker=None)
+        self.items = {r"gameplay\items\defs.xml": _BundleItem("defs", "recovered")}
+
+        loaded = self.namespace["load_category_cache"]("w3")
+
+        self.assertFalse(loaded)
+        self.assertTrue(self.namespace["_W3_CATEGORY_BUNDLE_STATE"]["stale"])
+
+    def test_catalog_without_bundle_xml_stays_valid_while_extraction_fails(self):
+        self._write_category_cache(signature_marker={})
+        self.items = {r"gameplay\items\defs.xml": _FailingBundleItem("defs")}
+
+        loaded = self.namespace["load_category_cache"]("w3")
+
+        self.assertTrue(loaded)
+        self.assertIn("armor", self.attributes)
+
+    def test_extraction_recovery_probe_is_throttled(self):
+        self.items = {r"gameplay\items\defs.xml": _FailingBundleItem("defs")}
+
+        self.assertFalse(self.namespace["_w3_bundle_xml_extraction_recovers"]())
+        self.assertFalse(self.namespace["_w3_bundle_xml_extraction_recovers"]())
+
+        self.assertEqual(self.reset_calls, [True])
+
+    def test_loaded_catalog_with_empty_signature_goes_stale_on_recovery(self):
+        self.namespace["_W3_CATEGORY_BUNDLE_STATE"].update({
+            "loaded": True,
+            "stale": False,
+            "signature": {},
+            "source_checked_at": 0.0,
+        })
+        self.items = {r"gameplay\items\defs.xml": _BundleItem("defs", "recovered")}
+
+        self.assertTrue(self.namespace["_w3_loaded_category_cache_is_stale"]())
 
     def test_refresh_operator_requests_forced_bundle_refresh(self):
         tree = ast.parse(UI_PATH.read_text(encoding="utf-8"), filename=str(UI_PATH))

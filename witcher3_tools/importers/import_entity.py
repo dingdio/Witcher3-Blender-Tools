@@ -4572,6 +4572,27 @@ def _resolve_inventory_item(item_raw, item_lookup, template_lookup):
             return template_lookup[key]
     return None
 
+
+def _lookup_item_attrs(item_attributes, source_game, *identifiers):
+    """Catalog attrs by exact key, then alias lookup; a miss silently loses equip_slot/bound_items."""
+    for identifier in identifiers:
+        if not identifier:
+            continue
+        attrs = item_attributes.get(str(identifier))
+        if attrs:
+            return attrs
+    try:
+        from ..ui.equipment_catalog import get_item_attributes_by_identifier
+    except Exception:
+        return {}
+    for identifier in identifiers:
+        if not identifier:
+            continue
+        attrs = get_item_attributes_by_identifier(str(identifier), source_game)
+        if attrs:
+            return attrs
+    return {}
+
 def _find_slot_by_item_or_template(slots, item_raw):
     keys = set(_candidate_item_keys(item_raw))
     if not keys:
@@ -4825,22 +4846,21 @@ def _apply_inventory_mounts(context, armature, selected_appearance, rig_settings
         slot.item_name = item_name
         slot.equip_template = template
 
-        attrs = item_attributes.get(item_name, {})
-        if not attrs and item_raw:
-            attrs = item_attributes.get(str(item_raw), {})
+        attrs = _lookup_item_attrs(item_attributes, source_game, item_name, item_raw, template)
         if attrs:
             slot.equip_slot = attrs.get('equip_slot', slot.equip_slot)
             slot.hold_slot = attrs.get('hold_slot', slot.hold_slot)
             slot.weapon = attrs.get('weapon', slot.weapon)
             slot.attachment_type = attrs.get('attachment_type', '')
-            try:
-                slot.variants_json = json.dumps(attrs.get('variants', []))
-            except Exception:
-                slot.variants_json = ""
-            try:
-                slot.bound_items_json = json.dumps(attrs.get('bound_items', []))
-            except Exception:
-                slot.bound_items_json = ""
+        # Always assign: a reused slot must not keep another item's variants/bound items.
+        try:
+            slot.variants_json = json.dumps(attrs.get('variants', []))
+        except Exception:
+            slot.variants_json = ""
+        try:
+            slot.bound_items_json = json.dumps(attrs.get('bound_items', []))
+        except Exception:
+            slot.bound_items_json = ""
         slot.base_equip_template = template
 
         if slot is None or slot_index is None:
@@ -7823,7 +7843,9 @@ def import_app(context,
 
         # Populate extra attributes if available
         try:
-            attrs = item_attributes.get(default_item, {})
+            attrs = _lookup_item_attrs(
+                item_attributes, source_game, slot.item_name, default_item, equip_template
+            )
             if attrs:
                 slot.equip_slot = attrs.get('equip_slot', slot.equip_slot)
                 slot.hold_slot = attrs.get('hold_slot', slot.hold_slot)

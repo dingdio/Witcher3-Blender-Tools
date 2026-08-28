@@ -48,6 +48,8 @@ _CATEGORY_CACHE_FILE = Path(get_cache_root(create=True)) / "equipment_categories
 _CATEGORY_CACHE_SCHEMA_VERSION = 2
 _CATEGORY_SOURCE_VALIDATION_INTERVAL_SECONDS = 5.0
 _CATEGORY_REFRESH_RETRY_INTERVAL_SECONDS = 30.0
+_BUNDLE_XML_RETRY_INTERVAL_SECONDS = 300.0
+_BUNDLE_XML_RECOVERY_STATE = {"checked_at": None}
 _CATALOG_CACHE_FLAGS = {
     "w3": {"schema_version": 0, "icon_path": False, "hold_template": False},
     "w2": {"schema_version": 0, "icon_path": False, "hold_template": False},
@@ -281,9 +283,19 @@ def _bundle_xml_cache_has_xml():
     )
 
 
+def _bundle_xml_cache_is_complete():
+    """XML present and the last extraction finished without failures; partial caches must retry."""
+    if not _bundle_xml_cache_has_xml():
+        return False
+    root = Path(get_cache_root(create=True)) / "equipment_items_xml_bundle"
+    meta = cache_meta.load_meta(cache_meta.get_meta_path(str(root)))
+    if not isinstance(meta, dict) or not meta.get("signature"):
+        return False
+    return not (meta.get("source") or {}).get("partial")
+
+
 def _w3_bundle_xml_source_snapshot():
-    has_xml = _bundle_xml_cache_has_xml()
-    if not has_xml:
+    if not _bundle_xml_cache_is_complete():
         return {}, {}, False
     root = Path(get_cache_root(create=True)) / "equipment_items_xml_bundle"
     meta = cache_meta.load_meta(cache_meta.get_meta_path(str(root)))
@@ -295,20 +307,43 @@ def _w3_bundle_xml_source_snapshot():
     return dict(meta.get("signature") or {}), source, True
 
 
+def _w3_bundle_xml_extraction_recovers(current_signature=None):
+    """Retry throttled extraction until the bundle XML cache is complete."""
+    if _bundle_xml_cache_is_complete():
+        return True
+    if current_signature is None:
+        current_signature, _source = build_w3_category_cache_source_signature()
+    if not current_signature:
+        return False
+    now = time.monotonic()
+    last = _BUNDLE_XML_RECOVERY_STATE["checked_at"]
+    if last is not None and now - last < _BUNDLE_XML_RETRY_INTERVAL_SECONDS:
+        return False
+    _BUNDLE_XML_RECOVERY_STATE["checked_at"] = now
+    extract_equipment_xmls_from_bundles()
+    return _bundle_xml_cache_is_complete()
+
+
 def _w3_category_cache_is_current(cache_file, cache_data):
     has_snapshot = "bundle_xml_source_signature" in cache_data
     stored_signature = cache_data.get("bundle_xml_source_signature") or {}
     current_signature, _source = build_w3_category_cache_source_signature()
 
-    # Empty stored signatures are manual caches; empty current ones preserve last-good data.
+    # Empty current signatures preserve last-good data while sources are unavailable.
+    if not current_signature:
+        return True
+
     if has_snapshot:
-        if not stored_signature or not current_signature:
-            return True
+        if not stored_signature:
+            # Built while the bundle XML cache was empty (failed extraction or
+            # no bundles at the time); rebuild once extraction recovers.
+            return not _w3_bundle_xml_extraction_recovers(current_signature)
         return cache_meta.signatures_match(stored_signature, current_signature)
 
-    # Preserve legacy manual caches and last-good data while sources are unavailable.
-    if not _bundle_xml_cache_has_xml() or not current_signature:
-        return True
+    # Legacy caches without a snapshot: rebuild if extraction now recovers,
+    # otherwise preserve last-good data.
+    if not _bundle_xml_cache_is_complete():
+        return not _w3_bundle_xml_extraction_recovers(current_signature)
 
     # Trust legacy caches only when newer than matching bundle metadata.
     bundle_root = Path(get_cache_root(create=True)) / "equipment_items_xml_bundle"
@@ -329,9 +364,9 @@ def _w3_category_cache_is_current(cache_file, cache_data):
 def _w3_loaded_category_cache_is_stale():
     if _W3_CATEGORY_BUNDLE_STATE["stale"]:
         return True
-    stored_signature = _W3_CATEGORY_BUNDLE_STATE.get("signature") or {}
-    if not _W3_CATEGORY_BUNDLE_STATE["loaded"] or not stored_signature:
+    if not _W3_CATEGORY_BUNDLE_STATE["loaded"]:
         return False
+    stored_signature = _W3_CATEGORY_BUNDLE_STATE.get("signature") or {}
     now = time.monotonic()
     if (
         now - float(_W3_CATEGORY_BUNDLE_STATE.get("source_checked_at", 0.0))
@@ -340,6 +375,12 @@ def _w3_loaded_category_cache_is_stale():
         return False
     _W3_CATEGORY_BUNDLE_STATE["source_checked_at"] = now
     current_signature, _source = build_w3_category_cache_source_signature()
+    if not stored_signature:
+        # Loaded from a catalog built without bundle XMLs; rebuild once
+        # extraction recovers so bundle-only (DLC) items reappear.
+        if current_signature and _w3_bundle_xml_extraction_recovers(current_signature):
+            _W3_CATEGORY_BUNDLE_STATE["stale"] = True
+        return _W3_CATEGORY_BUNDLE_STATE["stale"]
     if current_signature and not cache_meta.signatures_match(stored_signature, current_signature):
         _W3_CATEGORY_BUNDLE_STATE["stale"] = True
     return _W3_CATEGORY_BUNDLE_STATE["stale"]
@@ -555,7 +596,7 @@ def load_category_cache(source_game="w3"):
         clear_item_attribute_identifier_lookup(source_game)
         if source_game == "w3":
             bundle_signature = dict(cache_data.get("bundle_xml_source_signature") or {})
-            if not bundle_signature and "bundle_xml_source_signature" not in cache_data and _bundle_xml_cache_has_xml():
+            if not bundle_signature and "bundle_xml_source_signature" not in cache_data and _bundle_xml_cache_is_complete():
                 bundle_signature, _source = build_w3_category_cache_source_signature()
             _W3_CATEGORY_BUNDLE_STATE.update({
                 "loaded": True,
@@ -1011,6 +1052,18 @@ def extract_equipment_xmls_from_bundles(force_refresh=False):
     if found == 0:
         return out_root if has_cached_xml else ""
 
+    if failed:
+        log.warning(
+            "Equipment XML bundle extraction failed for %d of %d file(s); "
+            "bundle-only (DLC) items will be missing until it succeeds",
+            found - len(extracted_files),
+            found,
+        )
+        # Mark the cache partial so currency checks keep retrying instead of trusting it.
+        source = dict(source or {})
+        source.update({"partial": True, "extracted_files": sorted(extracted_files)})
+        cache_meta.save_meta(meta_path, cache_meta.make_meta("equipment_items_xml_bundle", out_root, {}, source))
+
     if not failed and signature:
         previous_files = set(old_source.get("extracted_files") or [])
         retry_removals = set()
@@ -1032,6 +1085,9 @@ def extract_equipment_xmls_from_bundles(force_refresh=False):
         source["pending_removals"] = sorted(retry_removals)
         meta = cache_meta.make_meta("equipment_items_xml_bundle", out_root, signature, source)
         cache_meta.save_meta(meta_path, meta)
+    # An extraction that produced nothing must not be offered as an XML source.
+    if not _bundle_xml_cache_has_xml():
+        return ""
     return out_root
 
 
