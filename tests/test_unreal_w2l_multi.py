@@ -15,20 +15,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 
-class _BlockDataObjectType:
-    Mesh = 0
-    RigidBody = 1
-    Collision = 2
-    PointLight = 3
-    SpotLight = 4
-    Invalid = 5
-    Decal = 6
-
-
-class _Enums:
-    BlockDataObjectType = _BlockDataObjectType
-
-
 def _install_pkg_stubs():
     pkg = sys.modules.get("witcher3_tools")
     if pkg is None or not getattr(pkg, "__path__", None):
@@ -36,15 +22,6 @@ def _install_pkg_stubs():
         pkg.__path__ = [str(REPO_ROOT / "witcher3_tools")]
         pkg.__package__ = "witcher3_tools"
         sys.modules["witcher3_tools"] = pkg
-
-    crw = types.ModuleType("witcher3_tools.CR2W")
-    crw.__path__ = [str(REPO_ROOT / "witcher3_tools" / "CR2W")]
-    crw.__package__ = "witcher3_tools.CR2W"
-    helpers = types.ModuleType("witcher3_tools.CR2W.CR2W_helpers")
-    helpers.Enums = _Enums
-    crw.CR2W_helpers = helpers
-    sys.modules["witcher3_tools.CR2W"] = crw
-    sys.modules["witcher3_tools.CR2W.CR2W_helpers"] = helpers
 
     importers = types.ModuleType("witcher3_tools.importers")
     importers.__path__ = [str(REPO_ROOT / "witcher3_tools" / "importers")]
@@ -59,7 +36,10 @@ def _install_pkg_stubs():
 
 _install_pkg_stubs()
 
+from witcher3_tools.CR2W.CR2W_helpers import Enums  # noqa: E402
 from witcher3_tools.unreal_export import terrain_unreal, w2l_placements  # noqa: E402
+
+_BlockDataObjectType = Enums.BlockDataObjectType
 
 
 _IDENT_ROWS = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]

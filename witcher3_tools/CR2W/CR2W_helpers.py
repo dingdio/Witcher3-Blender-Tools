@@ -103,6 +103,8 @@ class Enums:
     ,"ESkeletonBoneFlags"]
 
     Enum_Types = ["EDM_MappinType"
+    ,"ELinkedSocketPlacement"
+    ,"ELinkedSocketDirection"
     ,"BlockDataObjectType"
     ,"EFactValueChangeMethod"
     ,"EQuestPadVibrationStrength"

@@ -39,6 +39,13 @@ def write_w2cutscene(cr2w, file_path):
         f.write(data)
 
 
+def write_w2scene(cr2w, file_path):
+    _ensure_parent_dir(file_path)
+    data = _build_cr2w_bytes(cr2w)
+    with open(file_path, "wb") as f:
+        f.write(data)
+
+
 def write_w2ent(cr2w, file_path):
     _ensure_parent_dir(file_path)
     data = _build_cr2w_bytes(cr2w)
@@ -769,7 +776,11 @@ def _encode_array_element(el, elem_type, name_to_index, import_index):
         return struct.pack("<B", 1 if getattr(el, "Value", el) else 0)
 
     if isinstance(el, PROPERTY):
-        return _encode_property_value(el, name_to_index, import_index)
+        encoded = _encode_property_value(el, name_to_index, import_index)
+        if not encoded:
+            # Preserve empty inline structs so the array count stays aligned.
+            encoded = _encode_cvariable([], name_to_index, import_index)
+        return encoded
     if isinstance(el, CVariantSizeNameType) and el.PROP:
         return _encode_variant_size_name_type(el, name_to_index, import_index)
     if isinstance(el, CMatrix4x4):

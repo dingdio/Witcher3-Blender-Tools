@@ -3935,6 +3935,8 @@ def _cutscene_generated_actor_kind(actor_obj, actor_name, repo_path):
     actor_name = str(actor_name or "").strip().lower()
     repo_path = _cutscene_normalize_repo_path(repo_path).lower()
     generated_prop = str(actor_obj.get("cutscene_generated_actor_template", "") or "").strip().lower()
+    if actor_obj.get("cutscene_prop_rig"):
+        return "props"
     if generated_prop == "trajectories":
         return "trajectories"
     if actor_name == "trajectories" and os.path.basename(repo_path).endswith("_trajectories.w2ent"):
@@ -3995,13 +3997,28 @@ def _cutscene_write_generated_actor_template_entries(context, entries, force=Fal
         arm_obj = entry.get("object")
         if not full_path:
             raise RuntimeError(f"No REDkit project path for generated actor: {repo_path}")
-        if kind != "trajectories":
+        if kind not in ("trajectories", "props"):
             raise RuntimeError(f"Unsupported generated actor type: {kind or 'unknown'}")
         if os.path.isfile(full_path) and not force:
             entry["exists"] = True
             continue
         if arm_obj is None:
             raise RuntimeError(f"No Blender actor found for generated actor: {repo_path}")
+        if kind == "props":
+            from ..animation import cutscene_bake
+
+            attachments = cutscene_bake.collect_prop_attachments(getattr(context, "scene", None))
+            animated_component_builder.generate_entity(
+                attachments,
+                full_path,
+                entity_name=os.path.splitext(entry.get("basename") or "props")[0],
+            )
+            if not os.path.isfile(full_path):
+                raise RuntimeError(f"Generated actor file was not created: {repo_path}")
+            entry["exists"] = True
+            entry["attachment_count"] = len(attachments)
+            written.append(entry)
+            continue
         attachments, skipped = ui_animated_component.collect_hard_attachment_export_data(arm_obj)
         if skipped:
             skipped_names = ", ".join(skipped[:4])

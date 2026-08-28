@@ -11059,12 +11059,6 @@ class WITCHER_PT_AssetBrowser(Panel):
         ref_row.operator("witcher.character_image_browser", text="Characters", icon='OUTLINER_OB_ARMATURE')
         ref_row = char_col.row(align=True)
         ref_row.operator("witcher.location_image_browser", text="Locations", icon='WORLD')
-        if browser_settings:
-            debug_row = char_col.row(align=True)
-            debug_row.label(text="Location:")
-            debug_row.prop(browser_settings, "location_import_terrain", toggle=True)
-            debug_row.prop(browser_settings, "location_import_foliage", toggle=True)
-            debug_row.prop(browser_settings, "location_import_layers", toggle=True)
 
 
 def register():

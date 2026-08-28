@@ -11,20 +11,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 
-class _BlockDataObjectType:
-    Mesh = 0
-    RigidBody = 1
-    Collision = 2
-    PointLight = 3
-    SpotLight = 4
-    Invalid = 5
-    Decal = 6
-
-
-class _Enums:
-    BlockDataObjectType = _BlockDataObjectType
-
-
 _LOCAL_PARAMS = {"Diffuse": ("handle:ITexture", "tex\\wall_d.xbm"), "Roughness": ("Float", "0.5")}
 
 
@@ -48,15 +34,6 @@ def _install_stubs():
         pkg.__package__ = "witcher3_tools"
         sys.modules["witcher3_tools"] = pkg
 
-    crw = types.ModuleType("witcher3_tools.CR2W")
-    crw.__path__ = [str(REPO_ROOT / "witcher3_tools" / "CR2W")]
-    crw.__package__ = "witcher3_tools.CR2W"
-    helpers = types.ModuleType("witcher3_tools.CR2W.CR2W_helpers")
-    helpers.Enums = _Enums
-    crw.CR2W_helpers = helpers
-    sys.modules["witcher3_tools.CR2W"] = crw
-    sys.modules["witcher3_tools.CR2W.CR2W_helpers"] = helpers
-
     material = types.ModuleType("witcher3_tools.materials.material")
     material.xml_data_from_CR2W = _fake_xml_data_from_CR2W
     sys.modules["witcher3_tools.materials.material"] = material
@@ -64,8 +41,11 @@ def _install_stubs():
 
 _install_stubs()
 
+from witcher3_tools.CR2W.CR2W_helpers import Enums
 from witcher3_tools.unreal_export import terrain_unreal, w2l_placements
 from witcher3_tools.unreal_export import mesh_materials
+
+_BlockDataObjectType = Enums.BlockDataObjectType
 
 
 class _Vec:

@@ -10,7 +10,8 @@
         -36.04,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/white-orchard-village.jpg"
     },
     {
       "name": "Nilfgaardian Garrison",
@@ -21,7 +22,8 @@
         359.94,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/nilfgaardian-garrison.jpg"
     },
     {
       "name": "Crow's Perch",
@@ -32,7 +34,8 @@
         130.25,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/crows-perch.jpg"
     },
     {
       "name": "Keira Metz's Hut",
@@ -45,6 +48,7 @@
       ],
       "radius": 90,
       "description": "",
+      "image_file": "location_previews/keira-metzs-hut.jpg",
       "tiles": [
         "tile_22_x_21"
       ]
@@ -58,7 +62,8 @@
         705.3,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/hanged-mans-tree.jpg"
     },
     {
       "name": "Fyke Isle",
@@ -69,7 +74,8 @@
         -738.23,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/fyke-isle.jpg"
     },
     {
       "name": "Crossroads Inn",
@@ -80,7 +86,8 @@
         535.01,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/crossroads-inn.jpg"
     },
     {
       "name": "Crookback Bog",
@@ -91,7 +98,8 @@
         -905.22,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/crookback-bog.jpg"
     },
     {
       "name": "Bald Mountain",
@@ -102,7 +110,8 @@
         -1209.9,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/bald-mountain.jpg"
     },
     {
       "name": "Passiflora",
@@ -114,7 +123,8 @@
         35.7
       ],
       "radius": 50,
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/passiflora.jpg"
     },
     {
       "name": "Hierarch Square",
@@ -125,7 +135,8 @@
         1885.46,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/hierarch-square.jpg"
     },
     {
       "name": "Temple Isle",
@@ -136,7 +147,8 @@
         2206.43,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/temple-isle.jpg"
     },
     {
       "name": "Novigrad Harbour",
@@ -147,7 +159,8 @@
         1950.46,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/novigrad-harbour.jpg"
     },
     {
       "name": "The Chameleon",
@@ -158,7 +171,8 @@
         1739.06,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/the-chameleon.jpg"
     },
     {
       "name": "Kaer Trolde",
@@ -169,7 +183,8 @@
         695.38,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/kaer-trolde.jpg"
     },
     {
       "name": "Larvik",
@@ -180,7 +195,8 @@
         60.67,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/larvik.jpg"
     },
     {
       "name": "Druids' Camp",
@@ -191,7 +207,8 @@
         233.68,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/druids-camp.jpg"
     },
     {
       "name": "Undvik",
@@ -202,7 +219,8 @@
         -117.15,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/undvik.jpg"
     },
     {
       "name": "Kaer Morhen",
@@ -213,7 +231,8 @@
         -6.29,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/kaer-morhen.jpg"
     },
     {
       "name": "Beauclair",
@@ -224,7 +243,8 @@
         -1398.98,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/beauclair.jpg"
     },
     {
       "name": "Beauclair Palace",
@@ -236,7 +256,8 @@
         167.106
       ],
       "radius": 100,
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/beauclair-palace.jpg"
     },
     {
       "name": "Corvo Bianco",
@@ -247,7 +268,8 @@
         -808.93,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/corvo-bianco.jpg"
     },
     {
       "name": "Dun Tynne",
@@ -258,7 +280,8 @@
         -540.0,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/dun-tynne.jpg"
     },
     {
       "name": "Tournament Grounds",
@@ -269,7 +292,8 @@
         -977.05,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/tournament-grounds.jpg"
     },
     {
       "name": "Vizima Castle",
@@ -280,7 +304,8 @@
         16.79,
         10.0
       ],
-      "description": ""
+      "description": "",
+      "image_file": "location_previews/vizima-castle.jpg"
     }
   ]
 }

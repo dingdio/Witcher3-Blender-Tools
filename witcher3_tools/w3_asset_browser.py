@@ -1750,7 +1750,11 @@ def _merge_locations(builtin_locations, user_locations) -> list[dict]:
         key = _location_identity(item)
         if not all(key):
             continue
-        user_item = dict(item)
+        user_item = {
+            str(field): value
+            for field, value in dict(item).items()
+            if not str(field).startswith("_")
+        }
         user_item["_user_location"] = True
         index = by_key.get(key)
         if index is None:
@@ -1758,7 +1762,12 @@ def _merge_locations(builtin_locations, user_locations) -> list[dict]:
             merged.append(user_item)
         else:
             overlay = dict(merged[index])
+            builtin_image_file = _safe_text(overlay.get("_builtin_image_file"))
+            if not builtin_image_file and not overlay.get("_user_location"):
+                builtin_image_file = _safe_text(overlay.get("image_file"))
             overlay.update(user_item)
+            if builtin_image_file:
+                overlay["_builtin_image_file"] = builtin_image_file
             merged[index] = overlay
     return merged
 
@@ -1806,11 +1815,11 @@ def _save_user_location(location: dict) -> None:
                 pass
 
 
-def _user_location_image_path(image_file: str) -> str:
+def _location_image_path_from_root(image_file: str, root: str) -> str:
     relative = str(image_file or "").strip().replace("/", os.sep).replace("\\", os.sep)
     if not relative or os.path.isabs(relative):
         return ""
-    root = os.path.abspath(get_extension_user_dir(create=False))
+    root = os.path.abspath(root)
     candidate = os.path.abspath(os.path.join(root, relative))
     try:
         if os.path.commonpath((root, candidate)) != root:
@@ -1818,6 +1827,30 @@ def _user_location_image_path(image_file: str) -> str:
     except ValueError:
         return ""
     return candidate if win_path_exists(candidate) else ""
+
+
+def _user_location_image_path(image_file: str) -> str:
+    return _location_image_path_from_root(
+        image_file,
+        get_extension_user_dir(create=False),
+    )
+
+
+def _bundled_location_image_path(image_file: str) -> str:
+    return _location_image_path_from_root(
+        image_file,
+        os.path.dirname(_locations_data_path()),
+    )
+
+
+def _location_entry_image_path(location: dict) -> str:
+    image_file = _safe_text(location.get("image_file"))
+    if location.get("_user_location"):
+        image_path = _user_location_image_path(image_file)
+        if image_path:
+            return image_path
+        image_file = _safe_text(location.get("_builtin_image_file"))
+    return _bundled_location_image_path(image_file)
 
 
 def _location_depot_path(context, value: str) -> str:
@@ -1912,7 +1945,7 @@ def _build_location_entries() -> list[dict]:
         description = _safe_text(loc.get("description", ""))
         position = _location_position_from_value(loc.get("position"))
         image_file = _safe_text(loc.get("image_file", ""))
-        image_path = _user_location_image_path(image_file)
+        image_path = _location_entry_image_path(loc)
         try:
             radius = float(loc.get("radius") or _LOCATION_DEFAULT_RADIUS)
         except Exception:
@@ -1956,18 +1989,20 @@ def _build_location_entries() -> list[dict]:
 def _location_browser_signature():
     base_path = _safe_text(get_game_path() or "")
     uncook_path = _safe_text(get_uncook_path(bpy.context))
+    data_root = os.path.abspath(os.path.dirname(_locations_data_path()))
     data_token = "|".join((
         _file_signature_token(_locations_data_path()),
         _file_signature_token(_user_locations_data_path()),
     ))
     signature_hash = hashlib.sha1(
-        f"{base_path}|{uncook_path}|{data_token}|{JOURNAL_BROWSER_CACHE_VERSION}".encode("utf-8", "ignore")
+        f"{base_path}|{uncook_path}|{data_root}|{data_token}|{JOURNAL_BROWSER_CACHE_VERSION}".encode("utf-8", "ignore")
     ).hexdigest()
     source = {
         "type": "location_browser",
         "browser_key": "LOCATIONS",
         "base_path": base_path,
         "uncook_path": uncook_path,
+        "data_root": data_root,
         "data_token": data_token,
         "version": JOURNAL_BROWSER_CACHE_VERSION,
     }
@@ -2739,8 +2774,59 @@ def _placeholder_icon_path():
     return placeholder_path if win_path_exists(placeholder_path) else ""
 
 
+def _location_square_thumbnail_path(source_path: str) -> str:
+    source_path = _safe_text(source_path)
+    if not source_path or not win_path_exists(source_path):
+        return ""
+
+    cache_key = (
+        f"{os.path.normcase(os.path.abspath(source_path))}|"
+        f"{_file_signature_token(source_path)}|256"
+    )
+    digest = hashlib.sha1(cache_key.encode("utf-8", "ignore")).hexdigest()[:20]
+    thumbnail_path = os.path.join(_icon_cache_dir("LOCATIONS"), f"thumbnail-{digest}.png")
+    if win_path_exists(thumbnail_path):
+        return thumbnail_path
+
+    image = None
+    temp_path = thumbnail_path + ".tmp.png"
+    try:
+        import imbuf
+
+        image = imbuf.load(win_safe_path(source_path))
+        width, height = map(int, image.size)
+        side = min(width, height)
+        if side <= 0:
+            return ""
+        left = (width - side) // 2
+        bottom = (height - side) // 2
+        image.crop((left, bottom), (left + side - 1, bottom + side - 1))
+        if tuple(image.size) != (256, 256):
+            image.resize((256, 256), method="BILINEAR")
+        imbuf.write(image, filepath=win_safe_path(temp_path))
+        os.replace(temp_path, thumbnail_path)
+        return thumbnail_path if win_path_exists(thumbnail_path) else ""
+    except Exception:
+        log.debug("Failed to build square location thumbnail: %s", source_path, exc_info=True)
+        return ""
+    finally:
+        if image is not None:
+            image.free()
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
 def _ensure_entry_icon(preview_collection, entry: dict, fallback_icon: str = "QUESTION"):
     image_path = _safe_text(entry.get("image_path"))
+    if (
+        _safe_text(entry.get("browser_key")).upper() == "LOCATIONS"
+        and image_path
+        and win_path_exists(image_path)
+    ):
+        image_path = _location_square_thumbnail_path(image_path) or image_path
     using_placeholder = False
     if not image_path or not win_path_exists(image_path):
         image_path = _placeholder_icon_path()
@@ -2748,13 +2834,12 @@ def _ensure_entry_icon(preview_collection, entry: dict, fallback_icon: str = "QU
         if not image_path:
             return 0
 
-    preview_key = entry.get("_preview_key")
-    if not preview_key:
-        if using_placeholder:
-            preview_key = "__journal_placeholder_icon__"
-        else:
-            preview_key = f"{_safe_text(entry.get('repo_path'))}|{image_path}"
-        entry["_preview_key"] = preview_key
+    preview_key = (
+        "__journal_placeholder_icon__"
+        if using_placeholder
+        else f"{_safe_text(entry.get('repo_path'))}|{image_path}"
+    )
+    entry["_preview_key"] = preview_key
 
     try:
         icon = preview_collection.get(preview_key)
@@ -3013,6 +3098,14 @@ class _JournalBrowserMixin:
         refresh_op.browser_key = self.journal_browser_key
         if self.journal_browser_key == "LOCATIONS":
             row.operator(MyLocationSaveOperator.bl_idname, text="Save View", icon='ADD')
+            settings = getattr(context.scene, "witcher_file_browser", None)
+            if settings is not None:
+                row.separator()
+                load_row = row.row(align=True)
+                load_row.label(text="Load:")
+                load_row.prop(settings, "location_import_terrain", toggle=True)
+                load_row.prop(settings, "location_import_foliage", toggle=True)
+                load_row.prop(settings, "location_import_layers", toggle=True)
         else:
             row.prop(self, "open_import_dialog", text="Open Dialog")
         row.label(text=f"Shown {len(filtered_previews)}/{len(all_entries)} | Base {base_count} | DLC {sum(dlc_counts.values())}")
@@ -3076,6 +3169,8 @@ class _JournalBrowserMixin:
             exported = _is_exported_depot_path(repo_path)
             box = grid.box()
             row = box.row()
+            if self.journal_browser_key == "LOCATIONS":
+                row.alignment = 'CENTER'
             if icon_id:
                 row.template_icon(icon_value=icon_id, scale=8.0)
             else:
@@ -3083,6 +3178,17 @@ class _JournalBrowserMixin:
 
             action_row = box.row(align=True)
             action_op_id = getattr(self, "_action_operator_bl_idname", MyImageActionOperator.bl_idname)
+            image_path = ""
+            if action_op_id == MyLocationActionOperator.bl_idname:
+                image_path = _safe_text(entry.get("image_path"))
+                if image_path and win_path_exists(image_path):
+                    preview = action_row.operator(
+                        "witcher.texture_preview",
+                        text="",
+                        icon='IMAGE_DATA',
+                    )
+                    preview.file_path = image_path
+                    preview.cache_type = "Workspace"
             op = action_row.operator(action_op_id, text=name)
             if action_op_id == MyLocationActionOperator.bl_idname:
                 op.location_name = name

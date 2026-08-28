@@ -224,6 +224,18 @@ def _collect_cutscene_template_metadata(scene, export_entries, source_cache: Dic
     return merged
 
 
+def _companion_scene_depot_path(scene) -> str:
+    repo = export_anims._strip_text(
+        getattr(scene, "witcher_cutscene_export_repo_path", "")
+    ).replace("/", "\\").lower()
+    if not repo.endswith(".w2cutscene"):
+        return ""
+    folder, _sep, name = repo.rpartition("\\")
+    if folder.endswith("cutscenes"):
+        folder = folder[: -len("cutscenes")] + "scenes"
+    return (folder + "\\" if folder else "") + name[: -len(".w2cutscene")] + ".w2scene"
+
+
 def _resolve_filesystem_export_path(filepath: str) -> str:
     path = bpy.path.abspath(filepath or "")
     if path.startswith("//"):
@@ -1220,6 +1232,11 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
 
     root_events, entry_events = _collect_scene_cutscene_events(scene)
     template_metadata = _collect_cutscene_template_metadata(scene, export_entries, source_cache)
+    if not template_metadata.get("usedInFiles"):
+        companion_scene = _companion_scene_depot_path(scene)
+        if companion_scene:
+            template_metadata["usedInFiles"] = [companion_scene]
+            log.info("usedInFiles defaulted to companion scene '%s'", companion_scene)
     if root_events:
         template_metadata["animevents"] = root_events
     camera_segments = _collect_camera_cut_segments(export_entries, actors)
@@ -1312,6 +1329,19 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
     if not animations:
         log.error("No cutscene animation data found to export")
         return {'CANCELLED'}
+
+    from ..animation.cutscene_bake import SCAFFOLD_ACTORS
+
+    animated_actor_names = {export_anims._strip_text(anim.get("actor", "")) for anim in animations}
+    animated_actor_names |= {a["name"] for a in actors if str(a["name"]).lower() in SCAFFOLD_ACTORS}
+    stale_actors = [a for a in actors if a["name"] not in animated_actor_names]
+    if stale_actors:
+        log.warning(
+            "Dropping %d actor def(s) without animations from the export: %s",
+            len(stale_actors),
+            ", ".join(a["name"] for a in stale_actors),
+        )
+        actors = [a for a in actors if a["name"] in animated_actor_names]
 
     cr2w = anims_builder.build_w2cutscene(
         actors=actors,

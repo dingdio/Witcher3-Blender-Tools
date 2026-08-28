@@ -26,13 +26,18 @@ def _load_location_helpers():
         "_iter_descendant_collections",
         "_world_root_has_complete_layer_tree",
         "_terrain_tiles_within_radius",
+        "_locations_data_path",
         "_user_locations_data_path",
         "_read_locations_file",
         "_location_identity",
         "_merge_locations",
         "_save_user_location",
+        "_location_image_path_from_root",
         "_user_location_image_path",
+        "_bundled_location_image_path",
+        "_location_entry_image_path",
         "_location_preview_relative_path",
+        "_location_browser_signature",
     }
     nodes = [
         node for node in tree.body
@@ -51,11 +56,18 @@ def _load_location_helpers():
         "os": os,
         "re": re,
         "log": SimpleNamespace(warning=lambda *_args, **_kwargs: None),
+        "bpy": SimpleNamespace(context=None),
+        "__file__": str(BROWSER_PATH),
+        "_LOCATIONS_DATA_FILE": "locations.json",
         "_LOCATION_PREVIEW_DIR": "location_previews",
         "_USER_LOCATIONS_DATA_FILE": "user_locations.json",
         "_safe_text": lambda value: str(value or "").strip(),
         "get_extension_user_dir": lambda create=True: tempfile.gettempdir(),
+        "get_game_path": lambda: "",
+        "get_uncook_path": lambda _context: "",
         "win_path_exists": os.path.exists,
+        "_file_signature_token": lambda _path: "same",
+        "JOURNAL_BROWSER_CACHE_VERSION": 1,
         "_grid_tile_bounds": terrain_core.terrain_tile_bounds,
         "_grid_tile_from_world_position": terrain_core.terrain_tile_from_world_position,
     }
@@ -105,6 +117,9 @@ class LocationSystemTests(unittest.TestCase):
                     isinstance(value, (int, float))
                     for value in location["position"]
                 ))
+                image_file = location.get("image_file")
+                self.assertTrue(image_file)
+                self.assertTrue((LOCATIONS_PATH.parent / image_file).is_file())
 
         palace = next(item for item in locations if item["name"] == "Beauclair Palace")
         self.assertEqual(palace["position"], [-696.63, -1207.23, 167.106])
@@ -137,6 +152,7 @@ class LocationSystemTests(unittest.TestCase):
             "world_path": r"dlc\bob\bob.w2w",
             "position": [1, 2, 3],
             "radius": 100,
+            "image_file": "location_previews/builtin-palace.jpg",
         }]
         user = [{
             "name": "palace",
@@ -151,6 +167,10 @@ class LocationSystemTests(unittest.TestCase):
         self.assertEqual(merged[0]["world_path"], builtin[0]["world_path"])
         self.assertEqual(merged[0]["radius"], 100)
         self.assertEqual(merged[0]["position"], [4, 5, 6])
+        self.assertEqual(
+            merged[0]["_builtin_image_file"],
+            "location_previews/builtin-palace.jpg",
+        )
         self.assertTrue(merged[0]["_user_location"])
 
     def test_user_preview_path_cannot_escape_extension_storage(self):
@@ -169,6 +189,106 @@ class LocationSystemTests(unittest.TestCase):
                 self.assertEqual(HELPERS["_user_location_image_path"](str(preview)), "")
             finally:
                 HELPERS["get_extension_user_dir"] = original
+
+    def test_bundled_preview_path_cannot_escape_package_data(self):
+        image_file = "location_previews/passiflora.jpg"
+        self.assertEqual(
+            HELPERS["_bundled_location_image_path"](image_file),
+            str(LOCATIONS_PATH.parent / image_file),
+        )
+        self.assertEqual(HELPERS["_bundled_location_image_path"]("../escape.jpg"), "")
+        self.assertEqual(
+            HELPERS["_bundled_location_image_path"](str(LOCATIONS_PATH)),
+            "",
+        )
+
+    def test_missing_user_preview_falls_back_only_to_its_builtin_location(self):
+        original_user_dir = HELPERS["get_extension_user_dir"]
+        original_locations_path = HELPERS["_locations_data_path"]
+        with tempfile.TemporaryDirectory() as root:
+            package_data = Path(root, "package", "CR2W", "data")
+            user_data = Path(root, "user")
+            builtin_preview = package_data / "location_previews" / "builtin.jpg"
+            user_preview = user_data / "location_previews" / "custom.jpg"
+            builtin_preview.parent.mkdir(parents=True)
+            user_preview.parent.mkdir(parents=True)
+            builtin_preview.write_bytes(b"builtin")
+            user_preview.write_bytes(b"user")
+            HELPERS["get_extension_user_dir"] = lambda create=True: str(user_data)
+            HELPERS["_locations_data_path"] = lambda: str(package_data / "locations.json")
+            try:
+                user_overlay = {
+                    "name": "Palace",
+                    "map": "Toussaint",
+                    "image_file": "location_previews/custom.jpg",
+                }
+                merged = HELPERS["_merge_locations"](
+                    [{
+                        "name": "Palace",
+                        "map": "Toussaint",
+                        "image_file": "location_previews/builtin.jpg",
+                    }],
+                    [user_overlay, dict(user_overlay)],
+                )
+                self.assertEqual(
+                    HELPERS["_location_entry_image_path"](merged[0]),
+                    str(user_preview),
+                )
+                user_preview.unlink()
+                self.assertEqual(
+                    HELPERS["_location_entry_image_path"](merged[0]),
+                    str(builtin_preview),
+                )
+
+                standalone_item = {
+                    "name": "Standalone",
+                    "map": "Toussaint",
+                    "image_file": "location_previews/builtin.jpg",
+                    "_builtin_image_file": "location_previews/builtin.jpg",
+                }
+                standalone = HELPERS["_merge_locations"](
+                    [],
+                    [standalone_item, dict(standalone_item)],
+                )[0]
+                self.assertNotIn("_builtin_image_file", standalone)
+                self.assertEqual(HELPERS["_location_entry_image_path"](standalone), "")
+            finally:
+                HELPERS["get_extension_user_dir"] = original_user_dir
+                HELPERS["_locations_data_path"] = original_locations_path
+
+    def test_location_cache_signature_tracks_package_data_root(self):
+        original_locations_path = HELPERS["_locations_data_path"]
+        try:
+            HELPERS["_locations_data_path"] = lambda: os.path.join("first", "locations.json")
+            first, _source = HELPERS["_location_browser_signature"]()
+            HELPERS["_locations_data_path"] = lambda: os.path.join("second", "locations.json")
+            second, _source = HELPERS["_location_browser_signature"]()
+            self.assertNotEqual(first, second)
+        finally:
+            HELPERS["_locations_data_path"] = original_locations_path
+
+    def test_location_grid_uses_square_thumbnails_and_asset_preview_popup(self):
+        tree = ast.parse(BROWSER_PATH.read_text(encoding="utf-8"), filename=str(BROWSER_PATH))
+        ensure_icon = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_ensure_entry_icon"
+        )
+        browser_mixin = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "_JournalBrowserMixin"
+        )
+        draw = next(
+            node for node in browser_mixin.body
+            if isinstance(node, ast.FunctionDef) and node.name == "draw"
+        )
+        ensure_source = ast.unparse(ensure_icon)
+        draw_source = ast.unparse(draw)
+
+        self.assertIn("_location_square_thumbnail_path(image_path) or image_path", ensure_source)
+        self.assertIn("row.alignment = 'CENTER'", draw_source)
+        self.assertIn("witcher.texture_preview", draw_source)
+        self.assertIn("preview.file_path = image_path", draw_source)
+        self.assertIn("preview.cache_type = 'Workspace'", draw_source)
 
     def test_malformed_user_file_is_not_overwritten(self):
         original = HELPERS["get_extension_user_dir"]
