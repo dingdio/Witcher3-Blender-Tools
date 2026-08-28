@@ -1,14 +1,14 @@
-"""Author and export skeleton-bound CAnimatedComponent entities."""
+"""Entity Builder: author and export .w2ent templates (cutscene trajectory props, rigged, static)."""
 
 import json
 import logging
 import os
+from math import degrees
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, StringProperty
 
 from ..CR2W import animated_component as ac
-from .. import get_wolvenkit
 from .. import get_uncook_path
 from ..rigging.attachment import coerce_attachment_flags, normalize_engine_transform
 from ..ui.ui_utils import WITCH_PT_Base
@@ -23,11 +23,21 @@ P_NAME = "witcher_name"
 P_PATH = "witcher_path"
 P_ENTITY_PATH = "witcher_entity_path"
 P_BEHAVIOR = "witcher_behavior_path"
+# Builder-only markers; export is limited to entities authored here (imported
+# entities would lose every component the builder doesn't model).
+P_BUILDER = "witcher_entity_builder"
+P_KIND = "witcher_entity_kind"
 
 T_ANIMATED_COMPONENT = "CAnimatedComponent"
 T_MESH_COMPONENT = "CMeshComponent"
+T_STATIC_MESH_COMPONENT = "CStaticMeshComponent"
 P_ATTACHMENT_FLAGS = "witcher_attachment_flags"
 P_ATTACHMENT_RELATIVE = "witcher_hard_attachment_relative_transform"
+
+KIND_TRAJECTORY, KIND_ANIMATED, KIND_STATIC = "TRAJECTORY", "ANIMATED", "STATIC"
+_KIND_LABELS = {KIND_TRAJECTORY: "Cutscene Props", KIND_ANIMATED: "Rigged", KIND_STATIC: "Static"}
+DEFAULT_TRAJECTORY_ENTITY_PATH = r"animations\cutscenes\blender_tools\trajectory_props.w2ent"
+DEFAULT_CUSTOM_ENTITY_PATH = r"blender_tools\entities\custom_entity.w2ent"
 
 _MESH_PATH_PROPS = (P_PATH, "repo_path", "witcher_redkit_mesh_path", "w3_source_mesh_path", "_depot_path")
 
@@ -46,30 +56,65 @@ def _active_collection(context=None):
     return bpy.context.scene.collection
 
 
-def _object_collection(obj, fallback=None):
-    collections = getattr(obj, "users_collection", None) or ()
-    if collections:
-        return collections[0]
-    return fallback or _active_collection()
-
-
 def is_animated_component(obj):
     return (getattr(obj, "type", None) == 'ARMATURE'
             and str(obj.get(P_TYPE, "")) == T_ANIMATED_COMPONENT)
 
 
-def active_animated_component(context):
-    obj = getattr(context, "active_object", None)
-    if is_animated_component(obj):
-        return obj
-    for sel in getattr(context, "selected_objects", []) or []:
-        if is_animated_component(sel):
-            return sel
+def is_builder_root(obj):
+    return obj is not None and bool(obj.get(P_ENTITY_ROOT)) and bool(obj.get(P_BUILDER))
+
+
+def _entity_root_of(obj):
+    while obj is not None:
+        if obj.get(P_ENTITY_ROOT):
+            return obj
+        obj = obj.parent
     return None
 
 
+def builder_root_of(obj):
+    root = _entity_root_of(obj)
+    return root if is_builder_root(root) else None
+
+
+def active_builder_root(context):
+    candidates = [getattr(context, "active_object", None)]
+    candidates += list(getattr(context, "selected_objects", None) or [])
+    for obj in candidates:
+        root = builder_root_of(obj)
+        if root is not None:
+            return root
+    return None
+
+
+def root_armature(root):
+    if root is None:
+        return None
+    return next((c for c in root.children if is_animated_component(c)), None)
+
+
+def entity_kind(root):
+    kind = str(root.get(P_KIND, "") or "")
+    return kind or (KIND_ANIMATED if root_armature(root) else KIND_STATIC)
+
+
+def active_animated_component(context):
+    """Return the selected builder-owned CAnimatedComponent."""
+    candidates = [getattr(context, "active_object", None)]
+    candidates += list(getattr(context, "selected_objects", None) or [])
+    for obj in candidates:
+        if is_animated_component(obj) and builder_root_of(obj) is not None:
+            return obj
+    return root_armature(active_builder_root(context))
+
+
 def _bone_index(arm_obj, bone_name):
-    names = [b.name for b in arm_obj.data.bones]
+    """CSkeleton order as recorded by the rig importer; Blender's data.bones is tree-ordered."""
+    settings = getattr(arm_obj.data, "witcherui_RigSettings", None)
+    names = [b.name for b in settings.bone_order_list] if settings is not None else []
+    if not names:
+        names = [b.name for b in arm_obj.data.bones]
     return names.index(bone_name) if bone_name in names else 0
 
 
@@ -116,11 +161,22 @@ def iter_hard_attachments(arm_obj):
     return out
 
 
+def iter_static_meshes(root):
+    return [c for c in root.children
+            if getattr(c, "type", None) == 'MESH'
+            and str(c.get(P_TYPE, "") or "") == T_STATIC_MESH_COMPONENT]
+
+
 def resolve_mesh_depot(mesh_obj):
-    for key in _MESH_PATH_PROPS:
-        v = str(mesh_obj.get(key, "") or "").strip()
-        if v.lower().endswith(".w2mesh"):
-            return v.replace("/", "\\")
+    """Resolve a .w2mesh depot path from importer properties."""
+    candidates = [str(mesh_obj.get(key, "") or "") for key in _MESH_PATH_PROPS]
+    settings = getattr(mesh_obj, "witcherui_MeshSettings", None)
+    if settings is not None:
+        candidates.append(str(getattr(settings, "item_repo_path", "") or ""))
+    for value in candidates:
+        path = _norm_repo_path(value)
+        if path.lower().endswith(".w2mesh"):
+            return path
     return ""
 
 
@@ -144,14 +200,8 @@ def collect_hard_attachment_export_data(arm_obj):
             except Exception:
                 skipped.append(getattr(empty, "name", "CHardAttachment"))
                 continue
-        component_transform = None
-        component_transform_raw = str(mesh.get("witcher_component_transform", "") or "").strip()
-        if component_transform_raw:
-            try:
-                component_transform = json.loads(component_transform_raw)
-            except Exception:
-                skipped.append(getattr(mesh, "name", "mesh"))
-                continue
+        # The mesh basis under its anchor is the live component transform (the importer places it there too).
+        component_transform = matrix_to_engine_transform(mesh.matrix_basis)
         attachments.append({
             "mesh": depot,
             "slot": slot,
@@ -166,21 +216,54 @@ def collect_hard_attachment_export_data(arm_obj):
     return attachments, skipped
 
 
-def create_animated_component(entity_name, skeleton_path, bone_names, entity_path,
-                              behavior_path="", component_name=ac.DEFAULT_COMPONENT_NAME,
-                              chunk_index=2, target_collection=None):
-    """Create an entity root and return its CAnimatedComponent armature."""
-    target_collection = target_collection or _active_collection()
+def matrix_to_engine_transform(matrix):
+    """Blender local matrix -> EngineTransform dict.
+
+    EulerAngles::ToMatrix composes Y(roll)·X(pitch)·Z(yaw), i.e. Blender 'YXZ'
+    with x=pitch, y=roll, z=yaw.
+    """
+    loc, rot, scale = matrix.decompose()
+    e = rot.to_euler('YXZ')
+    values = {"X": loc.x, "Y": loc.y, "Z": loc.z,
+              "Pitch": degrees(e.x), "Roll": degrees(e.y), "Yaw": degrees(e.z),
+              "Scale_x": scale.x, "Scale_y": scale.y, "Scale_z": scale.z}
+    return normalize_engine_transform({k: round(v, 6) + 0.0 for k, v in values.items()})
+
+
+def collect_static_mesh_export_data(root):
+    """Return serializable CStaticMeshComponent data and skipped object names."""
+    items = []
+    skipped = []
+    for mesh in iter_static_meshes(root):
+        depot = resolve_mesh_depot(mesh)
+        if not depot:
+            skipped.append(mesh.name)
+            continue
+        items.append({
+            "mesh": depot,
+            "name": str(mesh.get(P_NAME, "") or "") or None,
+            "transform": matrix_to_engine_transform(mesh.matrix_local),
+        })
+    return items, skipped
+
+
+# Creation
+
+def create_entity_root(entity_name, entity_path, kind, target_collection=None):
     root = bpy.data.objects.new(entity_name, None)
     root.empty_display_type = 'PLAIN_AXES'
     root[P_ENTITY_ROOT] = True
-    target_collection.objects.link(root)
+    root[P_BUILDER] = True
+    root[P_KIND] = kind
+    root[P_ENTITY_PATH] = entity_path
+    (target_collection or _active_collection()).objects.link(root)
+    return root
 
-    arm_name = f"{entity_name}:{T_ANIMATED_COMPONENT}{chunk_index}_ARM"
+
+def _synthesize_armature(arm_name, bone_names, target_collection):
     arm_data = bpy.data.armatures.new(arm_name)
     arm = bpy.data.objects.new(arm_name, arm_data)
     target_collection.objects.link(arm)
-    arm.parent = root
 
     prev = bpy.context.view_layer.objects.active
     bpy.context.view_layer.objects.active = arm
@@ -202,12 +285,49 @@ def create_animated_component(entity_name, skeleton_path, bone_names, entity_pat
     finally:
         bpy.ops.object.mode_set(mode='OBJECT')
         bpy.context.view_layer.objects.active = prev
+    return arm
 
+
+def _armature_from_rig_file(rig_file, arm_ns, target_collection):
+    """Load a real .w2rig through the rig importer so bones match imported entities."""
+    from ..CR2W.dc_skeleton import load_bin_skeleton
+    from ..importers import import_rig
+
+    arm = import_rig.create_armature_from_skeleton_data(
+        load_bin_skeleton(rig_file), fileName=rig_file, ns=arm_ns, context=bpy.context)
+    for coll in list(arm.users_collection):
+        if coll is not target_collection:
+            coll.objects.unlink(arm)
+    if arm.name not in target_collection.objects:
+        target_collection.objects.link(arm)
+    return arm
+
+
+def create_animated_component(entity_name, skeleton_path, bone_names, entity_path,
+                              behavior_path="", component_name=ac.DEFAULT_COMPONENT_NAME,
+                              chunk_index=2, target_collection=None, rig_file=None, kind=None):
+    """Create an entity root and return its CAnimatedComponent armature.
+
+    rig_file: absolute .w2rig to load real bones from; otherwise bone_names are
+    synthesized with coincident heads (trajectory convention).
+    """
+    target_collection = target_collection or _active_collection()
+    if kind is None:
+        kind = KIND_TRAJECTORY if skeleton_path == ac.TRAJECTORY_RIG_PATH else KIND_ANIMATED
+
+    arm_ns = f"{entity_name}:{T_ANIMATED_COMPONENT}{chunk_index}"
+    if rig_file:
+        arm = _armature_from_rig_file(rig_file, arm_ns, target_collection)
+    else:
+        arm = _synthesize_armature(f"{arm_ns}_ARM", bone_names, target_collection)
+    root = create_entity_root(entity_name, entity_path, kind, target_collection)
+    arm.parent = root
     arm[P_TYPE] = T_ANIMATED_COMPONENT
     arm[P_NAME] = component_name
     arm[P_PATH] = skeleton_path
     arm[P_ENTITY_PATH] = entity_path
     arm[P_BEHAVIOR] = behavior_path
+    arm[P_BUILDER] = True
     return arm
 
 
@@ -215,6 +335,12 @@ def add_hard_attachment(arm_obj, mesh_obj, slot_bone, mesh_depot):
     """Attach a mesh through a CHardAttachment at the slot bone head."""
     from mathutils import Matrix
     from ..importers import import_entity
+
+    old_anchor = mesh_obj.parent
+    if old_anchor is not None and _is_hard_attachment_empty(old_anchor):
+        # Re-attaching to another slot: drop the previous anchor instead of orphaning it.
+        mesh_obj.parent = None
+        bpy.data.objects.remove(old_anchor, do_unlink=True)
 
     empty = import_entity._link_hard_attachment_anchor(
         arm_obj,
@@ -232,6 +358,131 @@ def add_hard_attachment(arm_obj, mesh_obj, slot_bone, mesh_depot):
         mesh_obj[P_NAME] = ac._mesh_stem(mesh_depot)
     mesh_obj[P_PATH] = mesh_depot
     return empty
+
+
+def add_static_mesh(root, mesh_obj, mesh_depot):
+    """Parent a mesh to the entity root as a CStaticMeshComponent, keeping its world placement."""
+    from mathutils import Matrix
+
+    world = mesh_obj.matrix_world.copy()
+    mesh_obj.parent = root
+    mesh_obj.parent_type = 'OBJECT'
+    mesh_obj.matrix_parent_inverse = Matrix.Identity(4)
+    mesh_obj.matrix_world = world
+    mesh_obj[P_TYPE] = T_STATIC_MESH_COMPONENT
+    if not str(mesh_obj.get(P_NAME, "") or "").strip():
+        mesh_obj[P_NAME] = ac._mesh_stem(mesh_depot)
+    mesh_obj[P_PATH] = mesh_depot
+
+
+def _add_static_meshes(root, meshes, override):
+    added, missing = 0, []
+    for mesh in meshes:
+        if mesh.parent is root and str(mesh.get(P_TYPE, "") or "") == T_STATIC_MESH_COMPONENT:
+            continue
+        if _is_hard_attachment_empty(mesh.parent):
+            continue
+        depot = override or resolve_mesh_depot(mesh)
+        if not depot:
+            missing.append(mesh.name)
+            continue
+        add_static_mesh(root, mesh, depot)
+        added += 1
+    return added, missing
+
+
+def _select_only(context, obj):
+    for o in context.selected_objects:
+        o.select_set(False)
+    obj.select_set(True)
+    context.view_layer.objects.active = obj
+
+
+# Paths
+
+def _norm_repo_path(value):
+    path = str(value or "").strip().replace("/", "\\")
+    if os.path.splitdrive(path)[0] or path.startswith("\\\\"):
+        return ""  # absolute paths are not depot paths
+    path = path.strip("\\")
+    if any(part in ("", ".", "..") for part in path.split("\\")):
+        return ""  # no traversal out of the depot roots
+    return path
+
+
+def _report_absolute_path(operator, raw, label):
+    if str(raw or "").strip() and not _norm_repo_path(raw):
+        operator.report({'ERROR'}, f"{label} must be game-relative (e.g. dlc\\mymod\\data\\...).")
+        return True
+    return False
+
+
+def _entity_path_or_default(value, default):
+    path = _norm_repo_path(value) or default
+    return path if path.lower().endswith(".w2ent") else path + ".w2ent"
+
+
+def _entity_name_from_path(entity_path):
+    return os.path.splitext(os.path.basename(entity_path.replace("\\", "/")))[0] or "entity"
+
+
+def _output_roots(context):
+    """Writable roots: REDkit project workspace first, then the uncook folder."""
+    roots = []
+    try:
+        from .ui_anims import _anim_get_active_redkit_project
+        project = _anim_get_active_redkit_project(context)
+    except Exception:
+        project = None
+    if project:
+        roots.append(os.path.join(project, "workspace"))
+    try:
+        uncook = get_uncook_path(context)
+    except Exception:
+        uncook = ""
+    if uncook:
+        roots.append(uncook)
+    return roots
+
+
+def _repo_roots(context):
+    """Read roots: output roots plus the REDkit dual depot (r4data, then uncooked) ahead of uncook."""
+    from ..CR2W.common_blender import _get_redkit_depot_roots
+
+    roots = _output_roots(context)
+    roots[1 if roots and roots[0].lower().endswith("workspace") else 0:0] = _get_redkit_depot_roots()
+    seen = set()
+    return [r for r in roots if not (os.path.normcase(r) in seen or seen.add(os.path.normcase(r)))]
+
+
+def _resolve_repo_file(context, repo_path):
+    rel = _norm_repo_path(repo_path)
+    for root in _repo_roots(context):
+        candidate = os.path.join(root, rel)
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _resolve_export_dir(context):
+    roots = _output_roots(context)
+    return roots[0] if roots else ""
+
+
+def _safe_repo_output_path(export_dir, repo_path, suffix=".w2ent"):
+    root = os.path.abspath(os.path.normpath(str(export_dir or "")))
+    raw = str(repo_path or "").strip().replace("/", os.sep).replace("\\", os.sep)
+    drive, _tail = os.path.splitdrive(raw)
+    if not root or not raw or drive or os.path.isabs(raw) or not raw.lower().endswith(suffix):
+        raise ValueError(f"Path must be a game-relative {suffix} path.")
+    candidate = os.path.abspath(os.path.normpath(os.path.join(root, raw.lstrip(os.sep))))
+    try:
+        inside = os.path.normcase(os.path.commonpath((root, candidate))) == os.path.normcase(root)
+    except ValueError:
+        inside = False
+    if not inside:
+        raise ValueError("Path must stay inside the configured export root.")
+    return candidate
 
 
 # Scene properties
@@ -253,58 +504,80 @@ def _slot_enum_items(self, context):
 
 # Operators
 
-class WITCH_OT_CreateAnimatedComponent(bpy.types.Operator):
-    """Create a skeleton-bound CAnimatedComponent using the selected preset."""
-    bl_idname = "witcher.create_animated_component"
-    bl_label = "Create CAnimatedComponent"
+class WITCH_OT_CreateBuilderEntity(bpy.types.Operator):
+    """Create a cutscene-prop, rigged, or static entity."""
+    bl_idname = "witcher.create_builder_entity"
+    bl_label = "Create Entity"
     bl_options = {'REGISTER', 'UNDO'}
+
+    kind: EnumProperty(
+        name="Kind",
+        items=[(KIND_TRAJECTORY, "Cutscene Props (trajectories_24)", "24 animatable prop slots"),
+               (KIND_ANIMATED, "Rigged", "CAnimatedComponent bound to a .w2rig"),
+               (KIND_STATIC, "Static", "CStaticMeshComponents only")],
+        default=KIND_TRAJECTORY)
 
     def execute(self, context):
         scene = context.scene
-        skeleton = str(getattr(scene, "witcher_ac_skeleton_path", "") or "").strip().replace("/", "\\")
-        if not skeleton:
-            skeleton = ac.TRAJECTORY_RIG_PATH
-        bone_count = int(getattr(scene, "witcher_ac_bone_count", ac.TRAJECTORY_BONE_COUNT) or ac.TRAJECTORY_BONE_COUNT)
-        bones = ac.trajectory_bone_names(bone_count)
+        collection = _active_collection(context)
+        selected_meshes = [o for o in context.selected_objects if getattr(o, "type", None) == 'MESH']
+        raw_entity = scene.witcher_ac_entity_path if self.kind == KIND_TRAJECTORY else scene.witcher_ac_custom_entity_path
+        if _report_absolute_path(self, raw_entity, "Entity path"):
+            return {'CANCELLED'}
 
-        entity_path = str(getattr(scene, "witcher_ac_entity_path", "") or "").strip().replace("/", "\\")
-        if not entity_path:
-            entity_path = "animations\\cutscenes\\blender_tools\\trajectory_props.w2ent"
-        if not entity_path.lower().endswith(".w2ent"):
-            entity_path += ".w2ent"
+        if self.kind == KIND_TRAJECTORY:
+            entity_path = _entity_path_or_default(scene.witcher_ac_entity_path, DEFAULT_TRAJECTORY_ENTITY_PATH)
+            scene.witcher_ac_entity_path = entity_path
+            arm = create_animated_component(
+                _entity_name_from_path(entity_path), ac.TRAJECTORY_RIG_PATH,
+                ac.trajectory_bone_names(), entity_path, ac.CUTSCENE_BEHAVIOR_PATH,
+                target_collection=collection, kind=KIND_TRAJECTORY)
+            root = arm.parent
+            message = f"Created '{root.name}' with {ac.TRAJECTORY_BONE_COUNT} trajectory slots."
+        else:
+            entity_path = _entity_path_or_default(scene.witcher_ac_custom_entity_path, DEFAULT_CUSTOM_ENTITY_PATH)
+            scene.witcher_ac_custom_entity_path = entity_path
+            name = _entity_name_from_path(entity_path)
+            if self.kind == KIND_ANIMATED:
+                skeleton = _norm_repo_path(scene.witcher_ac_skeleton_path)
+                if not skeleton.lower().endswith(".w2rig"):
+                    self.report({'ERROR'}, "Set a game-relative .w2rig skeleton path.")
+                    return {'CANCELLED'}
+                rig_file = _resolve_repo_file(context, skeleton)
+                if not rig_file:
+                    self.report({'ERROR'}, f"Skeleton not found under the project/uncook paths: {skeleton}")
+                    return {'CANCELLED'}
+                behavior = _norm_repo_path(scene.witcher_ac_behavior_path) if scene.witcher_ac_use_behavior else ""
+                try:
+                    arm = create_animated_component(
+                        name, skeleton, [], entity_path, behavior,
+                        target_collection=collection, rig_file=rig_file, kind=KIND_ANIMATED)
+                except Exception as exc:
+                    log.exception("Failed to load skeleton %s", rig_file)
+                    self.report({'ERROR'}, f"Failed to load skeleton: {exc}")
+                    return {'CANCELLED'}
+                root = arm.parent
+                message = f"Created '{root.name}' from {os.path.basename(skeleton)} ({len(arm.data.bones)} bones)."
+            else:
+                arm = None
+                root = create_entity_root(name, entity_path, KIND_STATIC, collection)
+                added, missing = _add_static_meshes(root, selected_meshes, "")
+                message = f"Created '{root.name}'" + (f" with {added} static mesh(es)." if added else ".")
+                if missing:
+                    self.report({'WARNING'}, f"No .w2mesh path for: {', '.join(missing[:4])} "
+                                             "(set Mesh Path, then Add Selected Meshes).")
 
-        entity_name = str(getattr(scene, "witcher_ac_entity_name", "") or "").strip()
-        if not entity_name:
-            entity_name = os.path.splitext(os.path.basename(entity_path.replace("\\", "/")))[0] or "entity"
-
-        behavior = ""
-        if bool(getattr(scene, "witcher_ac_use_behavior", True)):
-            behavior = str(getattr(scene, "witcher_ac_behavior_path", "") or "").strip().replace("/", "\\")
-
-        arm = create_animated_component(
-            entity_name,
-            skeleton,
-            bones,
-            entity_path,
-            behavior,
-            target_collection=_active_collection(context),
-        )
-
-        for o in bpy.data.objects:
-            o.select_set(False)
-        arm.select_set(True)
-        context.view_layer.objects.active = arm
-        set_main_armature(scene, arm)
-        scene.witcher_ac_entity_path = entity_path
-
-        self.report({'INFO'}, f"Created CAnimatedComponent '{arm.name}' ({len(bones)} bones).")
+        _select_only(context, arm or root)
+        if arm is not None:
+            set_main_armature(scene, arm)
+        self.report({'INFO'}, message)
         return {'FINISHED'}
 
 
 class WITCH_OT_AddHardAttachment(bpy.types.Operator):
-    """Attach the selected meshes to a slot on the active CAnimatedComponent."""
+    """Attach selected meshes to a bone slot."""
     bl_idname = "witcher.add_hard_attachment"
-    bl_label = "Add CHardAttachment"
+    bl_label = "Attach Selected Meshes"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -315,7 +588,7 @@ class WITCH_OT_AddHardAttachment(bpy.types.Operator):
         scene = context.scene
         arm = active_animated_component(context)
         if arm is None:
-            self.report({'WARNING'}, "Select a CAnimatedComponent armature first.")
+            self.report({'WARNING'}, "Select an entity with a CAnimatedComponent first.")
             return {'CANCELLED'}
 
         slot = str(getattr(scene, "witcher_ac_target_slot", "") or "").strip()
@@ -328,7 +601,9 @@ class WITCH_OT_AddHardAttachment(bpy.types.Operator):
             self.report({'WARNING'}, "Select one or more mesh objects to attach.")
             return {'CANCELLED'}
 
-        override = str(getattr(scene, "witcher_ac_mesh_path", "") or "").strip().replace("/", "\\")
+        if _report_absolute_path(self, scene.witcher_ac_mesh_path, "Mesh Path"):
+            return {'CANCELLED'}
+        override = _norm_repo_path(scene.witcher_ac_mesh_path)
         if override and not override.lower().endswith(".w2mesh"):
             self.report({'WARNING'}, "Mesh Path override must end with .w2mesh.")
             return {'CANCELLED'}
@@ -350,7 +625,7 @@ class WITCH_OT_AddHardAttachment(bpy.types.Operator):
 
 
 class WITCH_OT_RemoveHardAttachment(bpy.types.Operator):
-    """Remove an attachment while preserving its mesh's world transform."""
+    """Remove an attachment without moving its mesh."""
     bl_idname = "witcher.remove_hard_attachment"
     bl_label = "Remove CHardAttachment"
     bl_options = {'REGISTER', 'UNDO'}
@@ -365,40 +640,110 @@ class WITCH_OT_RemoveHardAttachment(bpy.types.Operator):
             mw = mesh.matrix_world.copy()
             mesh.parent = None
             mesh.matrix_world = mw
+            if P_TYPE in mesh:
+                del mesh[P_TYPE]
         bpy.data.objects.remove(empty, do_unlink=True)
         return {'FINISHED'}
 
 
-class WITCH_OT_ExportAnimatedComponentEntity(bpy.types.Operator):
-    """Export the active CAnimatedComponent as a .w2ent entity template."""
-    bl_idname = "witcher.export_animated_component_entity"
-    bl_label = "Export CEntityTemplate"
+class WITCH_OT_AddStaticMeshComponent(bpy.types.Operator):
+    """Add selected meshes as static components without moving them."""
+    bl_idname = "witcher.add_static_mesh_component"
+    bl_label = "Add Selected Meshes"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        return active_builder_root(context) is not None
+
+    def execute(self, context):
+        root = active_builder_root(context)
+        meshes = [o for o in context.selected_objects if getattr(o, "type", None) == 'MESH']
+        if not meshes:
+            self.report({'WARNING'}, "Select one or more mesh objects to add.")
+            return {'CANCELLED'}
+        if _report_absolute_path(self, context.scene.witcher_ac_mesh_path, "Mesh Path"):
+            return {'CANCELLED'}
+        override = _norm_repo_path(context.scene.witcher_ac_mesh_path)
+        if override and not override.lower().endswith(".w2mesh"):
+            self.report({'WARNING'}, "Mesh Path override must end with .w2mesh.")
+            return {'CANCELLED'}
+        added, missing = _add_static_meshes(root, meshes, override)
+        if missing:
+            self.report({'WARNING'}, f"Added {added}; no .w2mesh path for: "
+                                     f"{', '.join(missing[:4])} (set Mesh Path override).")
+        else:
+            self.report({'INFO'}, f"Added {added} static mesh(es) to '{root.name}'.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_RemoveStaticMeshComponent(bpy.types.Operator):
+    """Detach a static component without moving its mesh."""
+    bl_idname = "witcher.remove_static_mesh_component"
+    bl_label = "Remove Static Mesh"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mesh_name: StringProperty(default="")
+
+    def execute(self, context):
+        mesh = bpy.data.objects.get(self.mesh_name)
+        if mesh is None:
+            return {'CANCELLED'}
+        mw = mesh.matrix_world.copy()
+        mesh.parent = None
+        mesh.matrix_world = mw
+        if P_TYPE in mesh:
+            del mesh[P_TYPE]
+        return {'FINISHED'}
+
+
+class WITCH_OT_BuilderPathDetails(bpy.types.Operator):
+    """Show and copy the resolved depot path."""
+    bl_idname = "witcher.entity_builder_path_details"
+    bl_label = "Depot Path"
+    bl_options = {'INTERNAL'}
+
+    text: StringProperty(name="Depot Path", default="")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, context):
+        self.layout.prop(self, "text", text="")
+
+    def execute(self, context):
+        context.window_manager.clipboard = self.text
+        self.report({'INFO'}, "Depot path copied to clipboard")
+        return {'FINISHED'}
+
+
+class WITCH_OT_ExportBuilderEntity(bpy.types.Operator):
+    """Export the active entity to the configured writable depot."""
+    bl_idname = "witcher.export_builder_entity"
+    bl_label = "Export .w2ent"
     bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
-        return active_animated_component(context) is not None
+        return active_builder_root(context) is not None
 
     def execute(self, context):
-        arm = active_animated_component(context)
-        if arm is None:
-            self.report({'WARNING'}, "Select a CAnimatedComponent armature first.")
-            return {'CANCELLED'}
+        root = active_builder_root(context)
+        arm = root_armature(root)
 
-        entity_path = str(arm.get(P_ENTITY_PATH, "") or "").strip()
+        entity_path = _norm_repo_path(root.get(P_ENTITY_PATH, "") or (arm.get(P_ENTITY_PATH, "") if arm else ""))
         if not entity_path:
-            self.report({'WARNING'}, "Component has no witcher_entity_path.")
+            self.report({'ERROR'}, "Entity has no .w2ent path.")
             return {'CANCELLED'}
-        skeleton = str(arm.get(P_PATH, "") or "").strip() or ac.TRAJECTORY_RIG_PATH
-        behavior = str(arm.get(P_BEHAVIOR, "") or "").strip()
-        component_name = str(arm.get(P_NAME, "") or ac.DEFAULT_COMPONENT_NAME)
 
-        attachments, skipped = collect_hard_attachment_export_data(arm)
+        attachments, skipped = collect_hard_attachment_export_data(arm) if arm else ([], [])
+        statics, skipped_static = collect_static_mesh_export_data(root)
+        skipped += skipped_static
         if skipped:
-            self.report({'WARNING'}, "Skipped CHardAttachment(s) without mesh path: "
+            self.report({'WARNING'}, "Skipped mesh(es) without a .w2mesh path: "
                                      f"{', '.join(skipped[:4])}")
-        if not attachments and skipped:
-            self.report({'WARNING'}, "No CHardAttachments have a resolvable .w2mesh path.")
+        if arm is None and not statics:
+            self.report({'ERROR'}, "Add at least one static mesh with a .w2mesh path before exporting.")
             return {'CANCELLED'}
 
         export_dir = _resolve_export_dir(context)
@@ -411,166 +756,200 @@ class WITCH_OT_ExportAnimatedComponentEntity(bpy.types.Operator):
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
 
-        entity_name = os.path.splitext(os.path.basename(entity_path.replace("\\", "/")))[0]
+        # Custom props are user-editable; re-validate them like typed input.
+        if arm is not None and (_report_absolute_path(self, arm.get(P_PATH, ""), "Skeleton path")
+                                or _report_absolute_path(self, arm.get(P_BEHAVIOR, ""), "Behavior path")):
+            return {'CANCELLED'}
+        skeleton = (_norm_repo_path(arm.get(P_PATH, "")) or ac.TRAJECTORY_RIG_PATH) if arm else None
+        behavior = _norm_repo_path(arm.get(P_BEHAVIOR, "")) if arm else ""
+        component_name = str(arm.get(P_NAME, "") or ac.DEFAULT_COMPONENT_NAME) if arm else ac.DEFAULT_COMPONENT_NAME
         try:
             ac.generate_entity(
-                attachments, out_path, get_wolvenkit(context),
+                attachments, out_path,
                 skeleton_path=skeleton, behavior_path=behavior or None,
-                entity_name=entity_name, component_name=component_name)
+                entity_name=_entity_name_from_path(entity_path), component_name=component_name,
+                static_meshes=statics)
         except Exception as exc:
-            log.exception("CAnimatedComponent entity export failed.")
+            log.exception("Entity export failed.")
             self.report({'ERROR'}, f"Export failed: {exc}")
             return {'CANCELLED'}
 
-        self.report({'INFO'}, f"Exported {len(attachments)} CHardAttachment(s) -> {out_path}")
+        self.report({'INFO'}, f"Exported '{root.name}': {len(attachments)} attachment(s), "
+                              f"{len(statics)} static mesh(es) -> {out_path}")
         return {'FINISHED'}
 
 
-def _resolve_export_dir(context):
-    try:
-        from .ui_anims import _anim_get_active_redkit_project
-        project = _anim_get_active_redkit_project(context)
-    except Exception:
-        project = None
-    if project:
-        return os.path.join(project, "workspace")
-    try:
-        return get_uncook_path(context)
-    except Exception:
-        return ""
+# Panels
 
+def _draw_component_row(row, name, depot):
+    row.label(text=name if depot else f"{name} (no .w2mesh path)", icon='MESH_DATA' if depot else 'ERROR')
+    sub = row.row(align=True)
+    sub.enabled = bool(depot)
+    sub.operator(WITCH_OT_BuilderPathDetails.bl_idname, text="", icon='INFO').text = depot
 
-def _safe_repo_output_path(export_dir, repo_path):
-    root = os.path.abspath(os.path.normpath(str(export_dir or "")))
-    raw = str(repo_path or "").strip().replace("/", os.sep).replace("\\", os.sep)
-    drive, _tail = os.path.splitdrive(raw)
-    if not root or not raw or drive or os.path.isabs(raw) or not raw.lower().endswith(".w2ent"):
-        raise ValueError("Entity path must be a game-relative .w2ent path.")
-    candidate = os.path.abspath(os.path.normpath(os.path.join(root, raw.lstrip(os.sep))))
-    try:
-        if os.path.normcase(os.path.commonpath((root, candidate))) != os.path.normcase(root):
-            raise ValueError("Entity path must stay inside the configured export root.")
-    except ValueError:
-        raise ValueError("Entity path must stay inside the configured export root.")
-    return candidate
-
-
-# Panel
 
 class WITCHER_PT_animated_component(WITCH_PT_Base, bpy.types.Panel):
     bl_idname = "WITCHER_PT_animated_component"
-    bl_label = "CAnimatedComponent Authoring"
+    bl_label = "Entity Builder"
     bl_options = {'DEFAULT_CLOSED'}
 
     def draw_header(self, context):
-        self.layout.label(text="", icon='CON_ARMATURE')
+        self.layout.label(text="", icon='MOD_BUILD')
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = False
+        root = active_builder_root(context)
+        if root is None:
+            self._draw_create(layout, context)
+        else:
+            self._draw_edit(layout, context.scene, root)
+
+    def _draw_create(self, layout, context):
+        scene = context.scene
+        box = layout.box()
+        box.label(text="Cutscene Props Rig", icon='OUTLINER_OB_ARMATURE')
+        col = box.column(align=True)
+        col.label(text="trajectories_24: 24 animatable slots for props.", icon='INFO')
+        col.label(text="Create, attach meshes to slots, animate, export.", icon='BLANK1')
+        box.prop(scene, "witcher_ac_entity_path", text="Entity (.w2ent)")
+        row = box.row()
+        row.scale_y = 1.5
+        op = row.operator(WITCH_OT_CreateBuilderEntity.bl_idname, text="Create trajectories_24 Entity", icon='ADD')
+        op.kind = KIND_TRAJECTORY
+
+        active = getattr(context, "active_object", None)
+        if active is not None and (_entity_root_of(active) is not None or is_animated_component(active)):
+            layout.label(text="Imported entities can't be edited or exported here.", icon='INFO')
+        else:
+            layout.label(text="Select an entity created here to edit it.", icon='INFO')
+
+    def _draw_edit(self, layout, scene, root):
+        arm = root_armature(root)
+        kind = entity_kind(root)
+
+        info = layout.box()
+        row = info.row(align=True)
+        row.label(text=root.name, icon='OUTLINER_OB_ARMATURE' if arm else 'OUTLINER_OB_MESH')
+        row.label(text=_KIND_LABELS.get(kind, kind))
+        col = info.column(align=True)
+        path_owner = root if P_ENTITY_PATH in root else arm
+        if path_owner is not None and P_ENTITY_PATH in path_owner:
+            col.prop(path_owner, f'["{P_ENTITY_PATH}"]', text="Entity")
+        else:
+            col.label(text="Entity path: not set", icon='ERROR')
+        if arm is not None:
+            if P_PATH in arm:
+                col.prop(arm, f'["{P_PATH}"]', text="Skeleton")
+            else:
+                col.label(text="Skeleton: not set", icon='ERROR')
+            col.label(text=f"Bones: {len(arm.data.bones)}")
+
+        if arm is not None:
+            attachments = iter_hard_attachments(arm)
+            att_box = layout.box()
+            att_box.label(text=f"Attached Meshes ({len(attachments)})", icon='LINKED')
+            if attachments:
+                for empty, mesh, slot in attachments:
+                    row = att_box.row(align=True)
+                    mesh_name = str((mesh.get(P_NAME, "") if mesh else "") or (mesh.name if mesh else "<missing>"))
+                    row.label(text=slot, icon='BONE_DATA')
+                    _draw_component_row(row, mesh_name, resolve_mesh_depot(mesh) if mesh else "")
+                    op = row.operator(WITCH_OT_RemoveHardAttachment.bl_idname, text="", icon='X')
+                    op.empty_name = empty.name
+            else:
+                att_box.label(text="No meshes attached yet.", icon='INFO')
+            add = att_box.column(align=True)
+            add.prop(scene, "witcher_ac_target_slot", text="Slot")
+            add.prop(scene, "witcher_ac_mesh_path", text="Mesh Path")
+            add.operator(WITCH_OT_AddHardAttachment.bl_idname, icon='LINKED')
+
+        statics = iter_static_meshes(root)
+        if kind != KIND_TRAJECTORY or statics:
+            st_box = layout.box()
+            st_box.label(text=f"Static Meshes ({len(statics)})", icon='MESH_DATA')
+            for mesh in statics:
+                depot = resolve_mesh_depot(mesh)
+                row = st_box.row(align=True)
+                _draw_component_row(row, str(mesh.get(P_NAME, "") or mesh.name), depot)
+                op = row.operator(WITCH_OT_RemoveStaticMeshComponent.bl_idname, text="", icon='X')
+                op.mesh_name = mesh.name
+            add = st_box.column(align=True)
+            if arm is None:
+                add.prop(scene, "witcher_ac_mesh_path", text="Mesh Path")
+            add.operator(WITCH_OT_AddStaticMeshComponent.bl_idname, icon='ADD')
+
+        layout.separator(factor=0.5)
+        row = layout.row()
+        row.scale_y = 1.3
+        row.operator(WITCH_OT_ExportBuilderEntity.bl_idname, icon='EXPORT')
+
+
+class WITCHER_PT_entity_builder_custom(WITCH_PT_Base, bpy.types.Panel):
+    bl_idname = "WITCHER_PT_entity_builder_custom"
+    bl_parent_id = "WITCHER_PT_animated_component"
+    bl_label = "Custom Entity"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return active_builder_root(context) is None
 
     def draw(self, context):
         layout = self.layout
         layout.use_property_split = False
         scene = context.scene
-        arm = active_animated_component(context)
-
-        if arm is None:
-            self._draw_create(layout, scene)
+        layout.row().prop(scene, "witcher_ac_kind", expand=True)
+        col = layout.column(align=True)
+        rigged = scene.witcher_ac_kind == KIND_ANIMATED
+        if rigged:
+            col.prop(scene, "witcher_ac_skeleton_path", text="Skeleton (.w2rig)")
+            beh = col.row(align=True)
+            beh.prop(scene, "witcher_ac_use_behavior", text="")
+            sub = beh.row(align=True)
+            sub.enabled = bool(scene.witcher_ac_use_behavior)
+            sub.prop(scene, "witcher_ac_behavior_path", text="Behavior (.w2beh)")
         else:
-            self._draw_edit(layout, scene, arm)
-
-    def _draw_create(self, layout, scene):
-        box = layout.box()
-        box.label(text="New Component", icon='ADD')
-        box.label(text="Skeleton-bound armature + hard-attached meshes.", icon='INFO')
-        box.prop(scene, "witcher_ac_preset", text="Preset")
-        col = box.column(align=True)
-        col.prop(scene, "witcher_ac_skeleton_path", text="Skeleton (.w2rig)")
-        col.prop(scene, "witcher_ac_bone_count", text="Trajectory Bones")
-        beh = box.row(align=True)
-        beh.prop(scene, "witcher_ac_use_behavior", text="")
-        sub = beh.row(align=True)
-        sub.enabled = bool(getattr(scene, "witcher_ac_use_behavior", True))
-        sub.prop(scene, "witcher_ac_behavior_path", text="Behavior (.w2beh)")
-        box.prop(scene, "witcher_ac_entity_name", text="Entity Name")
-        box.prop(scene, "witcher_ac_entity_path", text="Entity (.w2ent)")
-        box.operator(WITCH_OT_CreateAnimatedComponent.bl_idname, icon='ARMATURE_DATA')
-        layout.label(text="Or select an existing CAnimatedComponent to edit.", icon='INFO')
-
-    def _draw_edit(self, layout, scene, arm):
-        info = layout.box()
-        info.label(text=str(arm.get(P_NAME, arm.name)), icon='CON_ARMATURE')
-        col = info.column(align=True)
-        if P_PATH in arm:
-            col.prop(arm, f'["{P_PATH}"]', text="Skeleton")
-        else:
-            col.label(text="Skeleton: not set", icon='ERROR')
-        col.label(text=f"Bones: {len(arm.data.bones)}")
-        if P_ENTITY_PATH in arm:
-            col.prop(arm, f'["{P_ENTITY_PATH}"]', text="Entity")
-        else:
-            col.label(text="Entity path: not set", icon='ERROR')
-
-        attachments = iter_hard_attachments(arm)
-        att_box = layout.box()
-        att_box.label(text=f"CHardAttachments ({len(attachments)})", icon='LINKED')
-        if attachments:
-            for empty, mesh, slot in attachments:
-                row = att_box.row(align=True)
-                mesh_name = str((mesh.get(P_NAME, "") if mesh else "") or (mesh.name if mesh else "<missing>"))
-                row.label(text=slot, icon='BONE_DATA')
-                row.label(text=mesh_name, icon='MESH_DATA' if mesh else 'ERROR')
-                op = row.operator(WITCH_OT_RemoveHardAttachment.bl_idname, text="", icon='X')
-                op.empty_name = empty.name
-        else:
-            att_box.label(text="No meshes attached yet.", icon='INFO')
-
-        add = layout.box()
-        add.label(text="Attach Selected Meshes", icon='ADD')
-        add.prop(scene, "witcher_ac_target_slot", text="Slot")
-        add.prop(scene, "witcher_ac_mesh_path", text="Mesh Path")
-        add.operator(WITCH_OT_AddHardAttachment.bl_idname, icon='LINKED')
-
-        layout.separator(factor=0.5)
-        layout.operator(WITCH_OT_ExportAnimatedComponentEntity.bl_idname, icon='EXPORT')
-
-
-def _preset_update(self, context):
-    if getattr(self, "witcher_ac_preset", "TRAJECTORY") == "TRAJECTORY":
-        self.witcher_ac_skeleton_path = ac.TRAJECTORY_RIG_PATH
-        self.witcher_ac_behavior_path = ac.CUTSCENE_BEHAVIOR_PATH
-        self.witcher_ac_bone_count = ac.TRAJECTORY_BONE_COUNT
-        self.witcher_ac_use_behavior = True
+            col.label(text="Selected meshes become CStaticMeshComponents.", icon='INFO')
+        col.prop(scene, "witcher_ac_custom_entity_path", text="Entity (.w2ent)")
+        op = layout.operator(WITCH_OT_CreateBuilderEntity.bl_idname,
+                             text="Create Rigged Entity" if rigged else "Create Static Entity", icon='ADD')
+        op.kind = scene.witcher_ac_kind
 
 
 classes = [
-    WITCH_OT_CreateAnimatedComponent,
+    WITCH_OT_CreateBuilderEntity,
     WITCH_OT_AddHardAttachment,
     WITCH_OT_RemoveHardAttachment,
-    WITCH_OT_ExportAnimatedComponentEntity,
+    WITCH_OT_AddStaticMeshComponent,
+    WITCH_OT_RemoveStaticMeshComponent,
+    WITCH_OT_BuilderPathDetails,
+    WITCH_OT_ExportBuilderEntity,
     WITCHER_PT_animated_component,
+    WITCHER_PT_entity_builder_custom,
 ]
 
 _scene_props = {
-    "witcher_ac_preset": EnumProperty(
-        name="Preset", description="Component preset",
-        items=[("TRAJECTORY", "Trajectory (trajectories_24)", "24 trajectory prop slots"),
-               ("CUSTOM", "Custom", "Custom skeleton / bone count")],
-        default="TRAJECTORY", update=_preset_update),
+    "witcher_ac_entity_path": StringProperty(
+        name="Entity Path", description="Game-relative path for the exported trajectories_24 .w2ent",
+        default=DEFAULT_TRAJECTORY_ENTITY_PATH),
+    "witcher_ac_kind": EnumProperty(
+        name="Kind", description="Custom entity type",
+        items=[(KIND_ANIMATED, "Rigged", "CAnimatedComponent bound to a .w2rig; meshes hard-attach to bones"),
+               (KIND_STATIC, "Static", "CStaticMeshComponents only, no skeleton")],
+        default=KIND_ANIMATED),
     "witcher_ac_skeleton_path": StringProperty(
-        name="Skeleton", description="CSkeleton (.w2rig) the component binds to",
-        default=ac.TRAJECTORY_RIG_PATH),
-    "witcher_ac_bone_count": IntProperty(
-        name="Trajectory Bones", description="Trajectory01..N slots on the rig",
-        default=ac.TRAJECTORY_BONE_COUNT, min=1, max=ac.TRAJECTORY_BONE_COUNT),
+        name="Skeleton", description="Game-relative CSkeleton (.w2rig) the component binds to",
+        default=""),
     "witcher_ac_use_behavior": BoolProperty(
         name="Behavior", description="Bind a CBehaviorGraph (cutscene) to the component",
         default=True),
     "witcher_ac_behavior_path": StringProperty(
         name="Behavior", description="CBehaviorGraph (.w2beh) instance slot",
         default=ac.CUTSCENE_BEHAVIOR_PATH),
-    "witcher_ac_entity_name": StringProperty(
-        name="Entity Name", description="Entity name (blank = from the entity path)", default=""),
-    "witcher_ac_entity_path": StringProperty(
+    "witcher_ac_custom_entity_path": StringProperty(
         name="Entity Path", description="Game-relative path for the exported .w2ent",
-        default="animations\\cutscenes\\blender_tools\\trajectory_props.w2ent"),
+        default=DEFAULT_CUSTOM_ENTITY_PATH),
     "witcher_ac_target_slot": EnumProperty(
         name="Slot", description="Bone (parentSlotName) to attach meshes to",
         items=_slot_enum_items),

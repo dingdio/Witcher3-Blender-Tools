@@ -3984,11 +3984,9 @@ def _cutscene_write_generated_actor_template_entries(context, entries, force=Fal
     if not targets:
         return []
 
-    from .. import get_wolvenkit
     from ..CR2W import animated_component as animated_component_builder
     from . import ui_animated_component
 
-    wolvenkit_exe = get_wolvenkit(context)
     written = []
     for entry in targets:
         kind = entry.get("kind")
@@ -4020,7 +4018,6 @@ def _cutscene_write_generated_actor_template_entries(context, entries, force=Fal
         animated_component_builder.generate_entity(
             attachments,
             full_path,
-            wolvenkit_exe,
             skeleton_path=skeleton_path,
             behavior_path=behavior_path or None,
             entity_name=entry.get("actor_name") or "trajectories",

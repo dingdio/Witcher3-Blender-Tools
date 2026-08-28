@@ -111,6 +111,119 @@ class AnimatedComponentBuilderTests(unittest.TestCase):
         mesh_transform = chunks["CMeshComponent #5"]["_vars"]["transform"]["_vars"]
         self.assertEqual(mesh_transform["Scale_x"]["_value"], 2.0)
 
+    def _parse(self, build):
+        import os
+        import tempfile
+        from witcher3_tools.CR2W.CR2W_file import read_CR2W
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "entity.w2ent")
+            build(out)
+            return read_CR2W(out)
+
+    def test_static_entity_has_no_animated_component(self):
+        parsed = self._parse(lambda out: animated_component.generate_entity(
+            [], out, skeleton_path=None, behavior_path=None, entity_name="crate",
+            static_meshes=[
+                {"mesh": r"environment\a.w2mesh", "name": "a"},
+                {"mesh": r"environment\b.w2mesh", "transform": {"X": 1.5, "Yaw": 90.0, "Scale_x": 2.0}},
+            ]))
+        exports = parsed.CR2WExport
+        self.assertEqual([e.name for e in exports],
+                         ["CEntityTemplate", "CEntity", "CStaticMeshComponent", "CStaticMeshComponent"])
+        self.assertEqual([e.parentID for e in exports], [0, 1, 2, 2])
+        first, second = parsed.CHUNKS.CHUNKS[2], parsed.CHUNKS.CHUNKS[3]
+        self.assertEqual([p.theName for p in first.PROPS], ["guid", "name", "mesh"])
+        self.assertEqual([p.theName for p in second.PROPS], ["transform", "guid", "name", "mesh"])
+        transform = next(p for p in second.PROPS if p.theName == "transform").EngineTransform
+        self.assertAlmostEqual(transform.X, 1.5)
+        self.assertAlmostEqual(transform.Yaw, 90.0)
+        self.assertAlmostEqual(transform.Scale_x, 2.0)
+        self.assertAlmostEqual(transform.Scale_y, 1.0)
+
+    def test_mixed_entity_lists_all_components(self):
+        parsed = self._parse(lambda out: animated_component.generate_entity(
+            [{"mesh": r"items\a.w2mesh", "slot": "Trajectory01", "bone_index": 1}], out,
+            entity_name="mixed", static_meshes=[{"mesh": r"environment\b.w2mesh"}]))
+        exports = parsed.CR2WExport
+        self.assertEqual([e.name for e in exports],
+                         ["CEntityTemplate", "CEntity", "CAnimatedComponent", "CHardAttachment",
+                          "CSkeletonBoneSlot", "CMeshComponent", "CStaticMeshComponent"])
+        self.assertEqual([e.parentID for e in exports], [0, 1, 2, 3, 3, 2, 2])
+
+    def test_native_attachment_keeps_transforms_and_flags(self):
+        from witcher3_tools.rigging.attachment import attachment_flag_names
+
+        parsed = self._parse(lambda out: animated_component.generate_entity([{
+            "mesh": r"items\a.w2mesh", "slot": "Trajectory01", "bone_index": 1,
+            "relative_transform": {"X": 1.5, "Yaw": 30.0},
+            "attachment_flags": 9,
+            "component_transform": {"Scale_x": 2.0},
+        }], out, entity_name="offset"))
+        hard, mesh = parsed.CHUNKS.CHUNKS[3], parsed.CHUNKS.CHUNKS[5]
+        self.assertEqual([p.theName for p in hard.PROPS][-2:], ["relativeTransform", "attachmentFlags"])
+        relative = next(p for p in hard.PROPS if p.theName == "relativeTransform").EngineTransform
+        self.assertAlmostEqual(relative.X, 1.5)
+        self.assertAlmostEqual(relative.Yaw, 30.0)
+        flags = next(p for p in hard.PROPS if p.theName == "attachmentFlags")
+        self.assertEqual(attachment_flag_names(flags), ["HAF_FreePositionAxisX", "HAF_FreeRotation"])
+        transform = next(p for p in mesh.PROPS if p.theName == "transform").EngineTransform
+        self.assertAlmostEqual(transform.Scale_x, 2.0)
+
+    def test_hard_attachments_require_a_skeleton(self):
+        with self.assertRaises(ValueError):
+            animated_component.build_entity_cr2w(
+                [{"mesh": r"items\a.w2mesh", "slot": "Trajectory01", "bone_index": 1}],
+                skeleton_path=None)
+
+    def test_static_mesh_requires_a_path(self):
+        with self.assertRaises(ValueError):
+            animated_component.build_entity_cr2w([], skeleton_path=None, static_meshes=[{"mesh": ""}])
+
+    def test_depot_paths_must_be_game_relative(self):
+        # Absolute, UNC and traversing paths must never reach the CR2W import table.
+        att = [{"mesh": r"items\a.w2mesh", "slot": "Trajectory01", "bone_index": 1}]
+        bad = [r"E:\abs\x", "\\\\server\\share\\x", r"..\x", r"a\..\x", r"a\.\x"]
+        for path in bad:
+            with self.assertRaises(ValueError, msg=path):
+                animated_component.build_entity_cr2w(att, skeleton_path=path + ".w2rig")
+            with self.assertRaises(ValueError, msg=path):
+                animated_component.build_entity_cr2w(att, behavior_path=path + ".w2beh")
+            with self.assertRaises(ValueError, msg=path):
+                animated_component.build_entity_cr2w(
+                    [{"mesh": path + ".w2mesh", "slot": "Trajectory01", "bone_index": 1}])
+            with self.assertRaises(ValueError, msg=path):
+                animated_component.build_entity_cr2w(
+                    [], skeleton_path=None, static_meshes=[{"mesh": path + ".w2mesh"}])
+        # Rooted and forward-slash paths are normalised, not rejected.
+        self.assertEqual(animated_component._depot_path("/items/a.w2mesh", "t"), r"items\a.w2mesh")
+        self.assertEqual(animated_component._depot_path("\\items\\a.w2mesh", "t"), r"items\a.w2mesh")
+
+    def test_import_table_holds_normalised_paths(self):
+        att = [{"mesh": "items/a.w2mesh", "slot": "Trajectory01", "bone_index": 1}]
+        data = animated_component.build_entity_json(att, skeleton_path="/characters/a.w2rig",
+                                                    behavior_path="foo/bar.w2beh")
+        self.assertEqual({(i["_className"], i["_depotPath"]) for i in data["_imports"]}, {
+            ("CSkeleton", r"characters\a.w2rig"), ("CBehaviorGraph", r"foo\bar.w2beh"), ("CMesh", r"items\a.w2mesh")})
+
+        parsed = self._parse(lambda out: animated_component.generate_entity(
+            att, out, skeleton_path="/characters/a.w2rig", behavior_path="foo/bar.w2beh"))
+        depot_paths = {str(getattr(i, "path", None) or getattr(i, "depotPath", None) or "") for i in parsed.CR2WImport}
+        self.assertEqual(depot_paths, {r"characters\a.w2rig", r"foo\bar.w2beh", r"items\a.w2mesh"})
+
+    def test_handle_extensions_are_enforced(self):
+        att = [{"mesh": r"items\a.w2mesh", "slot": "Trajectory01", "bone_index": 1}]
+        with self.assertRaises(ValueError):
+            animated_component.build_entity_cr2w(att, skeleton_path=r"items\a.w2mesh")
+        with self.assertRaises(ValueError):
+            animated_component.build_entity_cr2w(att, behavior_path=r"gameplay\x.txt")
+        with self.assertRaises(ValueError):
+            animated_component.build_entity_cr2w(
+                [{"mesh": r"characters\a.w2rig", "slot": "Trajectory01", "bone_index": 1}])
+        with self.assertRaises(ValueError):
+            animated_component.build_entity_cr2w(
+                [], skeleton_path=None, static_meshes=[{"mesh": r"characters\a.w2rig"}])
+
 
 if __name__ == "__main__":
     unittest.main()

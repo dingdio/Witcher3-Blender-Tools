@@ -39,6 +39,13 @@ def write_w2cutscene(cr2w, file_path):
         f.write(data)
 
 
+def write_w2ent(cr2w, file_path):
+    _ensure_parent_dir(file_path)
+    data = _build_cr2w_bytes(cr2w)
+    with open(file_path, "wb") as f:
+        f.write(data)
+
+
 def write_xbm(cr2w, file_path):
     _ensure_parent_dir(file_path)
     data = _build_cr2w_bytes(cr2w)
@@ -587,6 +594,10 @@ def _encode_property_value(prop, name_to_index, import_index):
     if p_type is None:
         return b""
 
+    raw_bytes = getattr(prop, "RawBytes", None)
+    if raw_bytes is not None:
+        return struct.pack("<I", len(raw_bytes)) + bytes(raw_bytes)
+
     if p_type.endswith("StringAnsi"):
         value = getattr(prop, "String", None)
         if hasattr(value, "String"):
@@ -653,6 +664,25 @@ def _encode_property_value(prop, name_to_index, import_index):
         dt = getattr(prop, "DateTime", None)
         value = getattr(dt, "Value", 0) if dt else 0
         return struct.pack("<Q", value)
+
+    if p_type == "CGUID":
+        raw = bytes(getattr(prop, "Bytes", b"") or b"")
+        return raw[:16].ljust(16, b"\x00")
+
+    if p_type == "EngineTransform":
+        et = getattr(prop, "EngineTransform", None)
+        pos = tuple(float(getattr(et, axis, 0.0)) for axis in ("X", "Y", "Z")) if et else (0.0,) * 3
+        rot = tuple(float(getattr(et, axis, 0.0)) for axis in ("Pitch", "Yaw", "Roll")) if et else (0.0,) * 3
+        scale = tuple(float(getattr(et, axis, 1.0)) for axis in ("Scale_x", "Scale_y", "Scale_z")) if et else (1.0,) * 3
+        flags_byte = (1 if any(pos) else 0) | (2 if any(rot) else 0) | (4 if scale != (1.0, 1.0, 1.0) else 0)
+        out = struct.pack("<B", flags_byte)
+        if flags_byte & 1:
+            out += struct.pack("<3f", *pos)
+        if flags_byte & 2:
+            out += struct.pack("<3f", *rot)
+        if flags_byte & 4:
+            out += struct.pack("<3f", *scale)
+        return out
 
     if p_type == "Float":
         return struct.pack("<f", float(getattr(prop, "Value", 0.0)))
