@@ -51,7 +51,7 @@ LOAD_BUFFER_SIZE = 0x55667788
 
 
 def _build_cache(version, entries):
-    header_size = {1: 0x30, 2: 0x40, 9: 0x30, 10: 0x38}[version]
+    header_size = {1: 0x30, 2: 0x40, 9: 0x30, 10: 0x38, 11: 0x38}[version]
     packed_payloads = [zlib.compress(payload) for _, payload in entries]
     data_offsets = []
     data_end = header_size
@@ -195,27 +195,29 @@ class CollisionCacheVersionTests(unittest.TestCase):
                 cache.Files[0].Extract(output)
                 self.assertEqual(output.getvalue(), entries[0][1])
 
-    def test_reads_v10_64_byte_tokens_and_extracts(self):
-        cache, entries = self._parse(10)
+    def test_reads_v10_and_v11_64_byte_tokens_and_extracts(self):
+        for version in (10, 11):
+            with self.subTest(version=version):
+                cache, entries = self._parse(version)
 
-        self.assertEqual(cache.Version, 10)
-        self.assertEqual([item.Name for item in cache.Files], [entry[0] for entry in entries])
-        self.assertEqual(cache.Files[1].Unk1, 0x100000001)
-        self.assertEqual(cache.Files[1].Unk2, 0x200000001)
-        self.assertEqual(cache.Files[1].Unk3, 0x300000001)
-        self.assertEqual(struct.unpack("<4f", cache.Files[1].unk4), (-2.0, -3.0, 2.0, 3.0))
-        self.assertEqual(cache.Files[1].Tail, b"\0" * 3)
-        output = io.BytesIO()
-        cache.Files[1].Extract(output)
-        self.assertEqual(output.getvalue(), entries[1][1])
+                self.assertEqual(cache.Version, version)
+                self.assertEqual([item.Name for item in cache.Files], [entry[0] for entry in entries])
+                self.assertEqual(cache.Files[1].Unk1, 0x100000001)
+                self.assertEqual(cache.Files[1].Unk2, 0x200000001)
+                self.assertEqual(cache.Files[1].Unk3, 0x300000001)
+                self.assertEqual(struct.unpack("<4f", cache.Files[1].unk4), (-2.0, -3.0, 2.0, 3.0))
+                self.assertEqual(cache.Files[1].Tail, b"\0" * 3)
+                output = io.BytesIO()
+                cache.Files[1].Extract(output)
+                self.assertEqual(output.getvalue(), entries[1][1])
 
     def test_rejects_unsupported_version(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "collision.cache"
-            path.write_bytes(b"CC3W" + struct.pack("<I", 11) + bytes(8))
+            path.write_bytes(b"CC3W" + struct.pack("<I", 12) + bytes(8))
             with self.assertRaisesRegex(
                 collision_module.InvalidCollisionCacheException,
-                "Unsupported collision cache version 11",
+                "Unsupported collision cache version 12",
             ):
                 collision_module.CollisionCache(path)
 

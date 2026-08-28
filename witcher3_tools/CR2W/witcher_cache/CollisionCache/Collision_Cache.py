@@ -35,6 +35,9 @@ class CollisionCache:
     VERSION_2 = 2
     VERSION_9 = 9
     VERSION_10 = 10
+    VERSION_11 = 11
+    SUPPORTED_VERSIONS = (VERSION_1, VERSION_2, VERSION_9, VERSION_10, VERSION_11)
+    V10_LAYOUT_VERSIONS = (VERSION_10, VERSION_11)
     BIT_LENGTH_32 = VERSION_1  # Compatibility aliases for existing callers.
     BIT_LENGTH_64 = VERSION_2
     DATA_OFFSET_V1 = 0x30
@@ -76,9 +79,9 @@ class CollisionCache:
 
             # Read version
             self.Version = f.readUInt32()
-            if self.Version not in (self.VERSION_1, self.VERSION_2, self.VERSION_9, self.VERSION_10):
+            if self.Version not in self.SUPPORTED_VERSIONS:
                 raise InvalidCollisionCacheException(
-                    f"Unsupported collision cache version {self.Version}; expected 1, 2, 9, or 10"
+                    f"Unsupported collision cache version {self.Version}; expected one of {self.SUPPORTED_VERSIONS}"
                 )
 
             # Read date (8 bytes)
@@ -89,7 +92,7 @@ class CollisionCache:
                 self.InfoOffset = f.readUInt64()
                 self.NumberOfFiles = f.readUInt64()
                 self.NameTableOffset = f.readUInt64()
-            elif self.Version == self.VERSION_10:
+            elif self.Version in self.V10_LAYOUT_VERSIONS:
                 self.InfoOffset = f.readUInt64()
                 self.NumberOfFiles = f.readUInt32()
                 self.NameTableOffset = f.readUInt64()
@@ -127,8 +130,8 @@ class CollisionCache:
                 item = CollisionCacheItem(parent=self)
                 item.Name = self.FileNames[i] if i < len(self.FileNames) else ""
 
-                if self.Version == self.VERSION_10:
-                    # v10 token: <IQQIIQQ4fB3x> (64 bytes).
+                if self.Version in self.V10_LAYOUT_VERSIONS:
+                    # v10/v11 token: <IQQIIQQ4fB3x> (64 bytes).
                     item.NameOffset = f.readUInt32()
                     item.Unk1 = f.readUInt64()
                     item.PageOffset = f.readUInt64()

@@ -102,7 +102,8 @@ class TextureCache(object):
                     ti.SliceCount = stream.readInt16()
 
                     ti.MipOffsetIndex = stream.readInt32()
-                    ti.NumMipOffsets = stream.readInt32()
+                    # Cache version 7 packs a flag (=1) into the upper 16 bits.
+                    ti.NumMipOffsets = stream.readInt32() & 0xFFFF
                     ti.TimeStamp = stream.readInt64() 
 
                     ti.Type1 = stream.readUByte()

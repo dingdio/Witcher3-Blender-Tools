@@ -15,13 +15,20 @@ def _get_addon_prefs():
     ctx = getattr(bpy, "context", None) if "bpy" in globals() else None
     prefs_root = getattr(ctx, "preferences", None) if ctx else None
     addons = getattr(prefs_root, "addons", None) if prefs_root else None
-    if not addons:
-        return None
+    prefs = None
+    if addons:
+        try:
+            addon_entry = addons.get(addon_name) if hasattr(addons, "get") else addons[addon_name]
+            prefs = getattr(addon_entry, "preferences", None)
+        except Exception:
+            prefs = None
+    if prefs is not None:
+        return prefs
     try:
-        addon_entry = addons.get(addon_name) if hasattr(addons, "get") else addons[addon_name]
+        from ... import _get_prefs  # headless sessions: same fallback as CR2W.common_blender
+        return _get_prefs(ctx)
     except Exception:
         return None
-    return getattr(addon_entry, "preferences", None)
 
 
 def get_game_path():
