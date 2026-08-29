@@ -84,14 +84,19 @@ def import_w3_fbx(context
     enable_print(False)
     # Small note: The imported objects automatically became selected on import.
     op_started = time.perf_counter()
-    bpy.ops.import_scene.fbx(
-        filepath = filepath
-        ,use_image_search = False
-        ,use_custom_normals = True
-        ,do_namespace_fix = True
-        ,do_UV_fix = False
-        #,use_custom_props = False
-    )
+    fbx_kwargs = {
+        "filepath": filepath,
+        "use_image_search": False,
+        "use_custom_normals": True,
+        "do_namespace_fix": True,
+        "do_UV_fix": False,
+    }
+    supported = {"filepath", "use_image_search", "use_custom_normals"}
+    try:
+        supported = set(bpy.ops.import_scene.fbx.get_rna_type().properties.keys())
+    except Exception:
+        pass
+    bpy.ops.import_scene.fbx(**{key: value for key, value in fbx_kwargs.items() if key in supported})
     fbx_op_seconds = time.perf_counter() - op_started
     enable_print(True)
     obj_name = filename

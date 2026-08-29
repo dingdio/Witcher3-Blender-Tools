@@ -434,7 +434,10 @@ def main() -> None:
         ]
         assert len(detail_groups) == 4, [group.name for group in detail_groups]
 
-        bpy.context.scene.render.engine = "BLENDER_EEVEE_NEXT"
+        try:
+            bpy.context.scene.render.engine = "BLENDER_EEVEE"
+        except TypeError:
+            bpy.context.scene.render.engine = "BLENDER_EEVEE_NEXT"
         bpy.context.scene.render.resolution_x = 16
         bpy.context.scene.render.resolution_y = 16
         bpy.context.scene.render.resolution_percentage = 100

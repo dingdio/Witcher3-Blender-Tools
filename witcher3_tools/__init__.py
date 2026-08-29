@@ -14,6 +14,7 @@ from .extension_paths import (
     get_texture_root,
     get_uncook_root,
     get_w2_uncook_root,
+    require_online_access,
 )
 from .lod_utils import lod_level_from_name
 
@@ -1107,6 +1108,7 @@ def _request_github_json(url):
     import json
     import urllib.request
 
+    require_online_access()
     request = urllib.request.Request(
         url,
         headers={
@@ -1156,6 +1158,7 @@ def _find_latest_wolvenkit_nightly_release():
 def _download_file(url, destination, expected_size=0, progress_callback=None):
     import urllib.request
 
+    require_online_access()
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
     temp_path = destination.with_name(destination.name + ".download")

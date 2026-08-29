@@ -7,6 +7,7 @@ import bpy
 from bpy.types import Object
 
 from .. import get_redcloth_simulation_enabled, get_redcloth_wind_velocity
+from ..gn_compat import gn_input_get, gn_input_set
 
 
 log = logging.getLogger(__name__)
@@ -59,7 +60,7 @@ def apply_redcloth_runtime_defaults(cloth_obj: Object, context) -> None:
         pass
 
     try:
-        mod["Socket_5"] = wind_velocity
+        gn_input_set(mod, "Socket_5", wind_velocity)
         node_group = getattr(mod, "node_group", None)
         if node_group is not None:
             node_group.interface_update(context)
@@ -169,10 +170,7 @@ def _classify_collection_info_node(node, mod=None):
             for token in (getattr(from_sock, "identifier", ""), getattr(from_sock, "name", "")):
                 if not token:
                     continue
-                try:
-                    coll_val = mod[token]
-                except Exception:
-                    coll_val = None
+                coll_val = gn_input_get(mod, token)
                 role = _role_from_token(getattr(coll_val, "name", ""))
                 if role:
                     return role

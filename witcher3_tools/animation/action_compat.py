@@ -195,6 +195,10 @@ def bind_strip_action_slot(strip, slot):
     if strip is None or slot is None:
         return
 
+    # Blender can crash when rebinding an already-bound slot.
+    if getattr(strip, "action_slot", None) == slot:
+        return
+
     if hasattr(strip, "action_slot"):
         try:
             strip.action_slot = slot

@@ -5020,8 +5020,7 @@ def _read_bone_first_frame_quat(action, armature_obj=None, bone_name="Root", def
     euler_curves = {}  # array_index → fcurve
     euler_order = 'XYZ'
 
-    fcurve_iter = (iter_action_fcurves(action, target=armature_obj)
-                   if armature_obj is not None else action.fcurves)
+    fcurve_iter = iter_action_fcurves(action, target=armature_obj)
     for fc in fcurve_iter:
         if fc.data_path == quat_path and fc.keyframe_points:
             f = fc.keyframe_points[0].co[0]

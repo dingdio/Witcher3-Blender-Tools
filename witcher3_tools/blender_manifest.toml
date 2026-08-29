@@ -23,7 +23,8 @@ wheels = [
 
 [permissions]
 files = "Read game data and write caches/exports"
-network = "Read the local REDkit debug service"
+network = "Download assets and communicate with external tools"
+clipboard = "Copy asset paths, texture export paths and string IDs"
 
 [build]
 paths_exclude_pattern = [

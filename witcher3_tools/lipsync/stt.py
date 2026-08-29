@@ -7,7 +7,7 @@ import threading
 import urllib.request
 from pathlib import Path
 
-from ..extension_paths import get_extension_user_dir
+from ..extension_paths import get_extension_user_dir, require_online_access
 
 
 log = logging.getLogger(__name__)
@@ -94,6 +94,7 @@ def download_recommended_model(target_path="", progress_callback=None):
             progress_callback(target.stat().st_size, target.stat().st_size)
         return target
 
+    require_online_access()
     temp_path = target.with_name(target.name + ".download")
     if temp_path.exists():
         temp_path.unlink()

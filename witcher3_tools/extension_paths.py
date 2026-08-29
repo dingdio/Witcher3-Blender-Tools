@@ -135,3 +135,13 @@ def get_dev_override_list(key: str, default=None):
     if isinstance(value, list):
         return value
     return default
+
+
+def require_online_access():
+    try:
+        import bpy
+        online = bpy.app.online_access
+    except (ImportError, AttributeError):
+        return
+    if not online:
+        raise RuntimeError("Blender online access is disabled (Preferences > System > Network, or --offline-mode).")

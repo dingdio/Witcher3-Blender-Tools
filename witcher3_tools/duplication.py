@@ -12,6 +12,8 @@ import uuid
 
 import bpy
 
+from .gn_compat import gn_input_get, gn_input_identifiers, gn_input_set
+
 log = logging.getLogger(__name__)
 
 __all__ = [
@@ -404,24 +406,15 @@ def _remap_duplicate_node_group_refs(node_group, id_map, visited=None):
 
 def _remap_duplicate_modifier_node_groups(duplicate_obj, id_map, node_group_map):
     for modifier in getattr(duplicate_obj, "modifiers", []) or []:
-        modifier_keys = []
         if getattr(modifier, "type", "") == "NODES":
-            try:
-                modifier_keys = list(modifier.keys())
-            except Exception:
-                modifier_keys = []
-        for key in modifier_keys:
-            try:
-                current_value = modifier[key]
-            except Exception:
-                continue
-            mapped_value = id_map.get(_duplicate_id_key(current_value))
-            if mapped_value is None:
-                continue
-            try:
-                modifier[key] = mapped_value
-            except Exception:
-                pass
+            for key in gn_input_identifiers(modifier):
+                mapped_value = id_map.get(_duplicate_id_key(gn_input_get(modifier, key)))
+                if mapped_value is None:
+                    continue
+                try:
+                    gn_input_set(modifier, key, mapped_value)
+                except Exception:
+                    pass
 
         node_group = getattr(modifier, "node_group", None)
         if node_group is None:

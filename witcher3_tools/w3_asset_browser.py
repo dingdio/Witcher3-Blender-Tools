@@ -2209,6 +2209,7 @@ def _capture_location_preview(context, filepath: str) -> None:
 
     render = context.scene.render
     image_settings = render.image_settings
+    previous_media_type = getattr(image_settings, "media_type", None)
     previous = (
         render.filepath,
         image_settings.file_format,
@@ -2219,6 +2220,8 @@ def _capture_location_preview(context, filepath: str) -> None:
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     try:
         render.filepath = filepath
+        if previous_media_type is not None:
+            image_settings.media_type = 'IMAGE'
         image_settings.file_format = 'PNG'
         render.resolution_x = 640
         render.resolution_y = 360
@@ -2228,6 +2231,8 @@ def _capture_location_preview(context, filepath: str) -> None:
         if 'FINISHED' not in result or not win_path_exists(filepath):
             raise RuntimeError("Blender did not write the viewport screenshot")
     finally:
+        if previous_media_type is not None:
+            image_settings.media_type = previous_media_type
         (
             render.filepath,
             image_settings.file_format,

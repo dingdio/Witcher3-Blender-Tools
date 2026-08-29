@@ -8,8 +8,6 @@ Export: Samples w3_face_poses per frame -> temporary mesh + armature -> RE expor
 """
 
 import os
-import site
-import sys
 import addon_utils
 import bpy
 import logging
@@ -27,12 +25,6 @@ _RE_PLUGIN_PATCHED = False
 #  Helpers
 # ---------------------------------------------------------------------------
 
-def _ensure_user_site_on_path():
-    user_site = getattr(site, "USER_SITE", "") or ""
-    if user_site and user_site not in sys.path:
-        sys.path.insert(0, user_site)
-
-
 def _is_re_plugin_available():
     try:
         _exists, enabled = addon_utils.check("blender_re_animations_plugin")
@@ -42,7 +34,6 @@ def _is_re_plugin_available():
 
 
 def _is_h5py_available():
-    _ensure_user_site_on_path()
     try:
         import h5py  # noqa: F401
         return True
@@ -264,7 +255,6 @@ def _read_curvekeys_trackdata(curvekeys, tracknames):
 
 
 def _read_re_shape_key_frames_h5py(resolved_path):
-    _ensure_user_site_on_path()
     try:
         import h5py
     except ImportError as exc:
@@ -286,7 +276,6 @@ def _read_re_shape_key_frames_h5py(resolved_path):
 
 
 def _read_re_shape_key_frames_bridge(resolved_path):
-    _ensure_user_site_on_path()
     try:
         from blender_re_animations_plugin.hdf_manager import HdfManager
         from blender_re_animations_plugin.asset_node import ReAssetNode
