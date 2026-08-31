@@ -4,6 +4,17 @@ Notable changes to **Witcher 3 Blender Tools** are documented here.
 
 ## [Unreleased]
 
+### Changed
+
+#### Cutscene authoring redesign
+- Redesigned the Cutscene panel around Actors, Clips, Camera, Events, Dialogue, and Export tabs.
+- Added a guided bake, validation, and export workflow.
+- Made baking and export transactional with exact rollback on failure.
+- Improved actor casting, entity management, and Witcher 2 retargeting.
+- Added W2/W3 clip browsing with stable IDs and reliable mute and re-import behavior.
+- Prevented promoted clips from also evaluating their `anim_import` or `mimic_import` sources.
+- Added camera shot/rig conversion, prop entity export, and copyable validation reports.
+
 ## [1.1.0] - 2026-06-23
 
 1.1.0 expands Witcher 2 support, scene and cutscene authoring tools, lipsync

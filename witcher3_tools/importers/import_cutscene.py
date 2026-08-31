@@ -31,11 +31,37 @@ log = logging.getLogger(__name__)
 CUTSCENE_GUID_PROP = "witcher_cutscene_guid"
 CUTSCENE_TRACK_NAME = "cutscene_anim"
 CUTSCENE_FACE_TRACK_NAME = f"{CUTSCENE_TRACK_NAME}_face"
+CUTSCENE_FILE_TRACK_NAME = f"{CUTSCENE_TRACK_NAME}_file"
+CUTSCENE_FILE_FACE_TRACK_NAME = f"{CUTSCENE_FACE_TRACK_NAME}_file"
 CUTSCENE_SOURCE_PATH_PROP = "witcher_cutscene_source_path"
 CUTSCENE_SOURCE_INDEX_PROP = "witcher_cutscene_source_index"
 CUTSCENE_ANIMATION_NAME_PROP = "witcher_cutscene_animation_name"
 CUTSCENE_ACTOR_IMPORTED_PROP = "cutscene_actor_imported"
 CUTSCENE_ACTOR_SOURCE_GAME_PROP = "cutscene_actor_source_game"
+ACTOR_CUSTOM_PROP_DEFAULTS = {
+    "cutscene_actor_name": "",
+    "cutscene_actor_tag": "",
+    "cutscene_actor_voice_tag": "",
+    "cutscene_actor_template": "",
+    CUTSCENE_ACTOR_SOURCE_GAME_PROP: "",
+    "cutscene_actor_appearance": "",
+    "cutscene_actor_type": "CAT_Actor",
+    "cutscene_actor_final_position": "",
+    "cutscene_actor_kill_me": False,
+    "cutscene_actor_use_mimic": False,
+    "cutscene_actor_anim_final_pos": "",
+}
+
+
+def ensure_actor_custom_props(obj):
+    """Ensure actor UI properties exist."""
+    if obj is None:
+        return
+    for key, value in ACTOR_CUSTOM_PROP_DEFAULTS.items():
+        if key not in obj:
+            obj[key] = value
+
+
 CUTSCENE_APPEARANCE_DATA_PATH = "witcherui_RigSettings.app_list_index"
 FACE_MORPHS_APPEARANCE_PROP = "witcher_face_morphs_loaded_for_appearance"
 CUTSCENE_BURNED_AUDIO_PROP = "witcher_cutscene_burned_audio"
@@ -671,6 +697,14 @@ def _cutscene_track_name_for_animation(anim_name, base_track=CUTSCENE_TRACK_NAME
         return CUTSCENE_FACE_TRACK_NAME
     return str(base_track or CUTSCENE_TRACK_NAME)
 
+def _cutscene_file_track_name_for_animation(anim_name, source_index, base_track=CUTSCENE_FILE_TRACK_NAME):
+    base_text = str(base_track or CUTSCENE_FILE_TRACK_NAME).strip()
+    if _is_face_cutscene_animation(anim_name):
+        base_text = CUTSCENE_FILE_FACE_TRACK_NAME
+    elif base_text == CUTSCENE_TRACK_NAME:
+        base_text = CUTSCENE_FILE_TRACK_NAME
+    return f"{base_text}_{_coerce_source_index(source_index)}"
+
 def _is_cutscene_track_name(track_name, base_track=CUTSCENE_TRACK_NAME):
     track_text = str(track_name or "").strip()
     base_text = str(base_track or CUTSCENE_TRACK_NAME).strip()
@@ -1211,6 +1245,7 @@ def _tag_cutscene_actor(actor_obj, actor, source_index=-1, source_path="", impor
     actor_obj[CUTSCENE_ACTOR_IMPORTED_PROP] = bool(imported_new)
     if cutscene_guid:
         actor_obj[CUTSCENE_GUID_PROP] = str(cutscene_guid)
+    ensure_actor_custom_props(actor_obj)
 
 def _clear_cutscene_actor_tags(actor_obj):
     if actor_obj is None:
@@ -1380,9 +1415,10 @@ def _generate_cutscene_guid():
 
     return generate_guid()
 
-def clear_cutscene_actor_animation_tracks(actor_obj, track_name=None):
+def clear_cutscene_actor_animation_tracks(actor_obj, track_name=None, source_path=None):
     removed_tracks = 0
     removed_actions = []
+    normalized_source_path = _normalize_filesystem_path(source_path)
     for armature_obj in _iter_cutscene_related_armatures(actor_obj):
         anim_data = getattr(armature_obj, "animation_data", None)
         if not anim_data:
@@ -1394,18 +1430,31 @@ def clear_cutscene_actor_animation_tracks(actor_obj, track_name=None):
                     continue
             elif not _is_cutscene_track_name(current_track_name):
                 continue
-            for strip in track.strips:
+            if normalized_source_path and "_prebake" in current_track_name:
+                continue
+            matching_strips = list(track.strips)
+            if normalized_source_path:
+                matching_strips = [
+                    strip for strip in matching_strips
+                    if _normalize_filesystem_path(
+                        getattr(strip, "action", None).get(CUTSCENE_SOURCE_PATH_PROP, "")
+                        if getattr(strip, "action", None) is not None else ""
+                    ) == normalized_source_path
+                ]
+            for strip in matching_strips:
                 action = getattr(strip, "action", None)
                 if action and action.name not in removed_actions:
                     removed_actions.append(action.name)
-            anim_data.nla_tracks.remove(track)
-            removed_tracks += 1
+                track.strips.remove(strip)
+            if not normalized_source_path or (matching_strips and len(track.strips) == 0):
+                anim_data.nla_tracks.remove(track)
+                removed_tracks += 1
 
     for action_name in removed_actions:
         action = bpy.data.actions.get(action_name)
         if action and action.users == 0:
             bpy.data.actions.remove(action)
-    if not track_name:
+    if not track_name and not normalized_source_path:
         clear_cutscene_actor_appearance_keys(actor_obj)
     return removed_tracks
 
@@ -1679,11 +1728,28 @@ def _estimate_animation_frame_count(node):
     estimated = int(round(duration * fps))
     return max(1, estimated)
 
+def _cutscene_strip_pointer(strip):
+    try:
+        return int(strip.as_pointer())
+    except Exception:
+        return id(strip)
+
+def _snapshot_cutscene_strip_pointers(actor_obj):
+    pointers = set()
+    for armature_obj in _iter_cutscene_related_armatures(actor_obj):
+        anim_data = getattr(armature_obj, "animation_data", None)
+        if not anim_data:
+            continue
+        for track in anim_data.nla_tracks:
+            pointers.update(_cutscene_strip_pointer(strip) for strip in track.strips)
+    return pointers
+
 def _tag_cutscene_animation_actions(target_armatures, track_name, anim_name, source_path, source_index, at_frame,
-                                    duration_frames=None):
+                                    duration_frames=None, existing_strip_pointers=None):
     start_frame = float(at_frame or 0.0)
     duration_frames = max(1.0, float(duration_frames or 0.0))
     end_frame = start_frame + duration_frames - 0.001
+    existing_strip_pointers = set(existing_strip_pointers or ())
     for armature_obj in target_armatures or []:
         anim_data = getattr(armature_obj, "animation_data", None)
         if not anim_data:
@@ -1692,6 +1758,8 @@ def _tag_cutscene_animation_actions(target_armatures, track_name, anim_name, sou
         if track is None:
             continue
         for strip in track.strips:
+            if _cutscene_strip_pointer(strip) in existing_strip_pointers:
+                continue
             strip_frame_start = float(getattr(strip, "frame_start", 0.0) or 0.0)
             if strip_frame_start < start_frame - 0.001 or strip_frame_start > end_frame:
                 continue
@@ -1705,10 +1773,12 @@ def _tag_cutscene_animation_actions(target_armatures, track_name, anim_name, sou
 def is_cutscene_animation_loaded(actor_obj, animation_name, source_path, source_index, track_name=None):
     animation_name = str(animation_name or "").strip()
     source_path = str(source_path or "").strip()
+    normalized_source_path = _normalize_filesystem_path(source_path)
     try:
         source_index = int(source_index)
     except Exception:
         source_index = -1
+    stable_identity_supplied = bool(normalized_source_path) or source_index >= 0
 
     for armature_obj in _iter_cutscene_related_armatures(actor_obj):
         anim_data = getattr(armature_obj, "animation_data", None)
@@ -1726,10 +1796,16 @@ def is_cutscene_animation_loaded(actor_obj, animation_name, source_path, source_
                 if action is None:
                     continue
                 if (
-                    str(action.get(CUTSCENE_SOURCE_PATH_PROP, "") or "") == source_path
-                    and _coerce_source_index(action.get(CUTSCENE_SOURCE_INDEX_PROP, -1)) == source_index
+                    (not normalized_source_path or _normalize_filesystem_path(
+                        action.get(CUTSCENE_SOURCE_PATH_PROP, "")
+                    ) == normalized_source_path)
+                    and (source_index < 0 or _coerce_source_index(
+                        action.get(CUTSCENE_SOURCE_INDEX_PROP, -1)
+                    ) == source_index)
                 ):
                     return True
+                if stable_identity_supplied:
+                    continue
                 action_name = str(getattr(action, "name", "") or "")
                 strip_name = str(getattr(strip, "name", "") or "")
                 if animation_name and (action_name == animation_name or strip_name == animation_name):
@@ -2018,12 +2094,14 @@ def _auto_apply_cutscene_animations(filename, cutscene_template, actor_objects_b
         actor_obj = actor_info["actor_obj"]
         actor_name = actor_info["actor_name"]
         try:
+            clear_cutscene_actor_animation_tracks(actor_obj, source_path=filename)
             actor_applied, _actor_errors = _apply_cutscene_animation_sequence_template(
                 cutscene_template,
                 filename,
                 actor_info["indices"],
                 actor_obj,
                 actor_name=actor_name,
+                track_name=CUTSCENE_FILE_TRACK_NAME,
                 return_errors=True,
             )
             applied_indices.update(actor_applied)
@@ -3015,7 +3093,7 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
 
     from ..ui.ui_anims_list import load_anim_into_scene
 
-    cutscene_source_game = "w2" if _is_w2_cutscene_file(filename) else ""
+    cutscene_source_game = "w2" if _is_w2_cutscene_file(filename) else "w3"
     applied_indices = set()
     error_messages = {}
     for context in animation_contexts:
@@ -3023,7 +3101,11 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
         anim_name = str(context.get("anim_name", "") or "")
         component_name = str(context.get("component_name", "") or "")
         at_frame = float(context.get("at_frame", 0.0) or 0.0)
-        animation_track_name = _cutscene_track_name_for_animation(anim_name, base_track=track_name)
+        animation_track_name = _cutscene_file_track_name_for_animation(
+            anim_name,
+            idx,
+            base_track=track_name,
+        )
 
         try:
             face_target_mode = "owner"
@@ -3033,6 +3115,7 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
                 _ensure_cutscene_face_setup(actor_obj)
                 if _w2_mimic_armature_for_actor(actor_obj) is not None:
                     face_target_mode = "auto"
+            existing_strip_pointers = _snapshot_cutscene_strip_pointers(actor_obj)
             target_armatures = load_anim_into_scene(
                 bpy.context,
                 anim_name,
@@ -3044,6 +3127,8 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
                 target_component=target_component,
                 source_game=cutscene_source_game,
                 cutscene_template=None if cutscene_source_game == "w2" else cutscene_template,
+                cutscene_entry=context["node"],
+                cutscene_source_index=idx,
             )
             _tag_cutscene_animation_actions(
                 target_armatures,
@@ -3053,6 +3138,7 @@ def _apply_cutscene_animation_sequence_template(cutscene_template, filename, ani
                 idx,
                 at_frame,
                 duration_frames=context.get("duration_frames", 0),
+                existing_strip_pointers=existing_strip_pointers,
             )
             applied_indices.add(idx)
         except Exception as exc:
@@ -3280,6 +3366,9 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
     window_manager = getattr(context, "window_manager", None)
     workspace = getattr(context, "workspace", None)
     import_started_at = time.perf_counter()
+    previous_loaded_cutscene_path = str(
+        getattr(scene, "witcher_loaded_w2cutscene_path", "") or ""
+    )
 
     def _set_progress(percent, message):
         _cutscene_progress_update(window_manager, workspace, percent, message)
@@ -3291,10 +3380,13 @@ def import_w3_cutscene(filename, selected_actor_indices=None, selected_animation
         if CCutsceneTemplate is None:
             return None
         retarget = normalize_cutscene_w2w3_retarget_options(retarget_options)
+        try:
+            CCutsceneTemplate.previous_loaded_cutscene_path = previous_loaded_cutscene_path
+        except Exception:
+            pass
 
         treeList = scene.witcher_w2cutscene_list
         treeList.clear()
-        scene.witcher_loaded_w2cutscene_path = filename
 
         selected_actor_indices = None if selected_actor_indices is None else {int(idx) for idx in selected_actor_indices}
         selected_animation_indices = None if selected_animation_indices is None else {int(idx) for idx in selected_animation_indices}

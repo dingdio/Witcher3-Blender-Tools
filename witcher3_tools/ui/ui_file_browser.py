@@ -9738,7 +9738,11 @@ class FileActionOperatorImportToScene(Operator):
                 bpy.context.view_layer.update()
             elif ext == ".w2cutscene":
                 from ..importers import import_cutscene
-                import_cutscene.import_w3_cutscene(abs_file_path)
+                from .ui_cutscene import _sync_loaded_cutscene_state, sync_animation_items_from_scene
+                sync_animation_items_from_scene(context.scene)
+                cutscene_data = import_cutscene.import_w3_cutscene(abs_file_path)
+                if cutscene_data is not None:
+                    _sync_loaded_cutscene_state(context.scene, abs_file_path, cutscene_data=cutscene_data)
             elif ext == ".w2anims" or abs_file_path.lower().endswith(".w2anims.json"):
                 from ..importers import import_anims
                 import_anims.start_import(context, abs_file_path)

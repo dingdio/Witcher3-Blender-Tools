@@ -7,6 +7,7 @@ import bpy
 from .repo_paths.casting import casting_record, resolve_cast
 from .repo_paths.entity_resolver import resolve_entity_repo_path
 from .repo_paths.materialize import materialize_entity_repo_path
+from .importers.import_cutscene import ensure_actor_custom_props
 
 
 def _default_actor_label(name: str) -> str:
@@ -94,6 +95,7 @@ def cast_actor(name, appearance="", at=None, actor_label="", entity_namespace=""
         holder["cutscene_actor_template"] = repo_path
         holder["cutscene_actor_appearance"] = appearance or ""
         holder["cutscene_actor_type"] = "CAT_Actor"
+        ensure_actor_custom_props(holder)
     if at is not None:
         root.location = at
 

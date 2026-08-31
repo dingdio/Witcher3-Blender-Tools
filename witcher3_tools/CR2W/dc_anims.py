@@ -1438,10 +1438,15 @@ def load_bin_anims_info(fileName, anim_name = None, rigPath = None) -> w3_types.
     return create_anim_set_info_only(theFile)
 
 
-def load_bin_anims_single(fileName, anim_name = None, rigPath = None) -> w3_types.CSkeletalAnimationSet:
+def load_bin_anims_single(fileName, anim_name = None, rigPath = None, anim_index=None) -> w3_types.CSkeletalAnimationSet:
     if _is_w2_cr2w_version_file(fileName):
         if _w2_file_is_cutscene(fileName):
-            return load_w2_cutscene_anim(fileName, rigPath=rigPath, anim_name=anim_name)
+            return load_w2_cutscene_anim(
+                fileName,
+                rigPath=rigPath,
+                anim_name=anim_name,
+                anim_index=anim_index,
+            )
         return load_w2_anims_full(fileName, rigPath=rigPath, anim_name=anim_name)
 
     if not rigPath:
@@ -2215,17 +2220,17 @@ def _rebind_decoded_buffer_to_rig(buffer, bone_names, bone_count, track_names):
     return new_buffer
 
 
-def build_cutscene_anim_entry_for_rig(cutscene_template, anim_name, rigPath=None):
-    """Build one rig-bound animation entry from a parsed W3 cutscene."""
+def build_cutscene_anim_entry_for_rig(cutscene_template, anim_name, rigPath=None, source_entry=None):
+    """Build a rig-bound entry from a parsed W3 cutscene node."""
     anim_name = str(anim_name or "")
-    if not anim_name:
-        return None
-    source_entry = None
-    for entry in getattr(cutscene_template, "animations", None) or []:
-        animation = getattr(entry, "animation", None)
-        if str(getattr(animation, "name", "") or "") == anim_name:
-            source_entry = entry
-            break
+    if source_entry is None:
+        if not anim_name:
+            return None
+        for entry in getattr(cutscene_template, "animations", None) or []:
+            animation = getattr(entry, "animation", None)
+            if str(getattr(animation, "name", "") or "") == anim_name:
+                source_entry = entry
+                break
     if source_entry is None:
         return None
 

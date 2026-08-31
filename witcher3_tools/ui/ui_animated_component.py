@@ -808,10 +808,10 @@ class WITCHER_PT_animated_component(WITCH_PT_Base, bpy.types.Panel):
     def _draw_create(self, layout, context):
         scene = context.scene
         box = layout.box()
-        box.label(text="Cutscene Props Rig", icon='OUTLINER_OB_ARMATURE')
+        box.label(text="Trajectories Entity (Advanced)", icon='OUTLINER_OB_ARMATURE')
         col = box.column(align=True)
-        col.label(text="trajectories_24: 24 animatable slots for props.", icon='INFO')
-        col.label(text="Create, attach meshes to slots, animate, export.", icon='BLANK1')
+        col.label(text="trajectories_24: 24 animatable prop slots.", icon='INFO')
+        col.label(text="Cutscene props: Cutscene → Actors → Props.", icon='BLANK1')
         box.prop(scene, "witcher_ac_entity_path", text="Entity (.w2ent)")
         row = box.row()
         row.scale_y = 1.5

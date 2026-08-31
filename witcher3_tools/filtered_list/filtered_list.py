@@ -46,8 +46,12 @@ class SModUiFilteredListCatItem:
         self.entryPos: int = entryPos
 
 
-def StrFindFirst(str, str2):
-    return str.lower().replace("_", " ").find(str2.lower().replace("_", " "))
+def fold_search_text(value):
+    return " ".join(str(value or "").casefold().replace("_", " ").split())
+
+
+def StrFindFirst(value, query):
+    return fold_search_text(value).find(fold_search_text(query))
 
 # -------------------------------------------------------------------------r---
 class CModUiFilteredList(ABC):

@@ -1327,6 +1327,7 @@ def createCat(cat_name, dict):
 #     return filtered_dictionary
 
 from ..filtered_list.animations_manager import CModStoryBoardAnimationListsManager, CModStoryBoardMimicsListsManager
+from ..filtered_list.filtered_list import fold_search_text
 from ..filtered_list.storyboardasset import CModStoryBoardActor
 from .mimic_compat import (
     collect_actor_mimic_animset_paths,
@@ -1533,6 +1534,114 @@ def _actor_compatible_animation_paths(main_arm_obj, source_game=""):
     return exact_paths, normalized_paths
 
 
+def _resolve_animation_catalog_source(main_arm_obj, source_game="AUTO"):
+    source_text = str(source_game or "AUTO").strip().upper()
+    if source_text in {"", "AUTO"}:
+        return _source_game_for_armature_obj(main_arm_obj)
+    return normalize_source_game(source_text)
+
+
+def _build_animation_catalog_state(context, main_arm_obj, source_game="AUTO", compatible_only=True):
+    context = context or bpy.context
+    resolved_source = _resolve_animation_catalog_source(main_arm_obj, source_game)
+    is_armature = bool(main_arm_obj and getattr(main_arm_obj, "type", None) == "ARMATURE")
+    compatible_paths = None
+
+    if is_armature:
+        rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
+        if rig_settings is None:
+            if compatible_only:
+                log.warning("Armature '%s' has no rig settings; falling back to show-all.", main_arm_obj.name)
+        else:
+            compatible_paths = [
+                str(animset.path)
+                for animset in rig_settings.animset_list
+                if ":" not in str(animset.path)
+            ]
+            if _uses_w2_player_animsets(main_arm_obj, resolved_source):
+                seen_paths = {_normalize_catalog_path(path) for path in compatible_paths}
+                for path in _w2_player_animsets(context):
+                    norm_path = _normalize_catalog_path(path)
+                    if norm_path and norm_path not in seen_paths:
+                        compatible_paths.append(path)
+                        seen_paths.add(norm_path)
+
+    show_all = not compatible_only or not is_armature or compatible_paths is None
+    source_key = _get_quick_anim_source_key(main_arm_obj, show_all, source_override=resolved_source)
+    actor = CModStoryBoardActor()
+    actor.source_game = resolved_source
+    actor._animPaths = None if show_all else compatible_paths
+
+    manager = CModStoryBoardAnimationListsManager()
+    manager.lazyLoad(resolved_source)
+    list_obj = manager.getAnimationListFor(actor)
+    return manager, list_obj, resolved_source, source_key, compatible_paths
+
+
+def _animation_catalog_records(manager, list_obj, source_game, compatible_paths):
+    included_ids = {str(getattr(item, "id", "")) for item in getattr(list_obj, "_items", []) or []}
+    records = []
+    for item in getattr(getattr(manager, "_animMeta", None), "animList", []) or []:
+        catalog_id = str(getattr(item, "slotId", ""))
+        animation_id = str(getattr(item, "id", "") or "").strip()
+        repo_path = str(getattr(item, "path", "") or "").strip()
+        if catalog_id not in included_ids or not repo_path.lower().endswith(".w2anims"):
+            continue
+        categories = [
+            str(getattr(item, attr, "") or "").strip()
+            for attr in ("cat1", "cat2", "cat3")
+        ]
+        records.append({
+            "catalog_id": catalog_id,
+            "animation_id": animation_id,
+            "caption": str(getattr(item, "caption", "") or "").strip(),
+            "category": next((value for value in categories if value), ""),
+            "repo_path": repo_path,
+            "frames": max(0, int(getattr(item, "frames", 0) or 0)),
+            "component": "FACE" if is_face_animation(animation_id, repo_path) else "BODY",
+            "source_game": source_game,
+            "compatible": compatible_paths is None or repo_path in compatible_paths,
+        })
+    return records
+
+
+def build_animation_catalog_records(context, actor_obj, source_game='AUTO', compatible_only=True) -> list[dict]:
+    """Return plain catalog rows without disturbing the interactive Animation browser."""
+    previous_active = CModStoryBoardAnimationListsManager.active
+    previous_active_list = CModStoryBoardAnimationListsManager.active_list
+    try:
+        manager, list_obj, resolved_source, _source_key, compatible_paths = _build_animation_catalog_state(
+            context,
+            actor_obj,
+            source_game=source_game,
+            compatible_only=bool(compatible_only),
+        )
+        return _animation_catalog_records(manager, list_obj, resolved_source, compatible_paths)
+    finally:
+        CModStoryBoardAnimationListsManager.active = previous_active
+        CModStoryBoardAnimationListsManager.active_list = previous_active_list
+
+
+def filter_animation_catalog_records(records, query='', category='ALL', component='') -> list[dict]:
+    """Filter plain catalog rows with the same case/underscore folding for ids and captions."""
+    query_text = fold_search_text(query)
+    category_text = fold_search_text(category)
+    component_text = str(component or "").strip().upper()
+    filtered = []
+    for record in records or ():
+        if category_text and category_text != "all" and fold_search_text(record.get("category")) != category_text:
+            continue
+        if component_text not in {"", "ALL"} and str(record.get("component", "")).upper() != component_text:
+            continue
+        if query_text and not (
+            query_text in fold_search_text(record.get("animation_id"))
+            or query_text in fold_search_text(record.get("caption"))
+        ):
+            continue
+        filtered.append(record)
+    return filtered
+
+
 def _normal_animation_manager(manager=None, source_game: str = "w3"):
     source_game = normalize_source_game(source_game or "w3")
     if manager is None or isinstance(manager, CModStoryBoardMimicsListsManager):
@@ -1609,38 +1718,12 @@ def SetupActor(main_arm_obj, context=None, show_all=False):
     scene_id = _scene_key(scene)
     show_all = show_all or not main_arm_obj
     source_game = _resolve_quick_anim_source(scene, main_arm_obj)
-    source_key = _get_quick_anim_source_key(main_arm_obj, show_all, source_override=source_game)
-
-    animListsManager: CModStoryBoardAnimationListsManager = CModStoryBoardAnimationListsManager()
-    actor = CModStoryBoardActor()
-    actor.source_game = source_game
-
-    if show_all:
-        actor._animPaths = None  # isCompatibleAnimation returns True for all
-    else:
-        rig_settings = getattr(main_arm_obj.data, "witcherui_RigSettings", None)
-        if rig_settings is None:
-            log.warning("Armature '%s' has no rig settings; falling back to show-all.", main_arm_obj.name)
-            actor._animPaths = None
-            source_key = ("__show_all__", source_game)
-        else:
-            animset_list = rig_settings.animset_list
-            actor._animPaths = []
-            for set in animset_list:
-                if ":" not in set.path:
-                    actor._animPaths.append(set.path)
-            if _uses_w2_player_animsets(main_arm_obj, source_game):
-                seen_paths = {_normalize_catalog_path(path) for path in actor._animPaths}
-                for path in _w2_player_animsets(context):
-                    norm_path = _normalize_catalog_path(path)
-                    if norm_path and norm_path not in seen_paths:
-                        actor._animPaths.append(path)
-                        seen_paths.add(norm_path)
-
-    animListsManager.lazyLoad(source_game)
-
-    #TODO list should be filtered by the list of w2anims passed into it from the entity object
-    list = animListsManager.getAnimationListFor(actor)
+    _manager, list, _resolved_source, source_key, _compatible_paths = _build_animation_catalog_state(
+        context,
+        main_arm_obj,
+        source_game=source_game,
+        compatible_only=not show_all,
+    )
     auto_collapse = bool(getattr(scene, "witcher_quick_anim_auto_collapse_categories", True))
     if hasattr(list, "setAutoCollapseCategories"):
         list.setAutoCollapseCategories(auto_collapse)
@@ -1819,7 +1902,8 @@ def _retarget_w2_animation_entry(context, animation_entry, source_rig_path, targ
 
 def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0,
                          face_target_mode="auto", nla_mode='replace', target_component="", source_game="",
-                         use_NLA=True, cutscene_template=None):
+                         use_NLA=True, cutscene_template=None, cutscene_entry=None,
+                         cutscene_source_index=None):
     face_animation = is_face_animation(anim_name, fdir)
     if face_target_mode == "owner" and face_animation:
         main_arm_obj, owner_armature, rig_path = resolve_owner_face_animation_context(
@@ -1865,7 +1949,19 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
         load_rig_path = retarget_source_rig_path
 
     animation = None
-    if cutscene_template is not None and not retarget_w2 and effective_source_game != "w2":
+    if cutscene_entry is not None and not retarget_w2 and effective_source_game != "w2":
+        try:
+            animation = build_cutscene_anim_entry_for_rig(
+                cutscene_template,
+                anim_name,
+                rigPath=load_rig_path,
+                source_entry=cutscene_entry,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Could not bind cutscene animation index {cutscene_source_index}: {exc}") from exc
+        if animation is None:
+            raise RuntimeError(f"Could not bind cutscene animation index {cutscene_source_index}")
+    elif cutscene_template is not None and not retarget_w2 and effective_source_game != "w2":
         # W3 cutscene fast path: the template load already decoded every clip;
         # rebinding it to the rig avoids re-parsing the cutscene per animation.
         try:
@@ -1878,6 +1974,7 @@ def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'an
             fdir,
             anim_name,
             rigPath=load_rig_path,
+            anim_index=cutscene_source_index,
         )
         if not result or not result.animations:
             raise RuntimeError(f"Animation '{anim_name}' was not found in {fdir}")

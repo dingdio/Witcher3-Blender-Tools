@@ -38,6 +38,7 @@ from .ui_cutscene import (
     _load_cutscene_dialogs_into_scene,
     _same_filesystem_path,
     _sync_loaded_cutscene_state,
+    sync_animation_items_from_scene,
 )
 from .ui_cr2w_fields import (
     WITCH_OT_ImportedFieldInfo,
@@ -2019,6 +2020,7 @@ def _load_w2scene_cutscene_section(context, scene_importer, section):
         if override_roots:
             set_repo_override_roots(override_roots, read_only=True)
 
+        sync_animation_items_from_scene(scene)
         cutscene_data = import_cutscene.import_w3_cutscene(
             cutscene_path,
             selected_actor_indices=None,
@@ -3055,7 +3057,7 @@ def _draw_w2scene_panel(layout, scene, context=None):
 
 class WITCHER_PT_scene_panel(WITCH_PT_Base, Panel):
     bl_idname = "WITCHER_PT_scene_panel"
-    bl_label = "Scene"
+    bl_label = "Story Scene (.w2scene)"
     bl_description = ""
     bl_options = {'DEFAULT_CLOSED'}
 

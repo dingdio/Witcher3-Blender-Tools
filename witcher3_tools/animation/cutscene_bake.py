@@ -1,6 +1,7 @@
 """Bake Blender cutscene timelines into engine-ready actor actions."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
@@ -10,10 +11,16 @@ from mathutils import Matrix
 CUTSCENE_TRACK_NAME = BAKE_TRACK_NAME = "cutscene_anim"
 BAKE_BACKUP_SUFFIX = "_prebake"
 BAKED_ACTION_TAG = "cutscene_bake_output"
+BAKED_SOURCE_CLIP_IDS_PROP = "cutscene_bake_source_clip_ids"
+BAKED_SOURCE_CLIP_STARTS_PROP = "cutscene_bake_source_clip_starts"
+CUTSCENE_SOURCE_INDEX_PROP = "witcher_cutscene_source_index"
 PREBAKE_STATE_PROP = "cutscene_prebake_state"
+BAKE_FINGERPRINT_PROP = "witcher_cutscene_bake_fp"
 SCALE_TOL = 1e-4
 
 SCAFFOLD_ACTORS = {"trajectories"}
+IMPORT_TRACK_NAMES = {"anim_import", "mimic_import"}
+_ACTIVE_BAKE_TRANSACTIONS = {}
 
 
 def iter_cutscene_actor_armatures(scene):
@@ -32,7 +39,31 @@ def _active_cutscene_strips(armature):
         t for t in (ad.nla_tracks if ad else [])
         if t.name.startswith(CUTSCENE_TRACK_NAME) and not _is_backup_track(t) and not t.mute
     ]
-    return [s for t in tracks for s in t.strips]
+    return [s for t in tracks for s in t.strips if not s.mute]
+
+
+def _active_cutscene_source_starts(armature):
+    source_starts = {}
+    anim_data = getattr(armature, "animation_data", None)
+    for track in (anim_data.nla_tracks if anim_data else []):
+        if not track.name.startswith(CUTSCENE_TRACK_NAME) or track.mute:
+            continue
+        for strip in track.strips:
+            action = getattr(strip, "action", None)
+            if strip.mute or action is None or action.get(BAKED_ACTION_TAG):
+                continue
+            try:
+                source_index = int(action.get(CUTSCENE_SOURCE_INDEX_PROP, -1))
+            except (TypeError, ValueError):
+                source_index = -1
+            if source_index >= 0:
+                strip_start = float(getattr(strip, "frame_start", 0.0) or 0.0)
+                source_starts[source_index] = min(source_starts.get(source_index, strip_start), strip_start)
+    return source_starts
+
+
+def _active_cutscene_source_ids(armature):
+    return list(_active_cutscene_source_starts(armature))
 
 
 def effective_frame_range(scene):
@@ -43,7 +74,8 @@ def effective_frame_range(scene):
         for track in (ad.nla_tracks if ad else []):
             if track.name.startswith(CUTSCENE_TRACK_NAME) and not track.mute:
                 for strip in track.strips:
-                    end = max(end, int(strip.frame_end))
+                    if not strip.mute:
+                        end = max(end, int(strip.frame_end))
     return int(scene.frame_start), end
 
 
@@ -184,10 +216,50 @@ def _sample_actor(context, armature, frames):
     return samples, custom
 
 
+def _isolate_import_tracks(armatures):
+    states = []
+    for armature in armatures:
+        anim_data = getattr(armature, "animation_data", None)
+        has_cutscene_source = any(
+            not track.mute
+            and track.name.startswith(CUTSCENE_TRACK_NAME)
+            and any(
+                not strip.mute
+                and strip.action is not None
+                and not strip.action.get(BAKED_ACTION_TAG)
+                for strip in track.strips
+            )
+            for track in (anim_data.nla_tracks if anim_data else [])
+        )
+        if not has_cutscene_source:
+            continue
+        isolated = False
+        for track in getattr(anim_data, "nla_tracks", []) or []:
+            if str(getattr(track, "name", "") or "") not in IMPORT_TRACK_NAMES:
+                continue
+            states.append((track, _rna_state(track, ("mute", "is_solo"))))
+            track.mute = True
+            if hasattr(track, "is_solo"):
+                track.is_solo = False
+            isolated = True
+        if isolated:
+            armature.update_tag(refresh={'TIME'})
+    return states
+
+
+def _restore_import_tracks(states):
+    for track, state in states:
+        _restore_rna_state(track, state)
+
+
 def bake_actor_flat_action(context, armature, frame_start, frame_end, action_name=""):
     """Bake pose and object motion, folding world motion into root bones."""
     frames = list(range(int(frame_start), int(frame_end) + 1))
-    samples, custom = _sample_actor(context, armature, frames)
+    import_states = _isolate_import_tracks((armature,))
+    try:
+        samples, custom = _sample_actor(context, armature, frames)
+    finally:
+        _restore_import_tracks(import_states)
     label = str(armature.get("cutscene_actor_name", "") or armature.name).strip()
     return _write_flat_action(armature, frames, samples, action_name or f"{label}:Root:cs_baked", custom)
 
@@ -252,6 +324,9 @@ def _remove_bake_output(holder):
     for track in list(ad.nla_tracks):
         actions = [s.action for s in track.strips if s.action is not None]
         if track.name.startswith(CUTSCENE_TRACK_NAME) and actions and all(a.get(BAKED_ACTION_TAG) for a in actions):
+            transaction = _active_bake_transaction(holder)
+            if transaction is not None and transaction.stage_track(holder, track, delete_orphan_actions=True):
+                continue
             ad.nla_tracks.remove(track)
             for action in actions:
                 if action.users == 0:
@@ -275,20 +350,22 @@ def _unflat(values):
     return Matrix([values[i * 4:i * 4 + 4] for i in range(4)])
 
 
-def _stash_holder(holder):
+def _stash_holder(holder, track_state_overrides=None):
     """Silence and zero a baked chain object; the recorded state lets a re-bake resample the sources."""
     if holder.get(PREBAKE_STATE_PROP):
         return
-    is_arm = holder.type == 'ARMATURE'
+    pose_bones = getattr(getattr(holder, "pose", None), "bones", ())
     state = {
         "basis": _flat(holder.matrix_basis),
         "parent_inverse": _flat(holder.matrix_parent_inverse),
         "constraints": [c.name for c in holder.constraints if c.enabled],
-        "bone_constraints": [[pb.name, c.name] for pb in holder.pose.bones
-                             for c in pb.constraints if c.enabled] if is_arm else [],
+        "bone_constraints": [[pb.name, c.name] for pb in pose_bones
+                             for c in pb.constraints if c.enabled],
         "unmuted_tracks": [],
+        "solo_tracks": [],
         "unmuted_drivers": [],
     }
+    track_state_overrides = track_state_overrides or {}
     ad = holder.animation_data
     if ad is not None:
         for drv in ad.drivers:
@@ -312,32 +389,53 @@ def _stash_holder(holder):
         for track in ad.nla_tracks:
             if track.name.startswith(CUTSCENE_TRACK_NAME) and not _is_backup_track(track):
                 track.name = track.name + BAKE_BACKUP_SUFFIX
-            if not track.mute:
+            override = track_state_overrides.get(track.as_pointer(), {})
+            if not override.get("mute", track.mute):
                 state["unmuted_tracks"].append(track.name)
+            if override.get("is_solo", getattr(track, "is_solo", False)):
+                state["solo_tracks"].append(track.name)
             track.mute = True
+            if hasattr(track, "is_solo"):
+                track.is_solo = False
     for con in holder.constraints:
         con.enabled = False
-    if is_arm:
-        for pb in holder.pose.bones:
-            for con in pb.constraints:
-                con.enabled = False
+    for pb in pose_bones:
+        for con in pb.constraints:
+            con.enabled = False
     holder.matrix_parent_inverse = Matrix.Identity(4)
     holder.matrix_basis = Matrix.Identity(4)
     holder[PREBAKE_STATE_PROP] = json.dumps(state)
 
 
-def _unstash_holder(holder):
+def _unstash_holder(holder, defer_import_tracks=False):
     raw = holder.get(PREBAKE_STATE_PROP)
     if not raw:
-        return
+        return []
     state = json.loads(raw)
     _remove_bake_output(holder)
+    deferred = []
     ad = holder.animation_data
     if ad is not None:
         names = set(state.get("unmuted_tracks") or [])
+        solo_names = set(state.get("solo_tracks") or []) if "solo_tracks" in state else None
+        restore_solo = []
         for track in ad.nla_tracks:
-            if track.name in names:
-                track.mute = False
+            desired = {
+                "mute": track.name not in names,
+                "is_solo": track.name in solo_names if solo_names is not None else bool(getattr(track, "is_solo", False)),
+            }
+            if defer_import_tracks and track.name in IMPORT_TRACK_NAMES:
+                deferred.append((track, desired))
+                track.mute = True
+                if hasattr(track, "is_solo"):
+                    track.is_solo = False
+                continue
+            if hasattr(track, "is_solo"):
+                track.is_solo = False
+                restore_solo.append((track, desired["is_solo"]))
+            track.mute = desired["mute"]
+        for track, is_solo in restore_solo:
+            track.is_solo = is_solo
         drivers = {tuple(k) for k in state.get("unmuted_drivers") or []}
         for drv in ad.drivers:
             if (drv.data_path, drv.array_index) in drivers:
@@ -346,15 +444,17 @@ def _unstash_holder(holder):
     for con in holder.constraints:
         if con.name in enabled:
             con.enabled = True
-    if holder.type == 'ARMATURE':
+    pose_bones = getattr(getattr(holder, "pose", None), "bones", None)
+    if pose_bones is not None:
         for bone, con_name in state.get("bone_constraints") or []:
-            pb = holder.pose.bones.get(bone)
+            pb = pose_bones.get(bone)
             con = pb.constraints.get(con_name) if pb is not None else None
             if con is not None:
                 con.enabled = True
     holder.matrix_parent_inverse = _unflat(state["parent_inverse"])
     holder.matrix_basis = _unflat(state["basis"])
     del holder[PREBAKE_STATE_PROP]
+    return deferred
 
 
 TRAJECTORY_SLOT_PROP = "cutscene_prop_slot"
@@ -419,10 +519,343 @@ def clear_prop_slot(obj):
 def remove_prop_actor(scene):
     arm = find_prop_actor(scene)
     if arm is not None:
+        transaction = _ACTIVE_BAKE_TRANSACTIONS.get(scene.as_pointer())
+        if transaction is not None and transaction.defer_prop_removal(arm):
+            _remove_bake_output(arm)
+            return
         _remove_bake_output(arm)
         data = arm.data
-        bpy.data.objects.remove(arm)
-        bpy.data.armatures.remove(data)
+        bpy.data.objects.remove(arm, do_unlink=True)
+        if data.users == 0:
+            bpy.data.armatures.remove(data)
+
+
+_TRACK_STATE_ATTRS = ("mute", "is_solo", "lock", "select")
+
+
+def _rna_state(item, attrs):
+    state = {}
+    for attr in attrs:
+        if hasattr(item, attr):
+            try:
+                state[attr] = getattr(item, attr)
+            except Exception:
+                pass
+    return state
+
+
+def _restore_rna_state(item, state):
+    for attr, value in state.items():
+        if hasattr(item, attr):
+            try:
+                setattr(item, attr, value)
+            except Exception:
+                pass
+
+
+def _active_bake_transaction(holder):
+    for transaction in tuple(_ACTIVE_BAKE_TRANSACTIONS.values()):
+        if transaction.owns_holder(holder):
+            return transaction
+    return None
+
+
+class _BakeTransaction:
+    def __init__(self, scene):
+        self.scene = scene
+        self.scene_pointer = scene.as_pointer()
+        self._done = False
+        self._deferred_prop_removal = False
+        self._staged_tracks = {}
+        self._initial_action_pointers = {action.as_pointer() for action in bpy.data.actions}
+        self._action_fake_users = {}
+        self._initial_prop = find_prop_actor(scene)
+        self._initial_prop_pointer = self._initial_prop.as_pointer() if self._initial_prop is not None else None
+        self._initial_prop_data = self._initial_prop.data if self._initial_prop is not None else None
+        self._initial_prop_collections = tuple(self._initial_prop.users_collection) if self._initial_prop is not None else ()
+        self._initial_prop_view_state = []
+        if self._initial_prop is not None:
+            for owner_scene in bpy.data.scenes:
+                for view_layer in owner_scene.view_layers:
+                    if self._initial_prop.name in view_layer.objects:
+                        self._initial_prop_view_state.append((
+                            view_layer,
+                            view_layer.objects.active,
+                            self._initial_prop.select_get(view_layer=view_layer),
+                        ))
+        self._scene_state = {
+            "frame_start": int(scene.frame_start),
+            "frame_end": int(scene.frame_end),
+            "frame_current": int(scene.frame_current),
+            "frame_subframe": float(getattr(scene, "frame_subframe", 0.0) or 0.0),
+            "fingerprint_present": BAKE_FINGERPRINT_PROP in scene.keys(),
+            "fingerprint": scene.get(BAKE_FINGERPRINT_PROP),
+        }
+
+        holders = []
+        seen = set()
+        armatures = list(iter_cutscene_actor_armatures(scene))
+        if self._initial_prop is not None and self._initial_prop not in armatures:
+            armatures.append(self._initial_prop)
+        for armature in armatures:
+            for holder in _object_chain(armature):
+                pointer = holder.as_pointer()
+                if pointer not in seen:
+                    seen.add(pointer)
+                    holders.append(holder)
+        self._holder_pointers = seen
+        self._holder_states = [self._snapshot_holder(holder) for holder in holders]
+
+    def _remember_action(self, action):
+        if action is None:
+            return
+        pointer = action.as_pointer()
+        self._action_fake_users.setdefault(pointer, (action, bool(action.use_fake_user)))
+
+    def _snapshot_holder(self, holder):
+        anim_data = holder.animation_data
+        pose_bones = getattr(getattr(holder, "pose", None), "bones", ())
+        tracks = []
+        if anim_data is not None:
+            self._remember_action(anim_data.action)
+            for track in anim_data.nla_tracks:
+                for strip in track.strips:
+                    self._remember_action(strip.action)
+                tracks.append({
+                    "pointer": track.as_pointer(),
+                    "state": {"name": track.name, **_rna_state(track, _TRACK_STATE_ATTRS)},
+                })
+
+        return {
+            "holder": holder,
+            "pointer": holder.as_pointer(),
+            "matrix_basis": holder.matrix_basis.copy(),
+            "matrix_parent_inverse": holder.matrix_parent_inverse.copy(),
+            "matrix_world": holder.matrix_world.copy(),
+            "prebake_present": PREBAKE_STATE_PROP in holder.keys(),
+            "prebake": holder.get(PREBAKE_STATE_PROP),
+            "constraints": [(constraint, bool(constraint.enabled)) for constraint in holder.constraints],
+            "bone_constraints": [
+                (constraint, bool(constraint.enabled))
+                for pose_bone in pose_bones
+                for constraint in pose_bone.constraints
+            ],
+            "rotation_modes": {
+                pose_bone.name: pose_bone.rotation_mode
+                for pose_bone in pose_bones
+            },
+            "had_animation_data": anim_data is not None,
+            "action": anim_data.action if anim_data is not None else None,
+            "action_slot": getattr(anim_data, "action_slot", None) if anim_data is not None else None,
+            "drivers": {
+                (driver.data_path, driver.array_index): bool(driver.mute)
+                for driver in (anim_data.drivers if anim_data is not None else [])
+            },
+            "tracks": tracks,
+        }
+
+    def owns_holder(self, holder):
+        try:
+            return holder.as_pointer() in self._holder_pointers
+        except ReferenceError:
+            return False
+
+    def stage_track(self, holder, track, delete_orphan_actions=False):
+        try:
+            holder_pointer = holder.as_pointer()
+            track_pointer = track.as_pointer()
+        except ReferenceError:
+            return False
+        state = next((item for item in self._holder_states if item["pointer"] == holder_pointer), None)
+        if state is None or track_pointer not in {item["pointer"] for item in state["tracks"]}:
+            return False
+        staged = self._staged_tracks.setdefault(track_pointer, {
+            "holder": holder,
+            "track": track,
+            "delete_orphan_actions": False,
+        })
+        staged["delete_orphan_actions"] = bool(staged["delete_orphan_actions"] or delete_orphan_actions)
+        track.mute = True
+        return True
+
+    def defer_prop_removal(self, armature):
+        if self._initial_prop_pointer is None or armature.as_pointer() != self._initial_prop_pointer:
+            return False
+        if self._deferred_prop_removal:
+            return True
+        self._deferred_prop_removal = True
+        for collection in tuple(armature.users_collection):
+            collection.objects.unlink(armature)
+        return True
+
+    def _restore_holder(self, state):
+        holder = state["holder"]
+        try:
+            if holder.as_pointer() != state["pointer"]:
+                return
+        except ReferenceError:
+            return
+
+        anim_data = holder.animation_data
+        if anim_data is not None:
+            initial_track_pointers = {item["pointer"] for item in state["tracks"]}
+            for track in list(anim_data.nla_tracks):
+                if track.as_pointer() not in initial_track_pointers:
+                    anim_data.nla_tracks.remove(track)
+
+            current_tracks = {track.as_pointer(): track for track in anim_data.nla_tracks}
+            # Free every original name first so Blender does not suffix names while they are restored.
+            for pointer, track in current_tracks.items():
+                if pointer in initial_track_pointers:
+                    track.name = f"__cutscene_export_rollback_{pointer}"
+            for track_state in state["tracks"]:
+                track = current_tracks.get(track_state["pointer"])
+                if track is not None:
+                    _restore_rna_state(track, track_state["state"])
+
+        if not state["had_animation_data"]:
+            if holder.animation_data is not None:
+                holder.animation_data_clear()
+        else:
+            anim_data = holder.animation_data or holder.animation_data_create()
+            try:
+                anim_data.action = state["action"]
+            except Exception:
+                anim_data.action = None
+                anim_data.action = state["action"]
+            if state["action_slot"] is not None and hasattr(anim_data, "action_slot"):
+                try:
+                    anim_data.action_slot = state["action_slot"]
+                except Exception:
+                    pass
+            for driver in anim_data.drivers:
+                key = (driver.data_path, driver.array_index)
+                if key in state["drivers"]:
+                    driver.mute = state["drivers"][key]
+
+        for constraint, enabled in state["constraints"]:
+            try:
+                constraint.enabled = enabled
+            except ReferenceError:
+                pass
+        for constraint, enabled in state["bone_constraints"]:
+            try:
+                constraint.enabled = enabled
+            except ReferenceError:
+                pass
+        pose_bones = getattr(getattr(holder, "pose", None), "bones", None)
+        if pose_bones is not None:
+            for bone_name, rotation_mode in state["rotation_modes"].items():
+                pose_bone = pose_bones.get(bone_name)
+                if pose_bone is not None:
+                    pose_bone.rotation_mode = rotation_mode
+        holder.matrix_parent_inverse = state["matrix_parent_inverse"]
+        holder.matrix_basis = state["matrix_basis"]
+        holder.matrix_world = state["matrix_world"]
+        if state["prebake_present"]:
+            holder[PREBAKE_STATE_PROP] = state["prebake"]
+        elif PREBAKE_STATE_PROP in holder.keys():
+            del holder[PREBAKE_STATE_PROP]
+
+    def _finish(self):
+        if _ACTIVE_BAKE_TRANSACTIONS.get(self.scene_pointer) is self:
+            del _ACTIVE_BAKE_TRANSACTIONS[self.scene_pointer]
+        self._done = True
+
+    def rollback(self):
+        if self._done:
+            return
+        scene = self.scene
+        try:
+            current_prop = find_prop_actor(scene)
+            if current_prop is not None and (
+                self._initial_prop_pointer is None
+                or current_prop.as_pointer() != self._initial_prop_pointer
+            ):
+                remove_prop_actor(scene)
+            for state in self._holder_states:
+                self._restore_holder(state)
+
+            for action, use_fake_user in self._action_fake_users.values():
+                try:
+                    action.use_fake_user = use_fake_user
+                except ReferenceError:
+                    pass
+            for action in list(bpy.data.actions):
+                if (
+                    action.as_pointer() not in self._initial_action_pointers
+                    and action.get(BAKED_ACTION_TAG)
+                    and action.users == 0
+                ):
+                    bpy.data.actions.remove(action)
+
+            scene.frame_start = self._scene_state["frame_start"]
+            scene.frame_end = self._scene_state["frame_end"]
+            if self._scene_state["fingerprint_present"]:
+                scene[BAKE_FINGERPRINT_PROP] = self._scene_state["fingerprint"]
+            elif BAKE_FINGERPRINT_PROP in scene.keys():
+                del scene[BAKE_FINGERPRINT_PROP]
+            if self._deferred_prop_removal:
+                for collection in tuple(self._initial_prop.users_collection):
+                    collection.objects.unlink(self._initial_prop)
+                for collection in self._initial_prop_collections:
+                    collection.objects.link(self._initial_prop)
+                for view_layer, active, selected in self._initial_prop_view_state:
+                    self._initial_prop.select_set(selected, view_layer=view_layer)
+                    view_layer.objects.active = active
+            scene.frame_set(
+                self._scene_state["frame_current"],
+                subframe=self._scene_state["frame_subframe"],
+            )
+            for view_layer in scene.view_layers:
+                view_layer.update()
+        finally:
+            self._finish()
+
+    def commit(self):
+        if self._done:
+            return
+        orphan_candidates = {}
+        try:
+            for staged in self._staged_tracks.values():
+                holder = staged["holder"]
+                try:
+                    anim_data = holder.animation_data
+                except ReferenceError:
+                    continue
+                if anim_data is None:
+                    continue
+                pointer = staged["track"].as_pointer()
+                track = next((item for item in anim_data.nla_tracks if item.as_pointer() == pointer), None)
+                if track is None:
+                    continue
+                if staged["delete_orphan_actions"]:
+                    for strip in track.strips:
+                        if strip.action is not None:
+                            orphan_candidates[strip.action.as_pointer()] = strip.action
+                anim_data.nla_tracks.remove(track)
+
+            if self._deferred_prop_removal:
+                bpy.data.objects.remove(self._initial_prop, do_unlink=True)
+                if self._initial_prop_data.users == 0:
+                    bpy.data.armatures.remove(self._initial_prop_data)
+            for action in orphan_candidates.values():
+                if action.users == 0:
+                    bpy.data.actions.remove(action)
+            self._finish()
+        finally:
+            if not self._done:
+                self._finish()
+
+
+def begin_bake_transaction(scene):
+    """Journal bake-owned Blender state so an export can explicitly commit or roll back."""
+    pointer = scene.as_pointer()
+    if pointer in _ACTIVE_BAKE_TRANSACTIONS:
+        raise RuntimeError("A cutscene bake transaction is already active for this scene")
+    transaction = _BakeTransaction(scene)
+    _ACTIVE_BAKE_TRANSACTIONS[pointer] = transaction
+    return transaction
 
 
 def ensure_prop_actor(context, actor_name=PROP_ACTOR_DEFAULT_NAME, entity_path=""):
@@ -513,6 +946,9 @@ def bake_prop_actor(context, frame_start=None, frame_end=None, cutscene_name="")
     ad = armature.animation_data or armature.animation_data_create()
     # Prop tracks are bake output, so replace rather than back them up.
     for track in [t for t in ad.nla_tracks if t.name.startswith(CUTSCENE_TRACK_NAME)]:
+        transaction = _active_bake_transaction(armature)
+        if transaction is not None and transaction.stage_track(armature, track):
+            continue
         ad.nla_tracks.remove(track)
     _add_bake_track(armature, action, frame_start)
     armature.matrix_world = Matrix.Identity(4)
@@ -564,7 +1000,7 @@ def generate_props_entity(context, out_path=""):
     return out_path
 
 
-def bake_cutscene_actors(context, frame_start=None, frame_end=None, cutscene_name=""):
+def bake_cutscene_actors(context, frame_start=None, frame_end=None, cutscene_name="", set_scene_range=False):
     """Bake all actors to full-length tracks, muting the editable source tracks.
 
     Every actor and prop is sampled from the live scene before any chain is
@@ -573,51 +1009,79 @@ def bake_cutscene_actors(context, frame_start=None, frame_end=None, cutscene_nam
     """
     scene = context.scene
     actors = [a for a in iter_cutscene_actor_armatures(scene) if not a.get(PROP_RIG_TAG)]
+    deferred_import_states = []
     for armature in actors:
         for holder in _object_chain(armature):
-            _unstash_holder(holder)
+            deferred_import_states.extend(_unstash_holder(holder, defer_import_tracks=True))
+    source_starts_by_armature = {
+        armature.as_pointer(): _active_cutscene_source_starts(armature)
+        for armature in actors
+    }
 
     default_start, default_end = effective_frame_range(scene)
     frame_start = default_start if frame_start is None else int(frame_start)
     frame_end = default_end if frame_end is None else int(frame_end)
-    scene.frame_start, scene.frame_end = frame_start, frame_end
+    if set_scene_range:
+        scene.frame_start, scene.frame_end = frame_start, frame_end
     if not cutscene_name:
         repo = str(getattr(scene, "witcher_cutscene_export_repo_path", "") or "")
         cutscene_name = repo.replace("/", "\\").rsplit("\\", 1)[-1].rsplit(".", 1)[0] or "cutscene"
 
-    scale_issues = [issue for a in actors
-                    for issue in _scale_issues(context, a, str(a.get("cutscene_actor_name", "") or a.name))]
-    if scale_issues:
-        raise RuntimeError("Cannot bake:\n" + "\n".join(scale_issues))
-
     frames = list(range(frame_start, frame_end + 1))
     current = scene.frame_current
+    import_states = _isolate_import_tracks(actors)
+    intended_import_states = {
+        track.as_pointer(): state
+        for track, state in (*import_states, *deferred_import_states)
+    }
+    sampled_ok = False
     try:
+        scale_issues = [issue for a in actors
+                        for issue in _scale_issues(context, a, str(a.get("cutscene_actor_name", "") or a.name))]
+        if scale_issues:
+            raise RuntimeError("Cannot bake:\n" + "\n".join(scale_issues))
+
         # Unanimated actors get a placement track too, or the engine never spawns them.
         targets = [a for a in actors if _needs_bake(a)
                    or str(a.get("cutscene_actor_name", "") or "").strip().lower() not in SCAFFOLD_ACTORS]
         sampled = [(a, *_sample_actor(context, a, frames)) for a in targets]
         prop_result = bake_prop_actor(context, frame_start, frame_end, cutscene_name)
+        sampled_ok = True
     finally:
         scene.frame_set(current)
+        if not sampled_ok:
+            _restore_import_tracks(import_states)
+            _restore_import_tracks(deferred_import_states)
 
     baked = []
     for armature, samples, custom in sampled:
         label = str(armature.get("cutscene_actor_name", "") or "").strip()
         action = _write_flat_action(armature, frames, samples, f"{label}:Root:{cutscene_name}_{label}", custom)
+        source_starts = source_starts_by_armature.get(armature.as_pointer(), {})
+        source_ids = list(source_starts)
+        if source_ids:
+            action[BAKED_SOURCE_CLIP_IDS_PROP] = source_ids
+            action[BAKED_SOURCE_CLIP_STARTS_PROP] = [source_starts[source_id] for source_id in source_ids]
         for holder in _object_chain(armature):
-            _stash_holder(holder)
+            _stash_holder(holder, intended_import_states)
         _add_bake_track(armature, action, frame_start)
         baked.append((armature, action))
     if prop_result:
         baked.append(prop_result)
     context.view_layer.update()  # zeroed chains must be reflected in matrix_world for validation
+    scene[BAKE_FINGERPRINT_PROP] = bake_fingerprint(scene)
     return baked
 
 
-def validate_cutscene_for_export(context, frame_start=None, frame_end=None):
+def validate_cutscene_for_export(
+        context, frame_start=None, frame_end=None, allowed_missing_prop_templates=()):
     """Return violations of the engine's one-full-length-track-per-actor contract."""
     scene = context.scene
+    allowed_missing_prop_templates = {
+        str(path or "").strip().replace("/", "\\").lower()
+        for path in allowed_missing_prop_templates
+        if str(path or "").strip()
+    }
     default_start, default_end = effective_frame_range(scene)
     frame_start = default_start if frame_start is None else int(frame_start)
     frame_end = default_end if frame_end is None else int(frame_end)
@@ -652,7 +1116,17 @@ def validate_cutscene_for_export(context, frame_start=None, frame_end=None):
                     f"object transforms; bake folds translation/rotation into bones"
                 )
             had = holder.animation_data
-            if had and (had.action or (holder is not armature and any(not t.mute for t in had.nla_tracks))):
+            if had and (
+                had.action
+                or (
+                    holder is not armature
+                    and any(
+                        not track.mute
+                        and any(strip.action is not None and not strip.mute for strip in track.strips)
+                        for track in had.nla_tracks
+                    )
+                )
+            ):
                 issues.append(
                     f"{label}: object '{holder.name}' has object-level animation — not exported; bake it"
                 )
@@ -680,8 +1154,50 @@ def validate_cutscene_for_export(context, frame_start=None, frame_end=None):
 
             template = str(prop_arm.get("cutscene_actor_template", "") or "").strip()
             written = str(prop_arm.get(PROPS_ENTITY_FILE_PROP, "") or "")
-            if not template or not ((written and os.path.isfile(written)) or _resolve_repo_file(context, template)):
+            template_key = template.replace("/", "\\").lower()
+            if (
+                (not template or not ((written and os.path.isfile(written)) or _resolve_repo_file(context, template)))
+                and template_key not in allowed_missing_prop_templates
+            ):
                 issues.append("Props entity (.w2ent) not written yet — run Generate Props Entity")
     elif prop_arm is not None:
         issues.append("Prop actor exists but no props are assigned to trajectory slots — re-bake or remove it")
     return issues
+
+
+def bake_fingerprint(scene):
+    """Hash of every authored cutscene strip (bake outputs excluded) and active action, per actor."""
+    items = []
+    for arm in iter_cutscene_actor_armatures(scene):
+        ad = arm.animation_data
+        if not ad:
+            continue
+        if ad.action is not None:
+            items.append((arm.name, "", "", ad.action.name, 0.0, 0.0, False))
+        for track in ad.nla_tracks:
+            if not track.name.startswith(CUTSCENE_TRACK_NAME):
+                continue
+            for s in track.strips:
+                if s.action is None or s.action.get(BAKED_ACTION_TAG):
+                    continue
+                items.append((arm.name, track.name, s.name, s.action.name,
+                              round(float(s.frame_start), 3), round(float(s.frame_end), 3), bool(track.mute or s.mute)))
+    return hashlib.sha1(repr(sorted(items)).encode("utf-8")).hexdigest()
+
+
+def bake_state(scene):
+    """Lightweight hint: baked output exists; stale means its fingerprint is missing or changed."""
+    actors = [a for a in iter_cutscene_actor_armatures(scene) if not a.get(PROP_RIG_TAG)]
+    targets = [a for a in actors if _needs_bake(a)
+               or str(a.get("cutscene_actor_name", "") or "").strip().lower() not in SCAFFOLD_ACTORS]
+    baked = [a for a in targets
+             if any(s.action is not None and s.action.get(BAKED_ACTION_TAG) for s in _active_cutscene_strips(a))]
+    is_baked = bool(targets) and len(baked) == len(targets)
+    stored = scene.get(BAKE_FINGERPRINT_PROP)
+    return {
+        "baked": is_baked,
+        "baked_count": len(baked),
+        "target_count": len(targets),
+        "stale": bool(is_baked and (stored is None or stored != bake_fingerprint(scene))),
+        "range": effective_frame_range(scene),
+    }

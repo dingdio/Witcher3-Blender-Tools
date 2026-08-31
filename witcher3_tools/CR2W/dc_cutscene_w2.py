@@ -534,7 +534,7 @@ def load_w2_cutscene_template(file_name):
     return create_CCutscene_w2(the_file, raw_data)
 
 
-def load_w2_cutscene_anim(file_name, rigPath=None, anim_name=None) -> w3_types.CSkeletalAnimationSet:
+def load_w2_cutscene_anim(file_name, rigPath=None, anim_name=None, anim_index=None) -> w3_types.CSkeletalAnimationSet:
     """Decode one (or all) animation(s) from a W2 .w2cutscene via Havok."""
     stream = open_cr2w_read_stream(file_name)
     raw_data = stream.cr2w_buf
@@ -548,8 +548,17 @@ def load_w2_cutscene_anim(file_name, rigPath=None, anim_name=None) -> w3_types.C
         source_file=file_name,
     )
 
-    if anim_name:
-        target_idx = None
+    target_idx = None
+    if anim_index is not None:
+        try:
+            target_idx = int(anim_index)
+        except (TypeError, ValueError):
+            target_idx = -1
+        if target_idx < 0 or target_idx >= len(anim_set.animations):
+            log.warning("Cutscene animation index %s not found in %s", anim_index, os.path.basename(file_name))
+            anim_set.animations = []
+            return anim_set
+    elif anim_name:
         for idx, entry in enumerate(anim_set.animations):
             if entry.animation and entry.animation.name == anim_name:
                 target_idx = idx
@@ -559,6 +568,8 @@ def load_w2_cutscene_anim(file_name, rigPath=None, anim_name=None) -> w3_types.C
             anim_set.animations = []
             return anim_set
 
+    if target_idx is not None:
+        selected_name = str(getattr(getattr(anim_set.animations[target_idx], "animation", None), "name", "") or anim_name or target_idx)
         blob_start = sum(_w2_entry_part_count(entry) for entry in anim_set.animations[:target_idx])
         part_count = _w2_entry_part_count(anim_set.animations[target_idx])
         decoded_parts = []
@@ -579,7 +590,7 @@ def load_w2_cutscene_anim(file_name, rigPath=None, anim_name=None) -> w3_types.C
             )
             log.info(
                 "Decoded W2 cutscene animation '%s' (blob %d-%d/%d) from %s",
-                anim_name,
+                selected_name,
                 blob_start + 1,
                 blob_start + part_count,
                 sum(_w2_entry_part_count(entry) for entry in anim_set.animations),
@@ -588,7 +599,7 @@ def load_w2_cutscene_anim(file_name, rigPath=None, anim_name=None) -> w3_types.C
         else:
             log.warning(
                 "Failed to decode W2 cutscene animation '%s' (blob %d-%d) from %s",
-                anim_name, blob_start, blob_start + part_count - 1, os.path.basename(file_name),
+                selected_name, blob_start, blob_start + part_count - 1, os.path.basename(file_name),
             )
         anim_set.animations = [anim_set.animations[target_idx]]
         return anim_set

@@ -20,6 +20,8 @@ CUTSCENE_FACE_TRACK_NAME = f"{CUTSCENE_TRACK_NAME}_face"
 CUTSCENE_SOURCE_PATH_PROP = "witcher_cutscene_source_path"
 CUTSCENE_SOURCE_INDEX_PROP = "witcher_cutscene_source_index"
 CUTSCENE_ANIMATION_NAME_PROP = "witcher_cutscene_animation_name"
+CUTSCENE_BAKED_SOURCE_IDS_PROP = "cutscene_bake_source_clip_ids"
+CUTSCENE_BAKED_SOURCE_STARTS_PROP = "cutscene_bake_source_clip_starts"
 CUTSCENE_RE_EXPORT_SUFFIX = "_redkit"
 _VALID_CUTSCENE_ACTOR_TYPES = ("CAT_None", "CAT_Actor", "CAT_Prop", "CAT_Camera")
 _INVALID_PATH_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -102,6 +104,9 @@ def _cutscene_entry_event_matches_group(event, group) -> bool:
         for part in group_parts:
             if export_anims._safe_int(part.get("source_index", -1), -1) == source_index:
                 return True
+            if source_index in set(part.get("source_clip_ids", []) or []):
+                return True
+        return False
 
     event_anim_name = export_anims._strip_text(event.get("animation_name", ""))
     if not event_anim_name:
@@ -122,6 +127,26 @@ def _cutscene_entry_event_matches_group(event, group) -> bool:
     return event_anim_name in {candidate for candidate in candidates if candidate}
 
 
+def _baked_source_clip_ids(group):
+    source_ids = set()
+    for part in list(group.get("entries", []) or group.get("parts", []) or []):
+        for value in part.get("source_clip_ids", []) or []:
+            source_index = export_anims._safe_int(value, -1)
+            if source_index >= 0:
+                source_ids.add(source_index)
+    return source_ids
+
+
+def _baked_source_clip_starts(group):
+    source_starts = {}
+    for part in list(group.get("entries", []) or group.get("parts", []) or []):
+        for source_index, start_frame in (part.get("source_clip_starts", {}) or {}).items():
+            source_index = export_anims._safe_int(source_index, -1)
+            if source_index >= 0:
+                source_starts[source_index] = float(start_frame)
+    return source_starts
+
+
 def _entry_events_for_group(entry_events, group):
     events = []
     seen = set()
@@ -130,11 +155,25 @@ def _entry_events_for_group(entry_events, group):
         group.get("component", ""),
         group.get("action_name", ""),
     )
+    baked_source_ids = _baked_source_clip_ids(group)
+    baked_source_starts = _baked_source_clip_starts(group)
     for event in entry_events or []:
         if not _cutscene_entry_event_matches_group(event, group):
             continue
         payload = dict(event)
-        if not payload.get("animation_name"):
+        source_index = export_anims._safe_int(payload.get("source_index", -1), -1)
+        if source_index in baked_source_ids:
+            payload["animation_name"] = default_animation_name
+            if source_index not in baked_source_starts:
+                raise ValueError(
+                    f"Baked action is missing timeline provenance for source clip {source_index}; re-bake before export"
+                )
+            fps = float(group.get("fps", export_anims.CUTSCENE_DEFAULT_FPS) or export_anims.CUTSCENE_DEFAULT_FPS)
+            baked_start = float(group.get("strip_frame_start", 0.0) or 0.0)
+            payload["start_time"] = float(payload.get("start_time", 0.0) or 0.0) + (
+                baked_source_starts[source_index] - baked_start
+            ) / fps
+        elif not payload.get("animation_name"):
             payload["animation_name"] = default_animation_name
         key = (
             payload.get("event_type"),
@@ -454,15 +493,15 @@ def _collect_cutscene_scene_actors(scene=None):
             "source_index": export_anims._safe_int(actor_obj.get(CUTSCENE_SOURCE_INDEX_PROP, -1), -1),
         })
     actors.sort(key=lambda actor: (
-        1 if int(actor.get("source_index", -1) or -1) < 0 else 0,
-        int(actor.get("source_index", -1) or -1) if int(actor.get("source_index", -1) or -1) >= 0 else 0,
+        1 if export_anims._safe_int(actor.get("source_index", -1), -1) < 0 else 0,
+        max(0, export_anims._safe_int(actor.get("source_index", -1), -1)),
         export_anims._strip_text(actor.get("name", "")),
     ))
     return actors
 
 
 def _cutscene_entry_sort_key(entry):
-    source_index = int(entry.get("source_index", -1) or -1)
+    source_index = export_anims._safe_int(entry.get("source_index", -1), -1)
     return (
         1 if source_index < 0 else 0,
         source_index if source_index >= 0 else 0,
@@ -591,6 +630,18 @@ def _collect_cutscene_nla_entries(context):
                     frame_start, frame_end = _resolve_action_frame_range(action, strip=strip)
                     fallback_count = max(1, frame_end - frame_start + 1)
                     strip_frame_count = _resolve_strip_frame_count(strip, fallback_count=fallback_count)
+                    source_clip_ids = []
+                    for value in action.get(CUTSCENE_BAKED_SOURCE_IDS_PROP, []) or []:
+                        source_id = export_anims._safe_int(value, -1)
+                        if source_id >= 0 and source_id not in source_clip_ids:
+                            source_clip_ids.append(source_id)
+                    source_clip_starts = {}
+                    stored_source_starts = action.get(CUTSCENE_BAKED_SOURCE_STARTS_PROP, []) or []
+                    if len(stored_source_starts) == len(source_clip_ids):
+                        source_clip_starts = {
+                            source_id: float(stored_source_starts[index])
+                            for index, source_id in enumerate(source_clip_ids)
+                        }
                     entries.append({
                         "actor_name": actor_name,
                         "component": component_name,
@@ -607,10 +658,23 @@ def _collect_cutscene_nla_entries(context):
                         "strip_frame_count": strip_frame_count,
                         "source_path": export_anims._strip_text(action.get(CUTSCENE_SOURCE_PATH_PROP, "")),
                         "source_index": export_anims._safe_int(action.get(CUTSCENE_SOURCE_INDEX_PROP, -1), -1),
+                        "source_clip_ids": source_clip_ids,
+                        "source_clip_starts": source_clip_starts,
                         "frame_start": frame_start,
                         "frame_end": frame_end,
                     })
     return sorted(entries, key=_cutscene_entry_sort_key)
+
+
+def _has_cutscene_nla_strips(context):
+    scene = getattr(context, "scene", None) or getattr(bpy.context, "scene", None)
+    for actor_root in _collect_cutscene_actor_roots(scene):
+        for armature_obj in _iter_cutscene_related_armatures(actor_root, scene):
+            anim_data = getattr(armature_obj, "animation_data", None)
+            for track in getattr(anim_data, "nla_tracks", []) or []:
+                if _is_cutscene_track_name(getattr(track, "name", "")) and len(track.strips) > 0:
+                    return True
+    return False
 
 
 def _collect_cutscene_active_entries(context):
@@ -1004,7 +1068,7 @@ def _extract_handle_depot_path(handle_like) -> str:
 
 def _resolve_source_cutscene_skeleton_path(entry, source_cache) -> str:
     source_path = export_anims._strip_text(entry.get("source_path", ""))
-    source_index = int(entry.get("source_index", -1) or -1)
+    source_index = export_anims._safe_int(entry.get("source_index", -1), -1)
     if not source_path or source_index < 0:
         return ""
     cutscene_template = _load_cutscene_source_template(source_path, source_cache)
@@ -1023,7 +1087,7 @@ def _build_cutscene_export_state(context):
 
     export_entries = _collect_cutscene_nla_entries(context)
     source_mode = "nla"
-    if not export_entries:
+    if not export_entries and not _has_cutscene_nla_strips(context):
         export_entries = _collect_cutscene_active_entries(context)
         source_mode = "active_action"
 
@@ -1053,7 +1117,7 @@ def _plan_cutscene_re_files(save_path: str, export_entries):
         actor_folder = _sanitize_cutscene_path_part(actor_name, fallback="actor")
         component_name = export_anims._normalize_cutscene_component(entry.get("component", ""))
         action_name = export_anims._strip_text(entry.get("action_name", "")) or component_name or actor_name
-        source_index = int(entry.get("source_index", -1) or -1)
+        source_index = export_anims._safe_int(entry.get("source_index", -1), -1)
         file_prefix = f"{source_index:04d}_{sequence_index:04d}" if source_index >= 0 else f"{sequence_index:04d}"
         file_parts = [file_prefix]
         if component_name and component_name != export_anims.CUTSCENE_ROOT_COMPONENT:
