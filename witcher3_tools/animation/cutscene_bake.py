@@ -8,7 +8,8 @@ import os
 import bpy
 from mathutils import Matrix
 
-CUTSCENE_TRACK_NAME = BAKE_TRACK_NAME = "cutscene_anim"
+CUTSCENE_TRACK_NAME = "cutscene_anim"
+BAKE_TRACK_NAME = "cutscene_anim_baked"
 BAKE_BACKUP_SUFFIX = "_prebake"
 BAKED_ACTION_TAG = "cutscene_bake_output"
 BAKED_SOURCE_CLIP_IDS_PROP = "cutscene_bake_source_clip_ids"
@@ -16,6 +17,13 @@ BAKED_SOURCE_CLIP_STARTS_PROP = "cutscene_bake_source_clip_starts"
 CUTSCENE_SOURCE_INDEX_PROP = "witcher_cutscene_source_index"
 PREBAKE_STATE_PROP = "cutscene_prebake_state"
 BAKE_FINGERPRINT_PROP = "witcher_cutscene_bake_fp"
+SHOTS_FINGERPRINT_PROP = "witcher_cutscene_shots_fp"
+_TRANSFORM_PATHS = ("location", "rotation_euler", "rotation_quaternion", "rotation_axis_angle", "scale",
+                    "delta_location", "delta_rotation_euler", "delta_rotation_quaternion", "delta_scale")
+_CAMERA_PATHS = ("lens", "lens_unit", "sensor_fit", "sensor_width", "sensor_height", "shift_x", "shift_y",
+                 "dof.use_dof", "dof.focus_distance", "dof.aperture_fstop")
+_CONSTRAINT_UI_PROPS = {"rna_type", "name", "active", "show_expanded", "is_valid", "is_override_data",
+                        "error_location", "error_rotation"}
 SCALE_TOL = 1e-4
 
 SCAFFOLD_ACTORS = {"trajectories"}
@@ -40,6 +48,27 @@ def _active_cutscene_strips(armature):
         if t.name.startswith(CUTSCENE_TRACK_NAME) and not _is_backup_track(t) and not t.mute
     ]
     return [s for t in tracks for s in t.strips if not s.mute]
+
+
+def bake_inputs(scene):
+    strips, lanes, foreign = 0, set(), []
+    for armature in iter_cutscene_actor_armatures(scene):
+        if armature.get(PROP_RIG_TAG):
+            continue
+        label = str(armature.get("cutscene_actor_name", "") or armature.name)
+        ad = armature.animation_data
+        for track in (ad.nla_tracks if ad else []):
+            if track.mute or _is_backup_track(track) or track.name in IMPORT_TRACK_NAMES:
+                continue
+            live = [s for s in track.strips if not s.mute and s.action is not None and not s.action.get(BAKED_ACTION_TAG)]
+            if not live:
+                continue
+            if track.name.startswith(CUTSCENE_TRACK_NAME):
+                strips += len(live)
+                lanes.add(track.name)
+            else:
+                foreign.append((label, track.name, armature.name))
+    return {"strips": strips, "lanes": sorted(lanes), "foreign": foreign}
 
 
 def _active_cutscene_source_starts(armature):
@@ -67,16 +96,17 @@ def _active_cutscene_source_ids(armature):
 
 
 def effective_frame_range(scene):
-    """Scene range extended to the last unmuted cutscene strip end across actors."""
-    end = int(scene.frame_end)
+    """Include active cutscene strips in the scene range."""
+    start, end = int(scene.frame_start), int(scene.frame_end)
     for armature in iter_cutscene_actor_armatures(scene):
         ad = armature.animation_data
         for track in (ad.nla_tracks if ad else []):
             if track.name.startswith(CUTSCENE_TRACK_NAME) and not track.mute:
                 for strip in track.strips:
                     if not strip.mute:
+                        start = min(start, int(strip.frame_start))
                         end = max(end, int(strip.frame_end))
-    return int(scene.frame_start), end
+    return start, end
 
 
 def _object_chain(obj):
@@ -1074,7 +1104,7 @@ def bake_cutscene_actors(context, frame_start=None, frame_end=None, cutscene_nam
 
 
 def validate_cutscene_for_export(
-        context, frame_start=None, frame_end=None, allowed_missing_prop_templates=()):
+        context, frame_start=None, frame_end=None, allowed_missing_prop_templates=(), details=None):
     """Return violations of the engine's one-full-length-track-per-actor contract."""
     scene = context.scene
     allowed_missing_prop_templates = {
@@ -1086,34 +1116,42 @@ def validate_cutscene_for_export(
     frame_start = default_start if frame_start is None else int(frame_start)
     frame_end = default_end if frame_end is None else int(frame_end)
     issues = []
+
+    def add(message, obj=None, tab="TEMPLATE"):
+        issues.append(message)
+        if details is not None:
+            details.append((message, getattr(obj, "name", "") if obj is not None else "", tab))
+
     actors = list(iter_cutscene_actor_armatures(scene))
     if not actors:
-        return ["No cutscene actors (armatures with cutscene_actor_name) in the scene"]
+        add("No cutscene actors (armatures with cutscene_actor_name) in the scene", tab="ACTORS")
+        return issues
 
     for armature in actors:
         label = str(armature.get("cutscene_actor_name", "") or armature.name)
         strips = _active_cutscene_strips(armature)
         if not strips and label.lower() not in SCAFFOLD_ACTORS:
-            issues.append(f"{label}: no active cutscene_anim strips — " + (
+            add(f"{label}: no active cutscene_anim strips — " + (
                 "bake to flatten the active action" if _has_animation(armature)
-                else "actor will not appear in engine; bake to create its placement track"))
+                else "actor will not appear in engine; bake to create its placement track"), armature)
         if len(strips) > 1:
-            issues.append(
+            add(
                 f"{label}: {len(strips)} strips — engine plays ALL animations from t=0 "
-                f"(no timeline); run Bake for Cutscene to flatten"
+                f"(no timeline); run Bake for Cutscene to flatten", armature,
             )
         for strip in strips:
             if int(strip.frame_start) > frame_start or int(strip.frame_end) < frame_end:
-                issues.append(
+                add(
                     f"{label}: strip '{strip.name}' covers {int(strip.frame_start)}-{int(strip.frame_end)}, "
-                    f"not the full range {frame_start}-{frame_end} — engine holds/misses poses"
+                    f"not the full range {frame_start}-{frame_end} — engine holds/misses poses", armature,
                 )
-        issues.extend(_scale_issues(context, armature, label))
+        for message in _scale_issues(context, armature, label):
+            add(message, armature)
         for holder in _object_chain(armature):
             if not _is_identity(holder.matrix_world):
-                issues.append(
+                add(
                     f"{label}: object '{holder.name}' has a non-identity transform — the engine ignores "
-                    f"object transforms; bake folds translation/rotation into bones"
+                    f"object transforms; bake folds translation/rotation into bones", holder,
                 )
             had = holder.animation_data
             if had and (
@@ -1127,15 +1165,13 @@ def validate_cutscene_for_export(
                     )
                 )
             ):
-                issues.append(
-                    f"{label}: object '{holder.name}' has object-level animation — not exported; bake it"
-                )
+                add(f"{label}: object '{holder.name}' has object-level animation — not exported; bake it", holder)
             for con in holder.constraints:
                 if con.enabled:
-                    issues.append(f"{label}: constraint '{con.name}' on '{holder.name}' will not export; bake")
+                    add(f"{label}: constraint '{con.name}' on '{holder.name}' will not export; bake", holder)
         bone_constraints = sum(1 for pb in armature.pose.bones for con in pb.constraints if con.enabled)
         if bone_constraints:
-            issues.append(f"{label}: {bone_constraints} enabled bone constraint(s) — export reads fcurves only; bake")
+            add(f"{label}: {bone_constraints} enabled bone constraint(s) — export reads fcurves only; bake", armature)
 
     props = iter_prop_objects(scene)
     prop_arm = find_prop_actor(scene)
@@ -1143,12 +1179,10 @@ def validate_cutscene_for_export(
         seen_slots = {}
         for obj, slot in props:
             if slot in seen_slots:
-                issues.append(f"Props '{seen_slots[slot]}' and '{obj.name}' share trajectory slot {slot}")
+                add(f"Props '{seen_slots[slot]}' and '{obj.name}' share trajectory slot {slot}", obj, tab="ACTORS")
             seen_slots[slot] = obj.name
         if prop_arm is None or not _active_cutscene_strips(prop_arm):
-            issues.append(
-                f"{len(props)} prop(s) assigned to trajectory slots but not baked — run Bake for Cutscene"
-            )
+            add(f"{len(props)} prop(s) assigned to trajectory slots but not baked — run Bake for Cutscene", prop_arm)
         else:
             from ..ui.ui_animated_component import _resolve_repo_file
 
@@ -1159,9 +1193,9 @@ def validate_cutscene_for_export(
                 (not template or not ((written and os.path.isfile(written)) or _resolve_repo_file(context, template)))
                 and template_key not in allowed_missing_prop_templates
             ):
-                issues.append("Props entity (.w2ent) not written yet — run Generate Props Entity")
+                add("Props entity (.w2ent) not written yet — run Generate Props Entity", prop_arm)
     elif prop_arm is not None:
-        issues.append("Prop actor exists but no props are assigned to trajectory slots — re-bake or remove it")
+        add("Prop actor exists but no props are assigned to trajectory slots — re-bake or remove it", prop_arm, tab="ACTORS")
     return issues
 
 
@@ -1185,6 +1219,112 @@ def bake_fingerprint(scene):
     return hashlib.sha1(repr(sorted(items)).encode("utf-8")).hexdigest()
 
 
+def iter_shot_markers(scene):
+    shots = []
+    for marker in getattr(scene, "timeline_markers", []) or []:
+        cam = getattr(marker, "camera", None)
+        if getattr(cam, "type", None) != 'CAMERA' or cam.get("witcher_shot_index") is None:
+            continue
+        shots.append((int(cam["witcher_shot_index"]), cam, int(marker.frame)))
+    shots.sort(key=lambda shot: shot[2])
+    return shots
+
+
+def shot_ranges(scene, shots=None):
+    shots = iter_shot_markers(scene) if shots is None else list(shots)
+    scene_end = int(getattr(scene, "frame_end", 0))
+    return [
+        (idx, cam, frame, (shots[i + 1][2] if i + 1 < len(shots) else scene_end + 1) - 1)
+        for i, (idx, cam, frame) in enumerate(shots)
+    ]
+
+
+def shots_fingerprint(scene):
+    """Hash shot markers, cameras, and their animation."""
+    from .action_compat import iter_action_fcurves
+
+    def keys(datablock):
+        action = getattr(getattr(datablock, "animation_data", None), "action", None)
+        if action is None:
+            return ()
+        return tuple(
+            (fc.data_path, fc.array_index, tuple((round(k.co[0], 3), round(k.co[1], 5)) for k in fc.keyframe_points))
+            for fc in iter_action_fcurves(action, target=datablock)
+        )
+
+    def nla(obj):
+        ad = getattr(obj, "animation_data", None)
+        return tuple(
+            (t.name, s.name, getattr(s.action, "name", ""), round(float(s.frame_start), 3), round(float(s.frame_end), 3),
+             bool(t.mute or s.mute))
+            for t in (getattr(ad, "nla_tracks", None) or ()) for s in t.strips
+        )
+
+    def flat(value):
+        if isinstance(value, (str, bytes)):
+            return value
+        if isinstance(value, (set, frozenset)):
+            return tuple(sorted(value))
+        try:
+            return tuple(flat(v) for v in value)
+        except TypeError:
+            return round(value, 4) if isinstance(value, float) else value
+
+    def animated_paths(datablock):
+        ad = getattr(datablock, "animation_data", None)
+        if ad is None:
+            return set()
+        paths = {d.data_path for d in ad.drivers}
+        for action in [ad.action] + [s.action for t in ad.nla_tracks for s in t.strips]:
+            if action is not None:
+                paths.update(fc.data_path for fc in iter_action_fcurves(action, target=datablock))
+        return paths
+
+    def props(datablock, paths):
+        """Static values only: animated or driven channels move on scrub, and their keys are hashed instead."""
+        animated = animated_paths(datablock)
+        return tuple(flat(datablock.path_resolve(p)) for p in paths if p not in animated)
+
+    def constraint(c):
+        return tuple(
+            (p.identifier, getattr(getattr(c, p.identifier), "name", "") if p.type == 'POINTER' else flat(getattr(c, p.identifier)))
+            for p in c.bl_rna.properties
+            if p.type != 'COLLECTION' and p.identifier not in _CONSTRAINT_UI_PROPS
+        )
+
+    def upstream(obj):
+        """The camera plus everything its world matrix depends on: parents and constraint targets, transitively."""
+        out, seen, stack = [], set(), [obj]
+        while stack:
+            o = stack.pop()
+            if o is None or o.name in seen:
+                continue
+            seen.add(o.name)
+            out.append((
+                o.name, o.rotation_mode, o.parent_type, o.parent_bone, flat(o.matrix_parent_inverse),
+                props(o, _TRANSFORM_PATHS), tuple(constraint(c) for c in o.constraints), keys(o), nla(o),
+            ))
+            stack.append(o.parent)
+            stack.extend(getattr(c, "target", None) for c in o.constraints)
+        return tuple(out)
+
+    items = [int(getattr(scene, "frame_end", 0))]
+    for idx, cam, frame in iter_shot_markers(scene):
+        data = cam.data
+        items.append((
+            idx, frame, upstream(cam), props(data, _CAMERA_PATHS), keys(data), nla(data),
+            upstream(data.dof.focus_object) if data.dof.focus_object is not None else (),
+        ))
+    return hashlib.sha1(repr(items).encode("utf-8")).hexdigest()
+
+
+def shots_stale(scene):
+    if not iter_shot_markers(scene):
+        return False
+    stored = scene.get(SHOTS_FINGERPRINT_PROP)
+    return stored is None or stored != shots_fingerprint(scene)
+
+
 def bake_state(scene):
     """Lightweight hint: baked output exists; stale means its fingerprint is missing or changed."""
     actors = [a for a in iter_cutscene_actor_armatures(scene) if not a.get(PROP_RIG_TAG)]
@@ -1199,5 +1339,6 @@ def bake_state(scene):
         "baked_count": len(baked),
         "target_count": len(targets),
         "stale": bool(is_baked and (stored is None or stored != bake_fingerprint(scene))),
+        "shots_stale": shots_stale(scene),
         "range": effective_frame_range(scene),
     }

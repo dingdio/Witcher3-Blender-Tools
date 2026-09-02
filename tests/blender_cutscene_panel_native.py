@@ -176,6 +176,64 @@ def draw_all_tabs(state, tab_ids, cls):
     return result
 
 
+def draw_dialogue_editor_state(scene, cls):
+    authored = getattr(scene, "witcher_cutscene_dialog_lines", None)
+    if authored is None:
+        return None
+    prefs = addon._get_prefs(bpy.context)
+    old_tts_command = prefs.tts_command
+    prefs.tts_command = ""
+    authored.clear()
+    authored.add()
+    line = authored[0]
+    line.speaker = "GERALT"
+    line.text = "Authored dialogue probe"
+    line.start_frame = 20
+    line.end_frame = 80
+    line.tier = 'SUBTITLE'
+    old_repo_path = scene.witcher_cutscene_export_repo_path
+    scene.witcher_cutscene_export_repo_path = r"dlc\panel\data\cutscenes\dialogue_probe.w2cutscene"
+    scene.witcher_cs_tab = 'DIALOGS'
+    calls = draw_panel(cls)
+    labels = [call[1] for call in calls if call[0] == "label"]
+    assert "Dialogue (preview)" not in labels, labels
+    assert ("list", "WITCH_UL_CutsceneAuthoredDialogList") in calls, calls
+    for operator in (
+        "witcher.cutscene_dialog_add_line",
+        "witcher.cutscene_dialog_remove_line",
+        "witcher.cutscene_dialog_move_line",
+        "witcher.cutscene_dialog_from_playhead",
+    ):
+        assert ("op", operator) in calls, (operator, calls)
+    for path in ("speaker", "text", "start_frame", "end_frame", "tier"):
+        assert ("prop", path) in calls, (path, calls)
+    companion_values = [
+        call[3] for call in calls
+        if call[:3] == ("op_prop", "witcher.cutscene_exact_value_details", "value")
+    ]
+    assert companion_values == [r"dlc\panel\data\scenes\dialogue_probe.w2scene"], companion_values
+    line.tier = 'GAME'
+    game_calls = draw_panel(cls)
+    assert ("prop", "game_line_id") in game_calls
+    assert ("prop", "game_voice_file_name") in game_calls
+    assert ("op", "witcher.cutscene_dialog_pick_game_voice") in game_calls
+    assert ("op", "witcher.cutscene_dialog_preview_game_line") in game_calls
+    line.tier = 'WAV'
+    wav_calls = draw_panel(cls)
+    assert ("prop", "wav_path") in wav_calls
+    assert ("prop", "allocated_line_id") in wav_calls
+    assert ("op", "witcher.cutscene_dialog_prepare_wav") in wav_calls
+    assert ("op", "witcher.cutscene_dialog_generate_wav") not in wav_calls
+    prefs.tts_command = 'tts --text "{text}" --out "{out}"'
+    tts_calls = draw_panel(cls)
+    assert ("op", "witcher.cutscene_dialog_generate_wav") in tts_calls
+    prefs.tts_command = old_tts_command
+    scene.witcher_cutscene_export_repo_path = old_repo_path
+    authored.clear()
+    scene.witcher_cutscene_dialog_items.clear()
+    return calls
+
+
 def header_lines(calls):
     labels = [c[1] for c in calls if c[0] == "label"]
     return labels[0], next(t for t in labels if t.startswith(("Next:", "Ready")))
@@ -433,7 +491,7 @@ try:
     from witcher3_tools.repo_paths.animation_index import find_anims
     from witcher3_tools.extension_paths import get_dev_override
     from witcher3_tools.importers.import_cutscene import ACTOR_CUSTOM_PROP_DEFAULTS
-    from witcher3_tools.animation import cutscene_bake
+    from witcher3_tools.animation import cutscene_bake, cutscene_validate
     from witcher3_tools.animation.camera_tracks import CAMERA_CONTROL_BONE, CAMERA_TRACK_NAMES
 
     collapsed_layout = FakeLayout()
@@ -534,19 +592,42 @@ try:
                         "No props assigned (Actors tab › Props)")
     step_calls = [c for c in states(calls['TEMPLATE'], "op") if c[3][:1].isdigit()]
     assert [c[3] for c in step_calls] == [
-        "1  Bake tracks", "2  Validate", "3  Export .w2cutscene",
+        "1  Bake actors", "2  Validate", "3  Export .w2cutscene",
         "4  Write props .w2ent", "5  Write REDkit .w2scene",
     ], step_calls
     assert ("op", "witcher.cutscene_scratch_import_camera") in calls['CAMERA'], "no-rig state offers Load Rig"
     dialog_labels = [c[1] for c in calls['DIALOGS'] if c[0] == "label"]
-    assert "Dialogue (preview)" in dialog_labels and any(t.startswith("Read-only") for t in dialog_labels), dialog_labels
-    assert "Imported .w2cutscene" in dialog_labels, dialog_labels
+    assert "Dialogue" in dialog_labels and "Dialogue (preview)" not in dialog_labels, dialog_labels
+    assert ("list", "WITCH_UL_CutsceneAuthoredDialogList") in calls['DIALOGS'], calls['DIALOGS']
+    assert ("prop", "witcher_lipsync_redkit_project") in calls['DIALOGS'], calls['DIALOGS']
+    assert ("op", "witcher.cutscene_dialog_add_from_speech") in calls['DIALOGS'], calls['DIALOGS']
+    assert any(
+        t.startswith(("idSpace ", "Radish IDs ", "No project")) or ": no idSpace" in t for t in dialog_labels
+    ), dialog_labels
+
+    scene.witcher_loaded_w2cutscene_path = r"C:\panel\preview.w2cutscene"
+    scene.witcher_cutscene_used_in_files = r"dlc\panel\scenes\preview.w2scene"
+    event = scene.witcher_cutscene_event_items.add()
+    event.event_type = "CExtAnimCutsceneDialogEvent"
     line = scene.witcher_cutscene_dialog_items.add()
     line.actor, line.line_text, line.line_id = "GERALT", "probe line", "1"
     scene.witcher_cs_tab = 'DIALOGS'
     dcalls = draw_panel(panel_cls)
+    preview_labels = [c[1] for c in dcalls if c[0] == "label"]
+    assert "Dialogue (preview)" in preview_labels and any(t.startswith("Read-only") for t in preview_labels), preview_labels
     assert ("list", "WITCH_UL_CutsceneDialogList") in dcalls and ("prop", "line_text") in dcalls, dcalls
+    assert ("op", "witcher.cutscene_dialog_copy_preview") in dcalls, dcalls
     scene.witcher_cutscene_dialog_items.clear()
+    scene.witcher_cutscene_event_items.clear()
+    empty_preview_calls = draw_panel(panel_cls)
+    empty_preview_labels = [c[1] for c in empty_preview_calls if c[0] == "label"]
+    assert "Dialogue" in empty_preview_labels and "Dialogue (preview)" not in empty_preview_labels
+    assert ("op", "witcher.cutscene_dialog_add_line") in empty_preview_calls, empty_preview_calls
+    scene.witcher_loaded_w2cutscene_path = ""
+    scene.witcher_cutscene_used_in_files = ""
+    editor_calls = draw_dialogue_editor_state(scene, panel_cls)
+    assert editor_calls is not None
+    print("STATE dialogue editor OK")
     status, hint = header_lines(calls['ACTORS'])
     assert status == "0 actors · 0 clips · not baked" and hint == "Next: press New or Import", (status, hint)
     assert len(ui_cutscene._cutscene_cast_actors(scene)) == len(ui_cutscene._clip_groups(scene)) == 0
@@ -615,8 +696,12 @@ try:
     assert_operator_poll("witcher.cutscene_add_props", False)
     assert_operator_poll("witcher.cutscene_grip_prop", False)
 
+    assert bpy.ops.witcher.cutscene_create_new(cutscene_name="probe scene", length=120, fps=25) == {'FINISHED'}
+    assert scene.witcher_cutscene_export_repo_path.endswith("\\probe_scene.w2cutscene"), scene.witcher_cutscene_export_repo_path
+    assert (scene.frame_start, scene.frame_end, scene.frame_current, scene.render.fps) == (0, 119, 0, 25)
     assert bpy.ops.witcher.cutscene_create_new() == {'FINISHED'}
     assert scene.witcher_cutscene_export_repo_path.endswith("new_cutscene_01.w2cutscene")
+    assert (scene.frame_start, scene.frame_end, scene.render.fps, scene.render.fps_base) == (0, 299, 30, 1.0)
     trajectories = ui_cutscene._find_cutscene_actor_armature(scene, "trajectories")
     assert trajectories is not None
     camera = ui_cutscene._find_cutscene_actor_armature(scene, "camera")
@@ -712,6 +797,115 @@ try:
         assert op in cam_ops, (op, cam_ops)
     assert ("witcher.cutscene_scratch_import_camera" in cam_ops) == (camera is None), cam_ops
     assert any(c[1].endswith("0 shots") for c in calls['CAMERA'] if c[0] == "label"), [c for c in calls['CAMERA'] if c[0] == "label"]
+
+    shot_frame_state = (scene.frame_current, scene.frame_end)
+    scene.frame_end = 100
+    scene.frame_set(10)
+    assert bpy.ops.witcher.cutscene_new_shot() == {'FINISHED'}
+    scene.frame_set(40)
+    assert bpy.ops.witcher.cutscene_new_shot() == {'FINISHED'}
+    shots = cutscene_bake.iter_shot_markers(scene)
+    assert [s[2] for s in shots] == [10, 40] and all(c.get("witcher_shot_generated") for _i, c, _f in shots), shots
+    assert [r[2:] for r in cutscene_bake.shot_ranges(scene)] == [(10, 39), (40, 100)]
+    assert cutscene_bake.shots_stale(scene) and cutscene_bake.bake_state(scene)["shots_stale"]
+    scene[cutscene_bake.SHOTS_FINGERPRINT_PROP] = cutscene_bake.shots_fingerprint(scene)
+    assert not cutscene_bake.shots_stale(scene)
+    shots[1][1].location.x += 1.0
+    assert cutscene_bake.shots_stale(scene)
+    pivot = bpy.data.objects.new("panel_shot_pivot", None)
+    aim = bpy.data.objects.new("panel_shot_aim", None)
+    for helper in (pivot, aim):
+        scene.collection.objects.link(helper)
+    shots[0][1].parent = pivot
+    track = shots[1][1].constraints.new('TRACK_TO')
+    track.target = aim
+    scene[cutscene_bake.SHOTS_FINGERPRINT_PROP] = cutscene_bake.shots_fingerprint(scene)
+    assert not cutscene_bake.shots_stale(scene)
+    pivot.keyframe_insert("location", frame=10)
+    assert cutscene_bake.shots_stale(scene), "animated parent must invalidate shots"
+    scene[cutscene_bake.SHOTS_FINGERPRINT_PROP] = cutscene_bake.shots_fingerprint(scene)
+    aim.location.z += 1.0
+    assert cutscene_bake.shots_stale(scene), "constraint target motion must invalidate shots"
+    pivot.location.x = 3.0
+    pivot.keyframe_insert("location", frame=30)
+    scene[cutscene_bake.SHOTS_FINGERPRINT_PROP] = cutscene_bake.shots_fingerprint(scene)
+    scene.frame_set(20)
+    assert not cutscene_bake.shots_stale(scene), "scrubbing an animated parent is not an edit"
+    track.track_axis = 'TRACK_X'
+    assert cutscene_bake.shots_stale(scene), "constraint settings must invalidate shots"
+    scene.frame_set(40)
+    shots[1][1].constraints.remove(track)
+    shots[0][1].parent = None
+    pivot_action = pivot.animation_data.action
+    for helper in (pivot, aim):
+        bpy.data.objects.remove(helper, do_unlink=True)
+    bpy.data.actions.remove(pivot_action)
+    assert bpy.ops.witcher.cutscene_new_shot() == {'FINISHED'}
+    scene.witcher_cs_tab = 'CAMERA'
+    shot_calls = draw_panel(panel_cls)
+    shot_ops = [c[1] for c in shot_calls if c[0] == "op"]
+    assert shot_ops.count("witcher.cutscene_jump_to_shot") == 3 and shot_ops.count("witcher.cutscene_remove_shot") == 3, shot_ops
+    shot_labels = [c[1] for c in shot_calls if c[0] == "label"]
+    assert "10–39" in shot_labels and "40 skipped" in shot_labels, shot_labels
+    assert any("3 shots" in l and "Shots → Rig" in l for l in shot_labels), shot_labels
+    shot_issues = cutscene_validate.collect_issues(bpy.context)
+    assert any(i["tab"] == 'CAMERA' and "skipped" in i["message"] and i["frame"] == 40 for i in shot_issues), shot_issues
+    assert any("not on the camera rig" in i["message"] for i in shot_issues), shot_issues
+    skipped_index = next(idx for idx, _cam, start, end in cutscene_bake.shot_ranges(scene) if end <= start)
+    skipped_name = next(cam.name for idx, cam, _f in cutscene_bake.iter_shot_markers(scene) if idx == skipped_index)
+    assert bpy.ops.witcher.cutscene_jump_to_shot(shot_index=shots[0][0]) == {'FINISHED'}
+    assert scene.frame_current == 10 and scene.camera == shots[0][1], (scene.frame_current, scene.camera)
+    assert bpy.ops.witcher.cutscene_remove_shot(shot_index=skipped_index) == {'FINISHED'}
+    assert skipped_name not in bpy.data.objects
+    assert [r[2:] for r in cutscene_bake.shot_ranges(scene)] == [(10, 39), (40, 100)]
+
+    rig_data = bpy.data.armatures.new("panel_shot_rig_data")
+    rig = bpy.data.objects.new("panel_shot_rig", rig_data)
+    scene.collection.objects.link(rig)
+    select_only(rig)
+    bpy.ops.object.mode_set(mode='EDIT')
+    rig_bone = rig_data.edit_bones.new(CAMERA_CONTROL_BONE)
+    rig_bone.head, rig_bone.tail = (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    rig["cutscene_actor_name"] = "camera_shot_probe"
+    rig["cutscene_actor_type"] = "CAT_Camera"
+    actions_before = {a.as_pointer() for a in bpy.data.actions}
+    assert bpy.ops.witcher.camera_apply_blender_cameras_to_rig() == {'FINISHED'}
+    assert not cutscene_bake.shots_stale(scene)
+    assert not any(m.name.startswith("W3 Cam") for m in scene.timeline_markers), [m.name for m in scene.timeline_markers]
+    rig_cuts = ui_anims._iter_camera_cut_strips(rig)
+    assert [(t.name, int(s.frame_start), int(s.frame_end)) for t, s in rig_cuts] == [
+        ("cutscene_anim_camera", 10, 39), ("cutscene_anim_camera", 40, 100),
+    ], [(t.name, s.frame_start, s.frame_end) for t, s in rig_cuts]
+    shown_arm = ui_cutscene._cs_find_camera_armature(bpy.context)
+    rig_labels = [c[1] for c in draw_panel(panel_cls) if c[0] == "label"]
+    shown_cuts = len(ui_anims._iter_camera_cut_strips(shown_arm))
+    assert any(l.startswith(f"{shown_cuts} cut") and l.endswith("2 shots") for l in rig_labels), rig_labels
+    old_shot_cams = [cam for _i, cam, _f in cutscene_bake.iter_shot_markers(scene)]
+    select_only(rig)
+    assert bpy.ops.witcher.camera_convert_cuts_to_blender_cameras() == {'FINISHED'}
+    converted = cutscene_bake.iter_shot_markers(scene)
+    assert [s[2] for s in converted] == [10, 40], converted
+    assert all(cam not in old_shot_cams and cam.get("witcher_shot_generated") for _i, cam, _f in converted), converted
+    assert all(cam.name in bpy.data.objects for cam in old_shot_cams)
+    assert cutscene_bake.shots_stale(scene)
+    for idx, _cam, _f in list(cutscene_bake.iter_shot_markers(scene)):
+        assert bpy.ops.witcher.cutscene_remove_shot(shot_index=idx) == {'FINISHED'}
+    for cam in old_shot_cams:
+        data = cam.data
+        bpy.data.objects.remove(cam, do_unlink=True)
+        bpy.data.cameras.remove(data)
+    assert not cutscene_bake.iter_shot_markers(scene) and not cutscene_bake.shots_stale(scene)
+    bpy.data.objects.remove(rig, do_unlink=True)
+    bpy.data.armatures.remove(rig_data)
+    for action in [a for a in bpy.data.actions if a.as_pointer() not in actions_before and a.users == 0]:
+        bpy.data.actions.remove(action)
+    del scene[cutscene_bake.SHOTS_FINGERPRINT_PROP]
+    ui_cutscene._sync_actor_items_with_scene(scene)
+    ui_cutscene.sync_animation_items_from_scene(scene)
+    scene.frame_end = shot_frame_state[1]
+    scene.frame_set(shot_frame_state[0])
+
     status, hint = header_lines(calls['ACTORS'])
     assert status == "0 actors · 0 clips · not baked", status
     assert len(ui_cutscene._cutscene_cast_actors(scene)) == len(ui_cutscene._clip_groups(scene)) == 0
@@ -841,7 +1035,7 @@ try:
     ]
     mixed_status, mixed_hint = header_lines(draw_panel(panel_cls))
     assert mixed_status == "1 actor · 1 clip · not baked", mixed_status
-    assert mixed_hint == "Next: Bake tracks (Export tab)", mixed_hint
+    assert mixed_hint == "Next: Bake actors (Export tab)", mixed_hint
     for technical_arm, technical_action in mixed_technical:
         technical_data = technical_arm.data
         bpy.data.objects.remove(technical_arm, do_unlink=True)
@@ -980,7 +1174,7 @@ try:
     assert "Use loaded strips (fallback)" in labels, labels
     assert not any("Loaded clips sit on anim_import" in text for text in labels), labels
     status, hint = header_lines(calls['ANIMS'])
-    assert status == "1 actor · 1 clip · not baked" and hint == "Next: Bake tracks (Export tab)", (status, hint)
+    assert status == "1 actor · 1 clip · not baked" and hint == "Next: Bake actors (Export tab)", (status, hint)
     assert len(ui_cutscene._cutscene_cast_actors(scene)) == len(ui_cutscene._clip_groups(scene)) == 1
     for idx in range(len(scene.witcher_cutscene_actor_items)):
         scene.witcher_cutscene_loaded_actor_index = idx
@@ -1047,6 +1241,7 @@ try:
                "witcher.cutscene_export_scene_wrapper"):
         assert op in export_ops, export_ops
     assert ("prop", "witcher_cutscene_export_repo_path") in calls['TEMPLATE']
+    assert ("prop", "witcher_cutscene_dialog_id_space") in calls['TEMPLATE']
 
     src_track = next(t for t in arm.animation_data.nla_tracks if t.name.startswith("cutscene_anim")
                      and not any(s.action is not None and s.action.get(cutscene_bake.BAKED_ACTION_TAG) for s in t.strips))
@@ -1064,10 +1259,23 @@ try:
     report = scene.witcher_cutscene_validation_report
     assert report and all(l.startswith(("ERROR", "WARN", "OK")) for l in report.splitlines()), report
     assert any("partial fields" in l for l in report.splitlines()), report
+    issues = scene.witcher_cutscene_validation_issues
+    assert [f"{i.severity} {i.message}" for i in issues] == [l for l in report.splitlines() if not l.startswith("OK")], report
     calls = draw_panel(panel_cls)
     ops = [c[1] for c in calls if c[0] == "op"]
     assert "witcher.cutscene_validation_report" in ops and "witcher.cutscene_set_scene_range" in ops, ops
     assert ops.count("witcher.cutscene_validate") == 1, ops
+    assert ("list", "WITCH_UL_CutsceneValidationIssues") in calls, calls
+    assert ops.count("witcher.cutscene_validation_goto") == len(issues) <= ops.count("witcher.cutscene_exact_value_details"), ops
+    target = next((i for i in issues if i.object_name), None) or next(i for i in issues if i.tab)
+    scene.witcher_cs_tab = 'ACTORS' if target.tab != 'ACTORS' else 'TEMPLATE'
+    assert bpy.ops.witcher.cutscene_validation_goto(
+        tab=target.tab, object_name=target.object_name, frame=target.frame, line=target.line,
+    ) == {'FINISHED'}
+    assert scene.witcher_cs_tab == target.tab, (scene.witcher_cs_tab, target.tab)
+    if target.object_name:
+        assert bpy.context.view_layer.objects.active.name == target.object_name, bpy.context.view_layer.objects.active
+    scene.witcher_cs_tab = 'TEMPLATE'
 
     bpy.data.objects.remove(arm, do_unlink=True)
     assert ui_cutscene._scene_needs_actor_sync(scene)

@@ -464,6 +464,17 @@ try:
     ))
     assert exact_scene_snapshot() == mixed_before
 
+    dialog = scene.witcher_cutscene_dialog_lines.add()
+    dialog.speaker = "IDENTITY"
+    dialog.text = "Same-path authored dialogue survives"
+    dialog.start_frame, dialog.end_frame = 15, 45
+    dialog.tier = 'GAME'
+    dialog.game_line_id = "337201"
+    dialog.game_voice_file_name = "337201"
+    scene.witcher_cutscene_dialog_line_index = 0
+    dialogue_snapshot = tuple(
+        getattr(dialog, field) for field in ui_cutscene._DIALOGUE_ROW_FIELDS
+    )
     ui_cutscene.sync_animation_items_from_scene(scene)
     imported_again = import_cutscene.import_w3_cutscene(
         str(OUT),
@@ -475,6 +486,11 @@ try:
     ui_cutscene._sync_loaded_cutscene_state(scene, str(OUT), cutscene_data=imported_again)
     assert clip_snapshot(third_id) == authored_before_rebuild
     assert event_ids(scene)["authored_keep"] == third_id
+    assert len(scene.witcher_cutscene_dialog_lines) == 1
+    assert tuple(
+        getattr(scene.witcher_cutscene_dialog_lines[0], field)
+        for field in ui_cutscene._DIALOGUE_ROW_FIELDS
+    ) == dialogue_snapshot
     same_file_zero = next(
         item for item in scene.witcher_cutscene_animation_items
         if item.file_backed and int(item.source_index) == 0
@@ -528,6 +544,7 @@ try:
         import_burned_audio=False,
     )
     ui_cutscene._sync_loaded_cutscene_state(scene, str(OUT_OTHER), cutscene_data=imported_other)
+    assert not scene.witcher_cutscene_dialog_lines
     assert 0 not in ui_cutscene._clip_groups(scene), ui_cutscene._clip_groups(scene)
     assert backup_track.name in actor.animation_data.nla_tracks
     assert len(backup_track.strips) == 1

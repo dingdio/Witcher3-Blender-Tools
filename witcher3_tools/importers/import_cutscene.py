@@ -3292,7 +3292,6 @@ def collect_cutscene_dialog_event_frames(cutscene_filepath, cutscene_template=No
         for event in getattr(node, "entries", None) or []:
             _append_cutscene_dialog_event_frame(dialog_events, event, "ENTRY", fps, source_index=idx)
 
-    dialog_events.sort(key=lambda item: (int(item["frame"]), int(item["source_index"])))
     return dialog_events
 
 
@@ -3320,7 +3319,7 @@ def load_cutscene_dialog_items(cutscene_filepath):
     ordered_scene_paths = [used_in_files[0], *used_in_files[1:]]
     dialog_items = []
 
-    for idx, depot_path in enumerate(ordered_scene_paths):
+    for depot_path in ordered_scene_paths:
         scene_abs = _resolve_cutscene_linked_scene_file(depot_path, cutscene_filepath)
         if not scene_abs:
             log.debug("Could not resolve scene file for dialog lookup: %s", depot_path)
@@ -3333,7 +3332,7 @@ def load_cutscene_dialog_items(cutscene_filepath):
             log.exception("Dialog lookup failed for %s in %s", cutscene_filepath, scene_abs)
             continue
 
-        if not lines and idx == 0:
+        if not lines:
             continue
 
         for line in lines:
@@ -3341,6 +3340,10 @@ def load_cutscene_dialog_items(cutscene_filepath):
                 line_index = int(line.get("line_index", 0) or 0)
             except (TypeError, ValueError):
                 line_index = 0
+            try:
+                approved_duration = float(line.get("approved_duration", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                approved_duration = 0.0
             dialog_items.append({
                 "actor":       str(line.get("actor", "") or ""),
                 "voice_file":  str(line.get("voice_file", "") or ""),
@@ -3348,12 +3351,12 @@ def load_cutscene_dialog_items(cutscene_filepath):
                 "line_id":     str(line.get("line_id", "") or ""),
                 "line_index":  line_index,
                 "line_text":   str(line.get("line_text", "") or ""),
+                "approved_duration": approved_duration,
                 "scene_path":  depot_path,
                 "source_game": str(line.get("source_game", "") or ""),
             })
 
-        if dialog_items and idx == 0:
-            break
+        break
 
     return dialog_items
 

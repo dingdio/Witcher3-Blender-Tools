@@ -1188,7 +1188,7 @@ class AnimImporter:
             if strip_start < cursor < strip_end:
                 self.__split_nla_strip_at_cursor(target, target_track, strip, cursor, insert_length)
 
-    def __assign_action(self, target: Union[bpy.types.ID, HasAnimationData], action: bpy.types.Action, camera_cut_frames=None):
+    def __assign_action(self, target: Union[bpy.types.ID, HasAnimationData], action: bpy.types.Action, camera_cut_frames=None, num_frames=0):
         if target.animation_data is None:
             target.animation_data_create()
 
@@ -1204,7 +1204,7 @@ class AnimImporter:
 
             start_frame, end_frame = action.frame_range
             length = end_frame - start_frame
-            strip_length = max(1.0, float(length))
+            strip_length = max(1.0, float(length), float(int(num_frames or 0) - 1))  # Preserve constant-channel duration.
             total_insert_length = strip_length
             if self.__AnimationBufferType == AnimationBufferType.Multi:
                 anim_buffer = getattr(getattr(self.__SetEntry, "animation", None), "animBuffer", None)
@@ -1323,24 +1323,8 @@ class AnimImporter:
             self.__animFile.filepath,
             SkeletalAnimation.name,
         ) and _is_standard_cutscene_root_motion_rig(armObj)
-        # W2 cutscenes author each actor's world placement on the Root bone
-        # (e.g. a 180 deg yaw). W3 cutscenes instead force the Root to identity
-        # and carry placement on Trajectory. So for W2 we keep the authored Root
-        # transform; zeroing it negates the actor's X/Y and puts it on the wrong
-        # side relative to the camera/trajectory actors (which always keep Root).
-        preserve_cutscene_root = cutscene_root_component and _is_w2_cr2w_version(
-            self.__animFile.filepath
-        )
-        zero_cutscene_root = cutscene_root_component and not preserve_cutscene_root
-        if cutscene_root_component:
-            log.debug(
-                "Animation '%s': %s cutscene Root bone.",
-                SkeletalAnimation.name,
-                "keeping authored" if preserve_cutscene_root else "zeroing",
-            )
-
-        # Skip the Trajectory->Root swap for all cutscene root components; for W2
-        # this leaves the authored Root (placement) intact, for W3 it is zeroed below.
+        # W2 and add-on exports store model-space placement/yaw on Root;
+        # vanilla W3 Root is already identity.
         use_root_source_bone = not cutscene_root_component
         if use_root_source_bone:
             root_bone = _find_anim_bone(anim_desc.bones, "Root")
@@ -1532,7 +1516,6 @@ class AnimImporter:
             #! 
             rot_frames = [Quaternion((rot.W, rot.X, rot.Y, rot.Z)) for rot in bone.rotationFramesQuat]
             loc_data_path, rot_data_path = curve_per_bone[mdl_bone.BoneName]
-            zero_root_bone = zero_cutscene_root and _base_bone_name(mdl_bone.BoneName).lower() == "root"
 
             #! SCALE FRAMES
             bone_frames = len(bone.scaleFrames)
@@ -1560,7 +1543,7 @@ class AnimImporter:
                 else:
                     origPos = bl_bone.bone.matrix_local.translation
                 origPos = Vector(( origPos.x, origPos.y, origPos.z ))
-                pos_rot90_matrix = Matrix.Rotation(math.radians(90), 4, 'Z') if use_rot90 else None
+                pos_rot90_matrix = Matrix.Rotation(math.radians(90), 4, 'Z') if use_rot90 and bl_bone.parent else None  # Root rest already includes rot90.
                 additive_pos = SkeletalAnimationType == "SAT_Additive" or face_animation
                 keep_world_pos = self.facePose or mdl_bone.BoneName in world_pos_list
                 bone_rest_rot_inv = None if (additive_pos or keep_world_pos) else bl_bone.bone.matrix.to_quaternion().inverted()
@@ -1590,11 +1573,6 @@ class AnimImporter:
                         pos_fix = pos_frame - origPos
                         if bone_rest_rot_inv is not None:
                             pos_fix = bone_rest_rot_inv @ pos_fix
-                    if zero_root_bone:
-                        loc_key_frames.append(loc_frame)
-                        for i in range(3):
-                            loc_key_values[i].append(0.0)
-                        continue
                     loc_key_frames.append(loc_frame)
                     loc_key_values[0].append(round(pos_fix.x, 8))
                     loc_key_values[1].append(round(pos_fix.y, 8))
@@ -1663,9 +1641,6 @@ class AnimImporter:
                     elif use_rot90:
                         fixed_rot = z_minus_90 @ fixed_rot @ z_plus_90
                         fixed_rot.normalize()
-
-                    if zero_root_bone:
-                        fixed_rot = Quaternion((1.0, 0.0, 0.0, 0.0))
 
                     if fixed_rot.dot(fixed_rot) <= 1e-12:
                         fixed_rot = Quaternion((1.0, 0.0, 0.0, 0.0))
@@ -1778,9 +1753,9 @@ class AnimImporter:
 
         
         
-        self.__assign_action(armObj, action, camera_cut_frames=camera_cut_frames)
+        self.__assign_action(armObj, action, camera_cut_frames=camera_cut_frames, num_frames=total_frames)
         if morph_action_target is not None and morph_action_target != armObj:
-            self.__assign_action(morph_action_target, action)
+            self.__assign_action(morph_action_target, action, camera_cut_frames=camera_cut_frames, num_frames=total_frames)
 
         if (foot_ik_cleanup and not face_animation and not camera_animation
                 and not self.facePose and SkeletalAnimationType != "SAT_Additive"):

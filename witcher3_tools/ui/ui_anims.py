@@ -27,6 +27,7 @@ from ..repo_paths import (
 )
 from ..importers import import_anims, import_cutscene, import_entity, import_rig, import_scene_animation
 from ..exporters import export_anims, export_cutscene
+from ..animation import cutscene_bake
 from ..animation import pose_keys as pose_key_tools
 from ..animation.action_compat import (
     assign_action,
@@ -973,6 +974,7 @@ def _is_cutscene_nla_track_name(track_name):
 
 
 CAMERA_CUT_MARKER_PREFIX = "W3 Cam "
+CAMERA_TRACK_NAME = "cutscene_anim_camera"
 
 
 def _is_camera_armature(obj):
@@ -1091,8 +1093,10 @@ def _sync_camera_cut_markers(scene, armature_obj):
         if _is_camera_cut_marker(marker):
             markers.remove(marker)
 
-    camera_obj = find_camera_preview_object(armature_obj)
     cuts = _iter_camera_cut_strips(armature_obj)
+    if cutscene_bake.iter_shot_markers(scene):
+        return len(cuts)  # Shot markers already define the cuts.
+    camera_obj = find_camera_preview_object(armature_obj)
     for idx, (_track, strip) in enumerate(cuts):
         marker = markers.new(_camera_cut_marker_name(idx), frame=int(round(float(strip.frame_start))))
         try:
@@ -1384,8 +1388,7 @@ def _validate_adjacent_camera_cuts(cuts):
 def _new_camera_edit_track(camera_armature):
     anim_data = camera_armature.animation_data_create()
     track = anim_data.nla_tracks.new()
-    base_name = "cutscene_anim_camera_edits"
-    track.name = base_name
+    track.name = CAMERA_TRACK_NAME
     return track
 
 
@@ -1906,10 +1909,29 @@ def _find_or_create_cutscene_track(armature_obj, track_name):
     return track
 
 
-def _new_cutscene_edit_track(armature_obj, track_name):
+def _is_cutscene_lane_name(name, track_name):
+    """Match the base, numbered, and legacy edit lanes."""
+    if name == track_name:
+        return True
+    if not name.startswith(f"{track_name}_"):
+        return False
+    suffix = name[len(track_name) + 1:]
+    return suffix.isdigit() or suffix.split(".", 1)[0] == "edits"
+
+
+def _cutscene_lanes(armature_obj, track_name):
+    anim_data = getattr(armature_obj, "animation_data", None)
+    return [t for t in (anim_data.nla_tracks if anim_data else []) if _is_cutscene_lane_name(t.name, track_name)]
+
+
+def _new_cutscene_lane(armature_obj, track_name):
     anim_data = armature_obj.animation_data_create()
+    names = {t.name for t in anim_data.nla_tracks}
+    number = 2
+    while f"{track_name}_{number}" in names:
+        number += 1
     track = anim_data.nla_tracks.new()
-    track.name = f"{track_name}_edits"
+    track.name = f"{track_name}_{number}"
     return track
 
 
@@ -1917,7 +1939,6 @@ def _last_cutscene_strip_end(armature_obj, track_name):
     anim_data = getattr(armature_obj, "animation_data", None)
     if anim_data is None:
         return None
-    edit_name = f"{track_name}_edits"
     file_track_base = (
         import_cutscene.CUTSCENE_FILE_FACE_TRACK_NAME
         if track_name == SCRATCH_CUTSCENE_FACE_TRACK_NAME
@@ -1929,15 +1950,7 @@ def _last_cutscene_strip_end(armature_obj, track_name):
         name = str(getattr(track, "name", "") or "")
         file_suffix = name[len(file_track_prefix):].split(".", 1)[0] if name.startswith(file_track_prefix) else ""
         is_file_track = bool(file_suffix) and file_suffix.isdigit()
-        if (
-            "_prebake" in name
-            or (
-                name != track_name
-                and name != edit_name
-                and not name.startswith(f"{edit_name}.")
-                and not is_file_track
-            )
-        ):
+        if "_prebake" in name or not (_is_cutscene_lane_name(name, track_name) or is_file_track):
             continue
         for strip in getattr(track, "strips", []) or []:
             strip_end = float(getattr(strip, "frame_end", 0.0) or 0.0)
@@ -2011,11 +2024,13 @@ def _create_cutscene_action_strip(context, armature_obj, action, actor_name, com
         bind_strip_action_slot(strip, resolve_action_slot(action, target=armature_obj, ensure=True))
         return track, strip
 
-    preferred_track = _find_or_create_cutscene_track(armature_obj, track_name)
-    try:
-        return _create_on_track(preferred_track)
-    except RuntimeError:
-        return _create_on_track(_new_cutscene_edit_track(armature_obj, track_name))
+    lanes = _cutscene_lanes(armature_obj, track_name) or [_find_or_create_cutscene_track(armature_obj, track_name)]
+    for track in lanes:
+        try:
+            return _create_on_track(track)
+        except RuntimeError:  # no room on this track
+            continue
+    return _create_on_track(_new_cutscene_lane(armature_obj, track_name))
 
 
 def _disable_promoted_action_source(armature_obj, action, source_track=None, source_strip=None):
@@ -2302,15 +2317,18 @@ def _cutscene_nla_entries(context):
         return []
 
 
-def _scratch_validation_lines(context):
+def _scratch_validation_issues(context):
+    """Return (severity, message, tab, object) setup issues."""
     scene = getattr(context, "scene", None)
     actors = _cutscene_actor_roots(scene)
     entries = _cutscene_nla_entries(context)
-    errors = []
-    warnings = []
+    issues = []
+
+    def add(severity, message, tab="", obj=None):
+        issues.append((severity, message, tab, getattr(obj, "name", "") if obj is not None else ""))
 
     if not actors:
-        errors.append("No cutscene actors are assigned.")
+        add("ERROR", "No cutscene actors are assigned.", "ACTORS")
 
     cameras = [
         actor for actor in actors
@@ -2320,24 +2338,24 @@ def _scratch_validation_lines(context):
     ]
     camera = cameras[0] if cameras else None
     if camera is None:
-        errors.append("No cutscene camera actor is assigned.")
+        add("ERROR", "No cutscene camera actor is assigned.", "CAMERA")
     else:
         if not _is_camera_armature(camera):
-            errors.append(f"Camera actor '{camera.name}' is missing Camera_Node.")
+            add("ERROR", f"Camera actor '{camera.name}' is missing Camera_Node.", "CAMERA", camera)
         camera_cuts = _iter_camera_cut_strips(camera)
         if not camera_cuts:
-            errors.append("Camera has no cutscene NLA strips.")
+            add("ERROR", "Camera has no cutscene NLA strips.", "CAMERA", camera)
         else:
             for _track, strip in camera_cuts:
                 action = getattr(strip, "action", None)
                 if action is None:
-                    errors.append(f"Camera strip '{strip.name}' has no action.")
+                    add("ERROR", f"Camera strip '{strip.name}' has no action.", "CAMERA", camera)
                     continue
                 if not _action_has_fcurves(action, target=camera):
-                    errors.append(f"Camera action '{action.name}' has no keyed channels.")
+                    add("ERROR", f"Camera action '{action.name}' has no keyed channels.", "CAMERA", camera)
             markers = [marker for marker in getattr(scene, "timeline_markers", []) if _is_camera_cut_marker(marker)]
             if markers and len(markers) != len(camera_cuts):
-                warnings.append(f"Camera marker count ({len(markers)}) does not match camera cuts ({len(camera_cuts)}).")
+                add("WARN", f"Camera marker count ({len(markers)}) does not match camera cuts ({len(camera_cuts)}).", "CAMERA", camera)
 
     entries_by_actor = {}
     for entry in entries:
@@ -2347,44 +2365,36 @@ def _scratch_validation_lines(context):
         actor_name = str(actor.get("cutscene_actor_name", "") or "").strip()
         actor_type = str(actor.get("cutscene_actor_type", "") or "").strip()
         if not actor_name:
-            errors.append(f"Actor object '{actor.name}' has no cutscene actor name.")
+            add("ERROR", f"Actor object '{actor.name}' has no cutscene actor name.", "ACTORS", actor)
         if not _resolve_actor_template_path(actor):
-            warnings.append(f"Actor '{actor_name or actor.name}' has no entity template path.")
+            add("WARN", f"Actor '{actor_name or actor.name}' has no entity template path.", "ACTORS", actor)
         if actor_type not in {"CAT_None", "CAT_Actor", "CAT_Prop", "CAT_Camera"}:
-            errors.append(f"Actor '{actor_name or actor.name}' has invalid actor type '{actor_type}'.")
+            add("ERROR", f"Actor '{actor_name or actor.name}' has invalid actor type '{actor_type}'.", "ACTORS", actor)
         if actor_type != "CAT_Camera":
             skeleton_path = export_cutscene._resolve_cutscene_skeleton_path(actor, SCRATCH_CUTSCENE_ROOT_COMPONENT, scene=scene)
             if not skeleton_path:
-                errors.append(f"Actor '{actor_name or actor.name}' has no body skeleton path.")
+                add("ERROR", f"Actor '{actor_name or actor.name}' has no body skeleton path.", "ACTORS", actor)
             if not entries_by_actor.get(actor_name):
-                warnings.append(f"Actor '{actor_name or actor.name}' has no cutscene animation strips.")
+                add("WARN", f"Actor '{actor_name or actor.name}' has no cutscene animation strips.", "ANIMS", actor)
             if actor_type == "CAT_Actor" and not getattr(getattr(actor, "pose", None), "bones", {}).get("Trajectory"):
-                warnings.append(f"Actor '{actor_name or actor.name}' has no Trajectory bone.")
+                add("WARN", f"Actor '{actor_name or actor.name}' has no Trajectory bone.", "ACTORS", actor)
         if bool(actor.get("cutscene_actor_use_mimic", False)):
             mimic_name = str(actor.get("mimicFace", "") or "").strip()
             mimic_obj = bpy.data.objects.get(mimic_name) if mimic_name else None
             if getattr(mimic_obj, "type", None) != 'ARMATURE':
-                warnings.append(f"Actor '{actor_name or actor.name}' is marked mimic but has no face armature.")
+                add("WARN", f"Actor '{actor_name or actor.name}' is marked mimic but has no face armature.", "ACTORS", actor)
 
     for entry in entries:
         action = entry.get("action")
+        armature = entry.get("armature_obj")
         strip_name = str(entry.get("strip_name", "") or "")
         if action is None:
-            errors.append(f"Cutscene strip '{strip_name}' has no action.")
-        elif not _action_has_fcurves(action, target=entry.get("armature_obj")):
-            warnings.append(f"Action '{action.name}' has no keyed channels.")
+            add("ERROR", f"Cutscene strip '{strip_name}' has no action.", "ANIMS", armature)
+        elif not _action_has_fcurves(action, target=armature):
+            add("WARN", f"Action '{action.name}' has no keyed channels.", "ANIMS", armature)
         if float(entry.get("strip_frame_end", 0.0) or 0.0) <= float(entry.get("strip_frame_start", 0.0) or 0.0):
-            errors.append(f"Cutscene strip '{strip_name}' has zero or negative duration.")
-
-    summary = [
-        f"Actors: {len(actors)}",
-        f"Animation strips: {len(entries)}",
-        f"Camera cuts: {len(_iter_camera_cut_strips(camera)) if camera is not None else 0}",
-    ]
-    lines = ["OK " + ", ".join(summary)] if not errors else ["ERROR " + ", ".join(summary)]
-    lines.extend(f"ERROR {line}" for line in errors)
-    lines.extend(f"WARN {line}" for line in warnings)
-    return lines, errors, warnings
+            add("ERROR", f"Cutscene strip '{strip_name}' has zero or negative duration.", "ANIMS", armature)
+    return issues
 
 
 def _key_pose_bone_transform(pose_bone, frame):
@@ -3056,10 +3066,9 @@ class WITCH_OT_CameraSetDofFromSelected(bpy.types.Operator):
 
 
 class WITCH_OT_CameraConvertCutsToBlenderCameras(bpy.types.Operator):
-    """Create a Blender camera for each NLA cut strip by baking the rig's animation onto it.
-    Tag each camera with the strip name so it can be applied back with 'Blender Cams → Rig'."""
+    """Bake rig cuts to shots without deleting replaced cameras."""
     bl_idname = "witcher.camera_convert_cuts_to_blender_cameras"
-    bl_label = "Cuts → Blender Cameras"
+    bl_label = "Cuts → Shots"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
@@ -3080,49 +3089,63 @@ class WITCH_OT_CameraConvertCutsToBlenderCameras(bpy.types.Operator):
             return {'CANCELLED'}
 
         camera_bone = ensure_camera_track_properties(camera_armature, track_names=CAMERA_TRACK_NAMES)
+        shot_markers = {}
+        for marker in scene.timeline_markers:
+            cam = getattr(marker, "camera", None)
+            if cam is not None and cam.get("witcher_shot_index") is not None:
+                shot_markers[int(marker.frame)] = marker
         previous_frame = scene.frame_current
         created = []
         try:
             for _track, strip in cuts:
-                strip_name = str(getattr(strip, "name", "") or "")
-                cam_name = f"BlenderCam_{strip_name}" if strip_name else f"BlenderCam_{len(created) + 1:02d}"
+                start = int(round(float(strip.frame_start)))
+                end = int(round(float(strip.frame_end)))
+                shot_idx = _next_shot_index(scene)
+                cam_name = f"Shot {shot_idx + 1:02d}"
 
                 cam_data = bpy.data.cameras.new(name=cam_name)
                 cam_data.sensor_fit = 'VERTICAL'
                 cam_data.sensor_height = CAMERA_SENSOR_HEIGHT
                 cam_data.lens_unit = 'FOV'
-
                 cam_obj = bpy.data.objects.new(name=cam_name, object_data=cam_data)
-                cam_obj["witcher_cut_strip_name"] = strip_name
+                cam_obj["witcher_shot_index"] = shot_idx
+                cam_obj["witcher_shot_generated"] = True
                 scene.collection.objects.link(cam_obj)
                 created.append(cam_obj)
-
-                start = int(round(float(strip.frame_start)))
-                end = int(round(float(strip.frame_end)))
 
                 for frame in range(start, end + 1):
                     scene.frame_set(frame)
                     context.view_layer.update()
-
-                    world_mat = None
-                    if preview_camera is not None:
-                        world_mat = preview_camera.matrix_world.copy()
-                    else:
-                        world_mat = _pose_bone_world_matrix(camera_armature, CAMERA_EDIT_BONE)
-
+                    world_mat = (
+                        preview_camera.matrix_world.copy() if preview_camera is not None
+                        else _pose_bone_world_matrix(camera_armature, CAMERA_EDIT_BONE)
+                    )
                     if world_mat is not None:
                         cam_obj.matrix_world = world_mat
-
                     if camera_bone is not None and "hctFOV" in camera_bone:
                         cam_data.lens = fov_to_lens(float(camera_bone["hctFOV"]))
-
+                    if preview_camera is not None:
+                        source_dof = preview_camera.data.dof
+                        cam_data.dof.use_dof = bool(source_dof.use_dof)
+                        cam_data.dof.focus_distance = float(source_dof.focus_distance)
+                        cam_data.dof.aperture_fstop = float(source_dof.aperture_fstop)
+                        cam_data.keyframe_insert("dof.focus_distance", frame=frame)
+                        cam_data.keyframe_insert("dof.aperture_fstop", frame=frame)
                     cam_obj.keyframe_insert("location", frame=frame)
                     cam_obj.keyframe_insert("rotation_euler", frame=frame)
                     cam_data.keyframe_insert("lens", frame=frame)
+
+                marker = shot_markers.get(start)
+                if marker is None:
+                    marker = scene.timeline_markers.new(cam_name, frame=start)
+                    shot_markers[start] = marker
+                else:
+                    marker.name = cam_name
+                marker.camera = cam_obj
         finally:
             scene.frame_set(previous_frame)
 
-        self.report({'INFO'}, f"Created {len(created)} Blender camera(s) from cuts.")
+        self.report({'INFO'}, f"Created {len(created)} shot(s) from camera cuts.")
         return {'FINISHED'}
 
 
@@ -3145,14 +3168,16 @@ class WITCH_OT_CameraApplyBlenderCamerasToRig(bpy.types.Operator):
         return has_shots or _find_camera_armature(context) is not None
 
     def execute(self, context):
-        scene = context.scene
-        shots = _iter_shot_markers(scene)
-        if shots:
-            return self._apply_shots(context, shots)
+        if _iter_shot_markers(context.scene):
+            return self._apply_shots(context)
         return self._apply_tagged_cameras(context)
 
-    def _apply_shots(self, context, shots):
+    def _apply_shots(self, context, shots=None):
         scene = context.scene
+        shots = _iter_shot_markers(scene) if shots is None else list(shots)
+        if not shots:
+            self.report({'WARNING'}, "No shots. Press New Shot first.")
+            return {'CANCELLED'}
         camera_armature = _find_camera_armature(context)
         if camera_armature is None:
             camera_armature = _import_cutscene_camera_rig(context)
@@ -3172,13 +3197,7 @@ class WITCH_OT_CameraApplyBlenderCamerasToRig(bpy.types.Operator):
             )
         from . import ui_cutscene
 
-        scene_end = int(getattr(scene, "frame_end", 0))
-        shot_ranges = []
-        for i, (shot_idx, cam_obj, frame) in enumerate(shots):
-            next_frame = shots[i + 1][2] if i + 1 < len(shots) else scene_end + 1
-            range_end = next_frame - 1
-            if range_end > frame:
-                shot_ranges.append((shot_idx, cam_obj, frame, range_end))
+        shot_ranges = [item for item in cutscene_bake.shot_ranges(scene, shots) if item[3] > item[2]]
         if not shot_ranges:
             self.report({'WARNING'}, "No shots baked. Check that shots have markers with cameras bound.")
             return {'CANCELLED'}
@@ -3374,7 +3393,7 @@ class WITCH_OT_CameraApplyBlenderCamerasToRig(bpy.types.Operator):
             if not track.strips:
                 anim_data.nla_tracks.remove(track)
             else:
-                track.name = "cutscene_anim_camera_edits"
+                track.name = CAMERA_TRACK_NAME
                 track.mute = False
         for camera_obj, _curves in driver_state.values():
             _clear_camera_preview_drivers(camera_obj)
@@ -3392,6 +3411,7 @@ class WITCH_OT_CameraApplyBlenderCamerasToRig(bpy.types.Operator):
             if old_source_index != source_index and old_source_index not in remaining_groups:
                 ui_cutscene._remove_cutscene_animation_entry(scene, old_source_index, remove_strips=False)
         ui_cutscene.sync_animation_items_from_scene(scene)
+        scene[cutscene_bake.SHOTS_FINGERPRINT_PROP] = cutscene_bake.shots_fingerprint(scene)
         self.report({'INFO'}, f"Baked {applied} shot(s) onto the rig.")
         return {'FINISHED'}
 
@@ -3415,7 +3435,7 @@ class WITCH_OT_CameraApplyBlenderCamerasToRig(bpy.types.Operator):
                     tagged_cameras[strip_name] = obj
 
         if not tagged_cameras:
-            self.report({'WARNING'}, "No shots or tagged cameras found. Use 'New Shot' or 'Cuts → Blender Cams' first.")
+            self.report({'WARNING'}, "No shots or tagged cameras found. Use 'New Shot' or 'Cuts → Shots' first.")
             return {'CANCELLED'}
 
         previous_frame = scene.frame_current
@@ -3718,6 +3738,13 @@ class WITCH_OT_PelvisApplyNumericOffset(bpy.types.Operator):
 # Shot-based camera workflow helpers
 # ---------------------------------------------------------------------------
 
+def apply_shots_to_rig(context, report=None):
+    """Bake scene shots to the camera rig."""
+    shim = type("_ShotsReport", (), {})()
+    shim.report = report or (lambda levels, message: log.info("shots to rig: %s", message))
+    return WITCH_OT_CameraApplyBlenderCamerasToRig._apply_shots(shim, context)
+
+
 def _shot_camera_action_name(shot_index):
     return f"witcher_camera_shot_{int(shot_index):02d}"
 
@@ -3732,18 +3759,7 @@ def _next_shot_index(scene):
 
 
 def _iter_shot_markers(scene):
-    """Return sorted [(shot_index, camera_obj, marker_frame)] for W3 shot cameras."""
-    shots = []
-    for marker in getattr(scene, "timeline_markers", []) or []:
-        cam = getattr(marker, "camera", None)
-        if cam is None or getattr(cam, "type", None) != 'CAMERA':
-            continue
-        shot_idx = cam.get("witcher_shot_index")
-        if shot_idx is None:
-            continue
-        shots.append((int(shot_idx), cam, int(marker.frame)))
-    shots.sort(key=lambda x: x[2])
-    return shots
+    return cutscene_bake.iter_shot_markers(scene)
 
 
 def _import_cutscene_camera_rig(context):
@@ -3813,6 +3829,7 @@ class WITCH_OT_CutsceneNewShot(bpy.types.Operator):
 
         scene.collection.objects.link(cam_obj)
         cam_obj["witcher_shot_index"] = shot_idx
+        cam_obj["witcher_shot_generated"] = True
 
         frame = scene.frame_current
         marker = scene.timeline_markers.new(cam_name, frame=frame)
@@ -3821,6 +3838,61 @@ class WITCH_OT_CutsceneNewShot(bpy.types.Operator):
         scene.camera = cam_obj
 
         self.report({'INFO'}, f"Created {cam_name} at frame {frame}.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneRemoveShot(bpy.types.Operator):
+    """Remove a shot, deleting only add-on-generated cameras."""
+    bl_idname = "witcher.cutscene_remove_shot"
+    bl_label = "Remove Shot"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    shot_index: IntProperty(default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        cam = next((cam for idx, cam, _frame in _iter_shot_markers(scene) if idx == self.shot_index), None)
+        if cam is None:
+            self.report({'WARNING'}, "Shot not found.")
+            return {'CANCELLED'}
+        for marker in [m for m in scene.timeline_markers if m.camera == cam]:
+            scene.timeline_markers.remove(marker)
+        label = cam.name
+        if cam.get("witcher_shot_generated"):
+            data = cam.data
+            bpy.data.objects.remove(cam, do_unlink=True)
+            if data is not None and data.users == 0:
+                bpy.data.cameras.remove(data)
+        else:
+            del cam["witcher_shot_index"]
+        self.report({'INFO'}, f"Removed shot '{label}'.")
+        return {'FINISHED'}
+
+
+class WITCH_OT_CutsceneJumpToShot(bpy.types.Operator):
+    """Select a shot and jump to its first frame."""
+    bl_idname = "witcher.cutscene_jump_to_shot"
+    bl_label = "Jump to Shot"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    shot_index: IntProperty(default=-1)
+
+    def execute(self, context):
+        scene = context.scene
+        shot = next((shot for shot in _iter_shot_markers(scene) if shot[0] == self.shot_index), None)
+        if shot is None:
+            self.report({'WARNING'}, "Shot not found.")
+            return {'CANCELLED'}
+        _idx, cam, frame = shot
+        scene.frame_set(frame)
+        scene.camera = cam
+        try:
+            for obj in context.selected_objects:
+                obj.select_set(False)
+            cam.select_set(True)
+            context.view_layer.objects.active = cam
+        except RuntimeError:
+            pass
         return {'FINISHED'}
 
 
@@ -8244,9 +8316,14 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
                 self.report({'ERROR'}, "Enable blender_re_animations_plugin to export Redkit .re files")
                 return {'CANCELLED'}
 
-        setup_lines, setup_errors, _setup_warnings = cutscene_validate.validate_cutscene_setup(context)
+        if self.bake_before_export and cutscene_bake.iter_shot_markers(context.scene):
+            if apply_shots_to_rig(context, self.report) != {'FINISHED'}:
+                self.report({'ERROR'}, "Shots → Rig failed; export cancelled")
+                return {'CANCELLED'}
+        setup_issues = cutscene_validate.collect_setup_issues(context)
+        setup_errors = [item["message"] for item in setup_issues if item["severity"] == "ERROR"]
         if setup_errors:
-            context.scene.witcher_cutscene_validation_report = "\n".join(setup_lines)
+            cutscene_validate.store_report(context.scene, setup_issues)
             self.report({'ERROR'}, f"{len(setup_errors)} validation error(s): " + " | ".join(setup_errors[:3])
                         + " — see Validate in the Export tab")
             return {'CANCELLED'}
@@ -8289,7 +8366,7 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
             if self.export_generated_actors and entry.get("kind") == "props" and entry.get("repo_path")
         }
         try:
-            lines, errors, _warnings = cutscene_validate.validate_cutscene(
+            issues = cutscene_validate.collect_issues(
                 context,
                 allowed_missing_prop_templates=planned_prop_templates,
             )
@@ -8300,9 +8377,9 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
             return {'CANCELLED'}
         if not self.bake_before_export:
             warning = "Bake before export is off; current baked output may be stale."
-            lines.append(f"WARN {warning}")
+            issues.append(cutscene_validate.issue("WARN", warning, "TEMPLATE"))
             self.report({'WARNING'}, warning)
-        context.scene.witcher_cutscene_validation_report = "\n".join(lines or ["OK export-ready"])
+        _lines, errors, _warnings = cutscene_validate.store_report(context.scene, issues)
         if errors:
             if transaction is not None:
                 transaction.rollback()
@@ -8419,6 +8496,8 @@ classes = [
     WITCH_OT_PelvisBakePoseDelta,
     WITCH_OT_PelvisApplyNumericOffset,
     WITCH_OT_CutsceneNewShot,
+    WITCH_OT_CutsceneRemoveShot,
+    WITCH_OT_CutsceneJumpToShot,
     WITCH_OT_CutsceneUseSelectedCameraAsShot,
     WITCH_OT_CutsceneScratchImportCamera,
     WITCH_OT_CutsceneScratchAssignActor,

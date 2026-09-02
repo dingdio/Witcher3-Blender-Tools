@@ -222,6 +222,15 @@ def _active_project_path(context):
 
 
 def _resolve_start_frame(scene):
+    line = _active_editor_line(scene)
+    line_id = str(getattr(line, "line_id", "") or "").strip() if line is not None else ""
+    if line_id:
+        for dialog_line in getattr(scene, "witcher_cutscene_dialog_lines", []) or []:
+            if (
+                str(getattr(dialog_line, "tier", "SUBTITLE") or "SUBTITLE") == 'WAV'
+                and str(getattr(dialog_line, "lipsync_ref", "") or "").strip() == line_id
+            ):
+                return float(getattr(dialog_line, "start_frame", 0) or 0)
     return float(scene.frame_current if getattr(scene, "witcher_anim_nla_mode", "REPLACE") == "APPEND_AT_CURSOR" else 0.0)
 
 
@@ -435,6 +444,15 @@ def _project_line_audio_source(line):
     return ""
 
 
+def _cutscene_linked_line_ids(scene):
+    try:
+        from ..ui import ui_cutscene
+
+        return ui_cutscene._cutscene_dialog_lipsync_refs(scene)
+    except Exception:
+        return set()
+
+
 def _line_status_icon_tooltip(line):
     if line is None:
         return 'ADD', "New lipsync line"
@@ -592,6 +610,23 @@ def _refresh_line_display_name(line):
         pass
 
 
+def _sync_linked_cutscene_dialog(line, previous_line_id=""):
+    scene = getattr(line, "id_data", None) if line is not None else None
+    if scene is None or not hasattr(scene, "witcher_cutscene_dialog_lines"):
+        return 0
+    try:
+        from ..ui import ui_cutscene
+
+        return ui_cutscene.adopt_cutscene_dialog_lipsync_line(
+            scene,
+            line,
+            previous_line_id=previous_line_id,
+        )
+    except Exception:
+        log.exception("Could not sync linked cutscene dialogue line")
+        return 0
+
+
 def _line_id_exists(scene, line_id):
     line_id = str(line_id or "").strip()
     lines = _editor_lines(scene)
@@ -638,14 +673,17 @@ def _sync_scene_fields_from_line(scene, line):
 def _sync_line_from_scene(scene, line):
     if line is None:
         return
+    previous_line_id = str(getattr(line, "line_id", "") or "").strip()
     line.text = str(getattr(scene, "witcher_lipsync_text", "") or "")
     line.speaker = str(getattr(scene, "witcher_lipsync_speaker", "GRLT") or "GRLT")
     line.line_id = str(getattr(scene, "witcher_lipsync_line_id", "") or "")
     line.language = str(getattr(scene, "witcher_lipsync_language", "en") or "en")
     _refresh_line_display_name(line)
+    _sync_linked_cutscene_dialog(line, previous_line_id=previous_line_id)
 
 
 def _apply_project_voice_line(line, project_line):
+    previous_line_id = str(getattr(line, "line_id", "") or "").strip()
     assets = project_line.assets
     line.line_id = str(project_line.line_id or "")
     line.original_line_id = str(project_line.line_id or "")
@@ -673,6 +711,7 @@ def _apply_project_voice_line(line, project_line):
         line.last_re = str(assets.re_path)
     line.last_status = f"Project assets: {_line_asset_status(line)}"
     _refresh_line_display_name(line)
+    _sync_linked_cutscene_dialog(line, previous_line_id=previous_line_id)
 
 
 def _refresh_project_asset_status_for_line(line):
@@ -707,6 +746,7 @@ def _refresh_project_asset_status_for_line(line):
         line.last_re = str(assets.re_path)
     line.last_status = f"Project assets: {_line_asset_status(line)}"
     _refresh_line_display_name(line)
+    _sync_linked_cutscene_dialog(line)
     return True
 
 
@@ -904,6 +944,7 @@ def _upsert_editor_line(
             line.duration = _line_duration_from_wav(wav_path)
         _refresh_line_display_name(line)
         _set_active_editor_line(scene, line)
+        _sync_linked_cutscene_dialog(line)
     return line
 
 
@@ -922,6 +963,7 @@ def _update_editor_line_from_result(context, line, job, wav_path, soundstrip, au
     if line is None:
         return
     scene = context.scene
+    previous_line_id = str(getattr(line, "line_id", "") or "").strip()
     line.line_id = str(job.line_id or "")
     line.text = str(job.text or "")
     line.speaker = str(job.speaker or "")
@@ -944,6 +986,7 @@ def _update_editor_line_from_result(context, line, job, wav_path, soundstrip, au
     _refresh_project_asset_status_for_line(line)
     _refresh_line_display_name(line)
     _set_active_editor_line(scene, line)
+    _sync_linked_cutscene_dialog(line, previous_line_id=previous_line_id)
 
 
 class WitcherLipsyncLineItem(bpy.types.PropertyGroup):
@@ -1022,6 +1065,12 @@ class WITCHER_UL_lipsync_lines(bpy.types.UIList):
                     text="", icon=audio_icon, emboss=False,
                 )
                 op.tooltip = audio_tooltip
+            if str(getattr(item, "line_id", "") or "").strip() in _cutscene_linked_line_ids(context.scene):
+                op = row.operator(
+                    WITCH_OT_lipsync_line_status_hint.bl_idname,
+                    text="", icon='LINKED', emboss=False,
+                )
+                op.tooltip = "Linked to a cutscene dialogue line"
             row.label(text=_line_list_label(context.scene, item))
         else:
             layout.label(text=str(item.name or item.line_id or "Line"))
@@ -1057,6 +1106,12 @@ class WITCH_MT_lipsync_line_list_actions(bpy.types.Menu):
             WITCH_OT_add_lipsync_line_from_voice_browser.bl_idname,
             text="Add From Dialog Browser",
             icon='TEXT',
+        )
+        layout.separator()
+        layout.operator(
+            WITCH_OT_add_lipsync_lines_to_cutscene.bl_idname,
+            text="Add Selected To Cutscene",
+            icon='LINKED',
         )
         layout.separator()
         layout.operator(
@@ -1271,7 +1326,9 @@ def _remove_existing_lipsync_strips(strips, line_id, start_frame=None):
                 log.debug("Could not remove previous lipsync sound strip", exc_info=True)
 
 
-def _import_audio_strip(context, wav_path, start_frame, line_id, text, speaker, language, source):
+def _import_audio_strip(
+    context, wav_path, start_frame, line_id, text, speaker, language, source, replace_at_start=True,
+):
     from ..ui import ui_voice
 
     scene = context.scene
@@ -1287,7 +1344,7 @@ def _import_audio_strip(context, wav_path, start_frame, line_id, text, speaker, 
         for strip in [strip for strip in strips if strip.type == "SOUND"]:
             strips.remove(strip)
     else:
-        _remove_existing_lipsync_strips(strips, line_id, start_frame=start_frame)
+        _remove_existing_lipsync_strips(strips, line_id, start_frame=start_frame if replace_at_start else None)
 
     wav_path = Path(wav_path)
     channel = 1 if replace_audio else ui_voice._get_next_sound_channel(scene)
@@ -1589,6 +1646,7 @@ def _load_editor_line_re_result(context, line, re_file, operator=None):
     scene.witcher_lipsync_last_log = "\n".join(load_notes)
     if operator is not None:
         operator.report({"WARNING"} if load_notes else {"INFO"}, scene.witcher_lipsync_last_status)
+    _sync_linked_cutscene_dialog(line)
     return True
 
 
@@ -1651,6 +1709,7 @@ def _load_editor_line_result(context, line, operator=None):
     )
     scene.witcher_lipsync_last_output = str(lipsyncanim_file)
     scene.witcher_lipsync_last_log = ""
+    _sync_linked_cutscene_dialog(line)
     return True
 
 
@@ -2103,6 +2162,51 @@ class WITCH_OT_add_lipsync_line_from_voice_browser(bpy.types.Operator):
         return {"FINISHED"}
 
 
+def load_project_lines_into_editor(context, clear_existing=True, include_unvoiced=False):
+    """Load project lines and return (all lines, added count)."""
+    scene = context.scene
+    project_path = _active_project_path(context)
+    if not project_path:
+        raise RuntimeError("No REDkit project selected.")
+    project_lines = redkit_project.read_project_voice_lines(
+        project_path,
+        language=getattr(scene, "witcher_lipsync_language", "en"),
+        include_unvoiced=include_unvoiced,
+    )
+    lines = _editor_lines(scene)
+    if lines is None:
+        raise RuntimeError("Lipsync line list is unavailable.")
+    if clear_existing:
+        while len(lines):
+            lines.remove(0)
+    added = 0
+    for project_line in project_lines:
+        if not clear_existing and _line_id_exists(scene, project_line.line_id):
+            continue
+        _apply_project_voice_line(lines.add(), project_line)
+        added += 1
+    if len(lines):
+        _set_active_editor_line(scene, lines[0])
+    else:
+        scene.witcher_lipsync_line_index = -1
+    return project_lines, added
+
+
+class WITCH_OT_add_lipsync_lines_to_cutscene(bpy.types.Operator):
+    bl_idname = "witcher.add_lipsync_lines_to_cutscene"
+    bl_label = "Add To Cutscene"
+    bl_description = (
+        "Add the batch-selected lines (or the active line) to Cutscene › Dialogue back to back from the current frame; "
+        "they stay linked by line ID"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        from ..ui import ui_cutscene
+
+        return ui_cutscene.add_picked_lipsync_lines_to_cutscene(self, context)
+
+
 class WITCH_OT_load_redkit_project_lipsync_lines(bpy.types.Operator):
     """Load voiced lines from the active REDkit project strings CSV."""
 
@@ -2130,10 +2234,8 @@ class WITCH_OT_load_redkit_project_lipsync_lines(bpy.types.Operator):
             return {"CANCELLED"}
 
         try:
-            project_lines = redkit_project.read_project_voice_lines(
-                project_path,
-                language=getattr(scene, "witcher_lipsync_language", "en"),
-                include_unvoiced=self.include_unvoiced,
+            project_lines, _added = load_project_lines_into_editor(
+                context, clear_existing=self.clear_existing, include_unvoiced=self.include_unvoiced,
             )
         except Exception as exc:
             message = str(exc).strip() or exc.__class__.__name__
@@ -2142,23 +2244,6 @@ class WITCH_OT_load_redkit_project_lipsync_lines(bpy.types.Operator):
             self.report({"ERROR"}, message.splitlines()[0][:240])
             log.exception("Failed to load REDkit project lipsync lines")
             return {"CANCELLED"}
-
-        lines = _editor_lines(scene)
-        if lines is None:
-            self.report({"ERROR"}, "Lipsync line list is unavailable.")
-            return {"CANCELLED"}
-        if self.clear_existing:
-            while len(lines):
-                lines.remove(0)
-
-        for project_line in project_lines:
-            line = lines.add()
-            _apply_project_voice_line(line, project_line)
-
-        if len(lines):
-            _set_active_editor_line(scene, lines[0])
-        else:
-            scene.witcher_lipsync_line_index = -1
 
         wav_count = sum(1 for item in project_lines if item.assets.has_wav)
         wem_count = sum(1 for item in project_lines if item.assets.has_wem)
@@ -3422,6 +3507,11 @@ def draw_panel(layout, context):
             text="Add To Project", icon='FILE_TICK',
         )
 
+    if hasattr(scene, "witcher_cutscene_dialog_lines"):
+        cutscene_row = edit_box.row(align=True)
+        cutscene_row.enabled = active_line is not None
+        cutscene_row.operator(WITCH_OT_add_lipsync_lines_to_cutscene.bl_idname, text="Add To Cutscene", icon='LINKED')
+
     edit_box.separator()
     primary = edit_box.column(align=True)
     primary.scale_y = 1.35
@@ -3522,6 +3612,7 @@ classes = (
     WITCH_OT_import_wav_to_active_lipsync_line,
     WITCH_OT_load_selected_lipsync_voiceline,
     WITCH_OT_apply_lipsync_voiceline_to_selected,
+    WITCH_OT_add_lipsync_lines_to_cutscene,
     WITCH_MT_lipsync_line_list_actions,
     WITCH_OT_download_lipsync_whisper_model,
     WITCH_OT_lipsync_whisper_info,

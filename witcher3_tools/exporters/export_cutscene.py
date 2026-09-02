@@ -1,14 +1,19 @@
 import collections
+import json
 import logging
 import math
 import os
 import re
+import shutil
+from pathlib import Path
 import bpy
 from typing import Dict, List
 
+from .. import dialog_language
 from ..CR2W import anims_builder, cr2w_writer
 from ..animation.action_compat import resolve_action_slot
 from ..external_addon_tools import get_re_addon_status
+from ..lipsync import redkit_project
 from . import export_anims
 
 
@@ -23,6 +28,12 @@ CUTSCENE_ANIMATION_NAME_PROP = "witcher_cutscene_animation_name"
 CUTSCENE_BAKED_SOURCE_IDS_PROP = "cutscene_bake_source_clip_ids"
 CUTSCENE_BAKED_SOURCE_STARTS_PROP = "cutscene_bake_source_clip_starts"
 CUTSCENE_RE_EXPORT_SUFFIX = "_redkit"
+CUTSCENE_DIALOG_EVENT_TYPE = "CExtAnimCutsceneDialogEvent"
+CUTSCENE_ROOT_ANIMATION_NAME = "__cutsceneAnimation"
+CUTSCENE_DIALOG_ID_SPACE_DEFAULT = 9999
+_RADISH_STRING_ID_BASE = 2_110_000_000
+_RADISH_STRING_ID_SPACE_SIZE = 1_000
+_RADISH_STRING_ID_SPACE_MAX = 9_999
 _VALID_CUTSCENE_ACTOR_TYPES = ("CAT_None", "CAT_Actor", "CAT_Prop", "CAT_Camera")
 _INVALID_PATH_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _BLENDER_DUPLICATE_SUFFIX_RE = re.compile(r"\.\d{3}$")
@@ -94,6 +105,11 @@ def _collect_scene_cutscene_events(scene):
             root_events.append(payload)
         else:
             entry_events.append(payload)
+    _dialogue_lines, dialogue_events = _collect_authored_cutscene_dialogue(scene)
+    if dialogue_events:
+        root_events = [event for event in root_events if event["event_type"] != CUTSCENE_DIALOG_EVENT_TYPE]
+        entry_events = [event for event in entry_events if event["event_type"] != CUTSCENE_DIALOG_EVENT_TYPE]
+        root_events.extend(dialogue_events)
     return root_events, entry_events
 
 
@@ -470,6 +486,337 @@ def _scene_fps(scene=None) -> float:
     return fps if fps > 0.0 else export_anims.CUTSCENE_DEFAULT_FPS
 
 
+def _cutscene_dialog_id_space_bounds(id_space):
+    try:
+        id_space = int(id_space)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Dialogue ID space must be a number from 0 to 9999.") from exc
+    if not 0 <= id_space <= _RADISH_STRING_ID_SPACE_MAX:
+        raise ValueError("Dialogue ID space must be from 0 to 9999 (-1 disables fallback allocation).")
+    first_id = _RADISH_STRING_ID_BASE + id_space * _RADISH_STRING_ID_SPACE_SIZE
+    return id_space, first_id, first_id + _RADISH_STRING_ID_SPACE_SIZE - 1
+
+
+def _companion_scene_resource(scene):
+    path = _companion_scene_depot_path(scene)
+    return f'CStoryScene "{path}"' if path else ""
+
+
+def authored_dialog_line_id_status(context, line_index):
+    """Return the allocated ID's status and explanation."""
+    scene = context.scene
+    lines = scene.witcher_cutscene_dialog_lines
+    raw_id = str(getattr(lines[line_index], "allocated_line_id", "") or "").strip()
+    id_space_prop = getattr(scene, "witcher_cutscene_dialog_id_space", -1)
+    project_path = redkit_project.get_active_project_path(context)
+    info = redkit_project.next_project_line_id(project_path) if project_path else None
+    if not raw_id:
+        if info is not None:
+            return 'INFO', f"allocated on export (next {info.next_line_id})"
+        try:
+            return 'INFO', f"allocated on export (from {_cutscene_dialog_id_space_bounds(id_space_prop)[1]})"
+        except ValueError:
+            return 'INFO', "no REDkit project or fallback ID space"
+    if not raw_id.isdecimal():
+        return 'ERROR', "must be numeric"
+    value = int(raw_id)
+    for other_index, other in enumerate(lines):
+        if (
+            other_index != line_index
+            and str(getattr(other, "tier", "SUBTITLE") or "SUBTITLE") != "GAME"
+            and str(getattr(other, "allocated_line_id", "") or "").strip() == raw_id
+        ):
+            return 'ERROR', f"also used by line {other_index + 1}"
+    if project_path:
+        name = project_path.name
+        if info is None:
+            return 'ERROR', f"{name} has no idSpace in its .w3edit"
+        if not info.id_space <= value <= redkit_project.MAX_RADISH_LINE_ID:
+            return 'ERROR', f"outside {name} idSpace (from {info.id_space})"
+        owner = redkit_project.read_project_string_owners(project_path).get(value)
+        if owner is None:
+            return 'OK', f"free in {name}"
+        if owner and owner.casefold() != _companion_scene_resource(scene).casefold():
+            if str(getattr(lines[line_index], "lipsync_ref", "") or "").strip() == raw_id:
+                return 'OK', f"references {owner}"
+            return 'ERROR', f"taken by {owner}"
+        return 'OK', f"already in {name}"
+    try:
+        id_space, first_id, last_id = _cutscene_dialog_id_space_bounds(id_space_prop)
+    except ValueError:
+        return 'INFO', "no REDkit project or fallback ID space to check"
+    if first_id <= value <= last_id:
+        return 'OK', f"in fallback space {id_space}"
+    return 'ERROR', f"outside fallback space {id_space} ({first_id}-{last_id})"
+
+
+def _write_cutscene_dialog_strings_csv(csv_path, language, rows):
+    csv_path = Path(csv_path)
+    output = [
+        f";meta[language={str(language or 'en').strip().lower() or 'en'}]",
+        "; id      |key(hex)|key(str)| text",
+        ";",
+    ]
+    for line_id, text in rows:
+        text = str(text or "")
+        if not text.strip():
+            raise ValueError(f"Dialogue string {line_id} has no text.")
+        if any(char in text for char in ("|", "\r", "\n")):
+            raise ValueError(f"Dialogue string {line_id} contains '|' or a line break, which Radish CSV cannot encode.")
+        output.append(f"{int(line_id)}|||{text}")
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = csv_path.with_name(csv_path.name + ".tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("\n".join(output) + "\n")
+        os.replace(tmp_path, csv_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    return csv_path
+
+
+def prepare_authored_cutscene_dialogue_strings(context, wrapper_path, scene_repo=""):
+    scene = context.scene
+    line_indices = [
+        index
+        for index, line in enumerate(getattr(scene, "witcher_cutscene_dialog_lines", []) or [])
+        if str(getattr(line, "tier", "SUBTITLE") or "SUBTITLE") != "GAME"
+    ]
+    if not line_indices:
+        return {"mode": "none", "path": "", "line_count": 0, "allocated_count": 0}
+
+    language = dialog_language.get_active_text_language(context)
+    project_path = redkit_project.get_active_project_path(context)
+    assigned_ids = {}
+    for line_index in line_indices:
+        line = scene.witcher_cutscene_dialog_lines[line_index]
+        if not str(getattr(line, "speaker", "") or "").strip():
+            raise ValueError(f"Dialogue line {line_index + 1} has no speaker.")
+        if not str(getattr(line, "text", "") or "").strip():
+            raise ValueError(f"Dialogue line {line_index + 1} has no text.")
+        raw_id = str(getattr(line, "allocated_line_id", "") or "").strip()
+        if raw_id and not raw_id.isdigit():
+            raise ValueError(f"Dialogue line {line_index + 1} has a non-numeric allocated ID: {raw_id}")
+        if raw_id and int(raw_id) in assigned_ids:
+            raise ValueError(
+                f"Dialogue lines {assigned_ids[int(raw_id)] + 1} and {line_index + 1} share allocated ID {raw_id}."
+            )
+        if raw_id:
+            assigned_ids[int(raw_id)] = line_index
+    allocated_count = 0
+    if project_path:
+        project_path = Path(project_path)
+        resource_path = str(scene_repo or "").replace("/", "\\")
+        resource = f'CStoryScene "{resource_path}"'
+        csv_path = project_path / redkit_project.PROJECT_STRINGS_CSV
+        validation = redkit_project.validate_project_voice_lines(project_path)
+        if validation.duplicate_ids or validation.duplicate_voiceovers or validation.invalid_ids:
+            raise ValueError(f"REDkit project string CSV is invalid: {validation.compact_message()}")
+
+        project_lines = {
+            str(item.line_id or "").strip(): item
+            for item in redkit_project.read_project_voice_lines(
+                project_path, language=language, include_unvoiced=True,
+            )
+        }
+        planned_ids = {}
+        reserved_ids = set(assigned_ids)
+        missing_indices = [
+            index for index in line_indices
+            if not str(getattr(scene.witcher_cutscene_dialog_lines[index], "allocated_line_id", "") or "").strip()
+        ]
+        next_id = None
+        if missing_indices:
+            id_info = redkit_project.next_project_line_id(project_path)
+            if id_info is None:
+                raise ValueError(f"REDkit project has no usable idSpace metadata: {project_path}")
+            next_id = int(id_info.next_line_id)
+        for line_index in line_indices:
+            raw_id = str(
+                getattr(scene.witcher_cutscene_dialog_lines[line_index], "allocated_line_id", "") or ""
+            ).strip()
+            if raw_id:
+                planned_ids[line_index] = raw_id
+                continue
+            while next_id in reserved_ids or str(next_id) in project_lines:
+                next_id += 1
+            if next_id > redkit_project.MAX_RADISH_LINE_ID:
+                raise ValueError(f"REDkit project dialogue ID space is full: {project_path}")
+            planned_ids[line_index] = str(next_id)
+            reserved_ids.add(next_id)
+            next_id += 1
+
+        planned_rows = []
+        for line_index in line_indices:
+            line = scene.witcher_cutscene_dialog_lines[line_index]
+            line_id = planned_ids[line_index]
+            text = str(getattr(line, "text", "") or "")
+            speaker = str(getattr(line, "speaker", "") or "").strip()
+            existing = project_lines.get(line_id)
+            if existing is not None and existing.resource and existing.resource.lower() != resource.lower():
+                if str(getattr(line, "lipsync_ref", "") or "").strip() != line_id:
+                    raise ValueError(
+                        f"Dialogue ID {line_id} already belongs to {existing.resource}; clear the allocated ID to allocate a new one."
+                    )
+                # Referenced lines stay owned by their source scene.
+                text, speaker = existing.text, existing.speaker
+            planned_rows.append((line_index, line_id, text, speaker, existing))
+
+        original_ids = {
+            line_index: str(
+                getattr(scene.witcher_cutscene_dialog_lines[line_index], "allocated_line_id", "") or ""
+            )
+            for line_index in line_indices
+        }
+        needs_write = any(
+            existing is None or existing.text != text or existing.speaker.upper() != speaker.upper()
+            for _line_index, _line_id, text, speaker, existing in planned_rows
+        )
+        backup_path = None
+        backup_dir = None
+        if needs_write:
+            backup_dir = redkit_project._make_backup_dir(project_path)
+            backup_path = redkit_project._backup_file(project_path, backup_dir, csv_path)
+        try:
+            for line_index, line_id, text, speaker, existing in planned_rows:
+                if not original_ids[line_index]:
+                    scene.witcher_cutscene_dialog_lines[line_index].allocated_line_id = line_id
+                    allocated_count += 1
+                if existing is None:
+                    redkit_project.add_project_line(
+                        project_path,
+                        line_id,
+                        text,
+                        speaker,
+                        language=language,
+                        resource=resource,
+                        property_name="Line text",
+                        key=line_id,
+                    )
+                elif existing.text != text or existing.speaker.upper() != speaker.upper():
+                    redkit_project.update_project_line_csv(
+                        project_path,
+                        line_id,
+                        line_id,
+                        text=text,
+                        speaker=speaker,
+                        language=language,
+                        backup_dir=backup_dir,
+                    )
+        except Exception:
+            for line_index, original_id in original_ids.items():
+                scene.witcher_cutscene_dialog_lines[line_index].allocated_line_id = original_id
+            if backup_path is not None and Path(backup_path).is_file():
+                try:
+                    shutil.copy2(backup_path, csv_path)
+                except Exception:
+                    log.exception("Could not restore REDkit strings CSV from %s", backup_path)
+            raise
+
+        return {
+            "mode": "redkit",
+            "path": str(csv_path),
+            "line_count": len(line_indices),
+            "allocated_count": allocated_count,
+        }
+
+    id_space, first_id, last_id = _cutscene_dialog_id_space_bounds(
+        getattr(scene, "witcher_cutscene_dialog_id_space", 0)
+    )
+    for line_index in line_indices:
+        text = str(getattr(scene.witcher_cutscene_dialog_lines[line_index], "text", "") or "")
+        if any(char in text for char in ("|", "\r", "\n")):
+            raise ValueError(
+                f"Dialogue string on line {line_index + 1} contains '|' or a line break, which Radish CSV cannot encode."
+            )
+    used_ids = {}
+    missing_indices = []
+    for line_index in line_indices:
+        line = scene.witcher_cutscene_dialog_lines[line_index]
+        raw_id = str(getattr(line, "allocated_line_id", "") or "").strip()
+        if not raw_id:
+            missing_indices.append(line_index)
+            continue
+        if not raw_id.isdigit() or not first_id <= int(raw_id) <= last_id:
+            raise ValueError(
+                f"Dialogue line {line_index + 1} allocated ID must be in {first_id}-{last_id} for id-space {id_space}."
+            )
+        if int(raw_id) in used_ids:
+            raise ValueError(
+                f"Dialogue lines {used_ids[int(raw_id)] + 1} and {line_index + 1} share allocated ID {raw_id}."
+            )
+        used_ids[int(raw_id)] = line_index
+
+    candidate = first_id
+    for line_index in missing_indices:
+        while candidate in used_ids and candidate <= last_id:
+            candidate += 1
+        if candidate > last_id:
+            raise ValueError(f"Dialogue id-space {id_space} is full ({first_id}-{last_id}).")
+        scene.witcher_cutscene_dialog_lines[line_index].allocated_line_id = str(candidate)
+        used_ids[candidate] = line_index
+        allocated_count += 1
+        candidate += 1
+
+    rows = []
+    for line_index in line_indices:
+        line = scene.witcher_cutscene_dialog_lines[line_index]
+        rows.append((int(line.allocated_line_id), str(getattr(line, "text", "") or "")))
+    csv_path = Path(wrapper_path).with_suffix(".strings.csv")
+    _write_cutscene_dialog_strings_csv(csv_path, language, rows)
+    return {
+        "mode": "csv",
+        "path": str(csv_path),
+        "line_count": len(line_indices),
+        "allocated_count": allocated_count,
+        "id_space": id_space,
+    }
+
+
+def _collect_authored_cutscene_dialogue(scene):
+    fps = _scene_fps(scene)
+    wrapper_lines = []
+    root_events = []
+    for line_index, line in enumerate(getattr(scene, "witcher_cutscene_dialog_lines", []) or [], 1):
+        label = f"Dialogue line {line_index}"
+        if not str(getattr(line, "speaker", "") or "").strip():
+            raise ValueError(f"{label} has no speaker.")
+        if not str(getattr(line, "text", "") or "").strip():
+            raise ValueError(f"{label} has no text.")
+        tier = str(getattr(line, "tier", "SUBTITLE") or "SUBTITLE")
+        raw_id = getattr(line, "game_line_id", "") if tier == "GAME" else getattr(line, "allocated_line_id", "")
+        try:
+            string_id = int(str(raw_id or "").strip() or 0)
+        except (TypeError, ValueError):
+            string_id = 0
+        if not 0 <= string_id <= 0xFFFFFFFF:
+            string_id = 0
+        if tier == "GAME" and string_id <= 0:
+            raise ValueError(f"{label} has no valid numeric Game Line ID.")
+        start_frame = int(getattr(line, "start_frame", 0) or 0)
+        end_frame = int(getattr(line, "end_frame", 0) or 0)
+        if end_frame <= start_frame:
+            raise ValueError(f"{label} must end after it starts.")
+        wrapper_lines.append({
+            "voicetag": str(getattr(line, "speaker", "") or "").strip(),
+            "string_id": string_id,
+            "approved_duration": (end_frame - start_frame) / fps,
+            "voice_file_name": (
+                str(getattr(line, "game_voice_file_name", "") or "").strip()
+                if tier == "GAME" else ""
+            ),
+        })
+        root_events.append({
+            "event_type": CUTSCENE_DIALOG_EVENT_TYPE,
+            "start_time": start_frame / fps,
+            "animation_name": CUTSCENE_ROOT_ANIMATION_NAME,
+            "event_scope": "ROOT",
+            "source_index": -1,
+        })
+    return wrapper_lines, root_events
+
+
 def _collect_cutscene_scene_actors(scene=None):
     actors = []
     for actor_obj in _collect_cutscene_actor_roots(scene):
@@ -542,48 +889,74 @@ def _entry_scene_frame_range(entry):
     return start, end
 
 
-def _collect_camera_cut_segments(export_entries, actors):
-    actor_types_by_name = _cutscene_actor_type_map(actors)
-    raw_segments = []
-    seen = set()
-    for entry in export_entries:
+def _shot_cut_ranges(scene, export_entries, actor_types_by_name):
+    from ..animation import cutscene_bake
+
+    shots = cutscene_bake.iter_shot_markers(scene) if scene is not None else []
+    if not shots:
+        return []
+    camera_ends = [
+        _entry_scene_frame_range(entry)[1]
+        for entry in export_entries
+        if _is_cutscene_camera_entry(entry, actor_types_by_name=actor_types_by_name)
+    ]
+    last_end = max([float(getattr(scene, "frame_end", 0) or 0), *camera_ends])
+    # Adjacent engine parts share the boundary frame.
+    return [
+        (float(frame), float(shots[index + 1][2]) if index + 1 < len(shots) else last_end)
+        for index, (_shot_index, _camera, frame) in enumerate(shots)
+    ]
+
+
+def _camera_prebake_cut_ranges(scene, actor_types_by_name):
+    from ..animation import cutscene_bake
+
+    ranges = []
+    for armature_obj in _iter_scene_armatures(scene):
+        entry = {"actor_name": armature_obj.get("cutscene_actor_name", ""), "armature_obj": armature_obj}
         if not _is_cutscene_camera_entry(entry, actor_types_by_name=actor_types_by_name):
             continue
-        scene_start, scene_end = _entry_scene_frame_range(entry)
-        if scene_end <= scene_start:
-            continue
-        key = (int(round(scene_start)), int(round(scene_end)))
-        if key in seen:
-            continue
-        seen.add(key)
-        raw_segments.append({
-            "scene_start": scene_start,
-            "scene_end": scene_end,
-            "sort_name": export_anims._strip_text(entry.get("strip_name", "")),
-        })
+        state = json.loads(armature_obj.get(cutscene_bake.PREBAKE_STATE_PROP) or "{}")
+        unmuted = set(state.get("unmuted_tracks") or [])
+        for track in getattr(getattr(armature_obj, "animation_data", None), "nla_tracks", []) or []:
+            if track.name in unmuted and _is_cutscene_track_name(track.name):
+                ranges.extend((float(strip.frame_start), float(strip.frame_end)) for strip in track.strips if not strip.mute)
+    return ranges
 
-    raw_segments.sort(key=lambda segment: (
-        float(segment["scene_start"]),
-        float(segment["scene_end"]),
-        segment["sort_name"],
-    ))
+
+def _cut_ranges_to_segments(ranges):
+    raw_segments = sorted({(int(round(start)), int(round(end))) for start, end in ranges if end > start})
     if not raw_segments:
         return []
+    base_start = raw_segments[0][0]
+    return [
+        {
+            "scene_start": float(start),
+            "scene_end": float(end),
+            "part_start_frame": start - base_start,
+            "part_num_frames": end - start + 1,
+        }
+        for start, end in raw_segments
+    ]
 
-    base_start = float(raw_segments[0]["scene_start"])
-    segments = []
-    for segment in raw_segments:
-        scene_start = float(segment["scene_start"])
-        scene_end = float(segment["scene_end"])
-        part_start_frame = max(0, int(round(scene_start - base_start)))
-        part_num_frames = max(1, int(round(scene_end - scene_start)) + 1)
-        segments.append({
-            "scene_start": scene_start,
-            "scene_end": scene_end,
-            "part_start_frame": part_start_frame,
-            "part_num_frames": part_num_frames,
-        })
-    return segments
+
+def _collect_camera_cut_segments(export_entries, actors, scene=None):
+    actor_types_by_name = _cutscene_actor_type_map(actors)
+    scene = scene or getattr(bpy.context, "scene", None)
+    camera_ranges = [
+        _entry_scene_frame_range(entry)
+        for entry in export_entries
+        if _is_cutscene_camera_entry(entry, actor_types_by_name=actor_types_by_name)
+    ]
+    for source, ranges in (
+        ("shots", _shot_cut_ranges(scene, export_entries, actor_types_by_name)),
+        ("pre-bake camera strips", _camera_prebake_cut_ranges(scene, actor_types_by_name)),
+        ("camera strips", camera_ranges),
+    ):
+        segments = _cut_ranges_to_segments(ranges)
+        if segments:
+            return source, segments
+    return "", []
 
 
 def _collect_cutscene_nla_entries(context):
@@ -1296,19 +1669,30 @@ def export_w3_cutscene(context, savePath, export_redkit_re_files=False, export_r
 
     root_events, entry_events = _collect_scene_cutscene_events(scene)
     template_metadata = _collect_cutscene_template_metadata(scene, export_entries, source_cache)
-    if not template_metadata.get("usedInFiles"):
-        companion_scene = _companion_scene_depot_path(scene)
-        if companion_scene:
-            template_metadata["usedInFiles"] = [companion_scene]
-            log.info("usedInFiles defaulted to companion scene '%s'", companion_scene)
+    companion_scene = _companion_scene_depot_path(scene)
+    used_in_files = list(template_metadata.get("usedInFiles") or [])
+    if companion_scene and bool(getattr(scene, "witcher_cutscene_dialog_lines", None)):
+        companion_key = companion_scene.replace("/", "\\").lower()
+        template_metadata["usedInFiles"] = [
+            companion_scene,
+            *[
+                path for path in used_in_files
+                if export_anims._strip_text(path).replace("/", "\\").lower() != companion_key
+            ],
+        ]
+        log.info("usedInFiles prioritized authored companion scene '%s'", companion_scene)
+    elif companion_scene and not used_in_files:
+        template_metadata["usedInFiles"] = [companion_scene]
+        log.info("usedInFiles defaulted to companion scene '%s'", companion_scene)
     if root_events:
         template_metadata["animevents"] = root_events
-    camera_segments = _collect_camera_cut_segments(export_entries, actors)
+    cut_source, camera_segments = _collect_camera_cut_segments(export_entries, actors, scene=scene)
     if camera_segments:
         animation_groups = _group_cutscene_entries_to_camera_segments(export_entries, camera_segments)
         log.info(
-            "Conforming cutscene export to %d camera cut segment(s)",
+            "Conforming cutscene export to %d cut segment(s) from %s",
             len(camera_segments),
+            cut_source,
         )
     else:
         animation_groups = _sync_multipart_group_timings(_group_cutscene_entries(export_entries))

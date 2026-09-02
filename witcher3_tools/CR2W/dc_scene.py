@@ -21,6 +21,17 @@ def _localized_string_id_and_text(prop, scene_filepath=""):
         text = str(getattr(string_obj, 'text', "") or "").strip()
     except Exception:
         log.debug("Could not resolve localized dialog string %s", line_id, exc_info=True)
+    if not text and line_id and scene_filepath:
+        csv_path = os.path.splitext(str(scene_filepath))[0] + ".strings.csv"
+        try:
+            with open(csv_path, "r", encoding="utf-8-sig", errors="replace") as handle:
+                for raw_line in handle:
+                    key, separator, value = raw_line.rstrip("\r\n").partition("|||")
+                    if separator and key.strip() == line_id:
+                        text = value
+                        break
+        except OSError:
+            pass
     if not text:
         text = resolve_localized_text(line_id, scene_filepath)
     return line_id, text
@@ -48,6 +59,30 @@ def create_scene(file):
 def load_bin_scene(fileName):
     theFile = getCR2W(open_cr2w_read_stream(fileName))
     return create_scene(theFile)
+
+
+def _section_variant_durations(section, chunks):
+    durations = {}
+    variants = section.GetVariableByName('variants')
+    for ptr_val in getattr(variants, 'value', None) or []:
+        if not ptr_val or ptr_val <= 0 or ptr_val > len(chunks):
+            continue
+        element_info = chunks[ptr_val - 1].GetVariableByName('elementInfo')
+        for info in getattr(element_info, 'More', None) or getattr(element_info, 'elements', None) or []:
+            member = getattr(info, 'GetVariableByName', None)
+            if member is None:
+                member = lambda name, info=info: next(
+                    (prop for prop in getattr(info, 'More', None) or [] if prop.theName == name), None
+                )
+            element_id = _prop_to_str(member('elementId'))
+            duration = member('approvedDuration')
+            if element_id and duration is not None:
+                durations[element_id] = float(getattr(duration, 'Value', 0.0) or 0.0)
+        if durations:
+            break
+    return durations
+
+
 def get_cutscene_dialog_lines(scene_filepath, cutscene_path):
     """Load dialog lines from a .w2scene that belong to the given .w2cutscene.
 
@@ -95,6 +130,7 @@ def get_cutscene_dialog_lines(scene_filepath, cutscene_path):
         if elements_prop is None:
             continue
         ptr_list = getattr(elements_prop, 'value', None) or []
+        durations = _section_variant_durations(chunk, CHUNKS)
 
         for ptr_val in ptr_list:
             if not ptr_val or ptr_val <= 0 or ptr_val > len(CHUNKS):
@@ -121,6 +157,9 @@ def get_cutscene_dialog_lines(scene_filepath, cutscene_path):
                 "line_id":     line_id,
                 "line_index":  line_idx,
                 "line_text":   line_text,
+                "approved_duration": durations.get(
+                    _prop_to_str(el_chunk.GetVariableByName('elementID')), 0.0
+                ),
                 "source_game": "W3",
             })
 

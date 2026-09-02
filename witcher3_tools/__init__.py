@@ -272,6 +272,10 @@ def get_wwise_console_path(context) -> str:
     addon_prefs = _get_prefs(context)
     return getattr(addon_prefs, "wwise_console_path", "")
 
+def get_tts_command(context) -> str:
+    addon_prefs = _get_prefs(context)
+    return getattr(addon_prefs, "tts_command", "")
+
 def get_fbx_uncook_path(context) -> str:
     addon_prefs = _get_prefs(context)
     fbx_uncook_path = addon_prefs.fbx_uncook_path
@@ -1605,6 +1609,11 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         default="",
         description="Optional path to WwiseConsole.exe or its bin folder. WEM generation requires Wwise 2021.1.x; v2021.1.14 is recommended by Radish."
     )
+    tts_command: StringProperty(
+        name="TTS Command",
+        default="",
+        description="Optional external command template; include {text} and {out}. The addon supplies no TTS engine or voice."
+    )
     mod_directory: StringProperty(
         name="Wolvenkit Project Path",
         subtype='DIR_PATH',
@@ -2217,6 +2226,8 @@ class Witcher3AddonPrefs(bpy.types.AddonPreferences):
         help_op.path = getattr(self, "wwise_console_path", "")
         help_op.is_file = True
         help_op.title_text = "Wwise Console"
+
+        tools_col.prop(self, "tts_command")
 
         lipsync_box = _tools_box.box()
         lipsync_box.label(text="REDkit Lipsync", icon='SOUND')

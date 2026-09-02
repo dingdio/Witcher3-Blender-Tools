@@ -517,12 +517,12 @@ try:
         float(strip.frame_end)
         for obj in bpy.data.objects
         for track in (getattr(getattr(obj, "animation_data", None), "nla_tracks", ()) or ())
-        if track.name == first_track.name or track.name.startswith(f"{first_track.name}_edits")
+        if track.name in (first_track.name, f"{first_track.name}_2")
         for strip in track.strips
     )
     edit_end = existing_end + 137.0
     edits = target.animation_data.nla_tracks.new()
-    edits.name = f"{first_track.name}_edits"
+    edits.name = f"{first_track.name}_2"
     edit_strip = edits.strips.new("after_last_extent_probe", int(edit_end - 10.0), first_strip.action)
     edit_strip.frame_start = edit_end - 10.0
     edit_strip.frame_end = edit_end

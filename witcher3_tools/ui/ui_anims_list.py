@@ -585,9 +585,10 @@ def is_face_animation(anim_name, fdir=""):
     if anim_text.endswith("_face") or "_face:" in anim_text:
         return True
     path_text = str(fdir or "").strip().replace("/", "\\").lower()
-    if "_mimic_" in path_text or "\\mimics\\" in path_text:
+    file_name = path_text.rsplit("\\", 1)[-1]
+    if "_mimic_" in file_name or "\\mimics\\" in path_text:
         return True
-    if "lipsync" in anim_text or "lipsync" in path_text:
+    if "lipsync" in anim_text or "lipsync" in file_name:
         return True
     return False
 

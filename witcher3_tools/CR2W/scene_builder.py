@@ -1,6 +1,6 @@
 import zlib
 
-from .CR2W_types import CR2W, PROPERTY
+from .CR2W_types import CR2W, LocalizedString, PROPERTY
 from .anims_builder import (
     DEFAULT_BUILD_VERSION,
     DEFAULT_HEADER_VERSION,
@@ -34,6 +34,23 @@ def _uint32(name, value):
 
 def _bool(name, value):
     return PROPERTY(Value=bool(value), theName=name, theType="Bool")
+
+
+def _localized_string(name, value):
+    string = LocalizedString()
+    string.val = int(value)
+    return PROPERTY(String=string, theName=name, theType="LocalizedString")
+
+
+def _element_info(element_id, duration):
+    return PROPERTY(
+        theName="CStorySceneSectionVariantElementInfo",
+        theType="CStorySceneSectionVariantElementInfo",
+        More=[
+            _make_string_prop("elementId", element_id),
+            PROPERTY(Value=float(duration), theName="approvedDuration", theType="Float"),
+        ],
+    )
 
 
 def _vector_prop(name, x, y):
@@ -90,8 +107,10 @@ def build_cutscene_wrapper_scene(
     locale_id: int = 2,
     header_version: int = DEFAULT_HEADER_VERSION,
     build_version: int = DEFAULT_BUILD_VERSION,
+    lines=None,
 ) -> CR2W:
     cutscene_depot_path = str(cutscene_depot_path or "").strip().replace("/", "\\")
+    lines = list(lines or [])
     if not section_name:
         section_name = cutscene_depot_path.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[0]
     if not scene_id:
@@ -106,12 +125,14 @@ def build_cutscene_wrapper_scene(
     (GRAPH, CS_BLOCK, CS_IN, CONN_A, IN_BLOCK, IN_OUT, CONN_B, CS_OUT, CONN_C,
      OUT_BLOCK, OUT_IN, CONN_D, SEC_BLOCK, SEC_IN, SEC_OUT) = range(8, 23)
     element_id = "CutscenePlayer_2"
+    line_indices = list(range(23, 23 + len(lines)))
+    line_element_ids = [f"Line_{index}" for index in range(3, 3 + len(lines))]
 
     _add_chunk(cr2w, "CStoryScene", [
         _ptr_array_prop(cr2w, "controlParts", [INPUT, SECTION, OUTPUT, CS], "ptr:CStorySceneControlPart"),
         _ptr_array_prop(cr2w, "sections", [SECTION, CS], "ptr:CStorySceneSection"),
         _ptr_prop(cr2w, "graph", GRAPH, "ptr:CStorySceneGraph"),
-        _uint32("elementIDCounter", 2),
+        _uint32("elementIDCounter", 2 + len(lines)),
         _uint32("sectionIDCounter", 2),
         _uint32("sceneId", scene_id),
     ])
@@ -131,7 +152,7 @@ def build_cutscene_wrapper_scene(
         _uint32("nextVariantId", 1),
         _uint32("defaultVariantId", 0),
         _ptr_array_prop(cr2w, "variants", [VARIANT], "ptr:CStorySceneSectionVariant"),
-        _ptr_array_prop(cr2w, "sceneElements", [PLAYER], "ptr:CStorySceneElement"),
+        _ptr_array_prop(cr2w, "sceneElements", [PLAYER, *line_indices], "ptr:CStorySceneElement"),
         _uint32("sectionId", 2),
         _make_string_prop("sectionName", section_name),
         _bool("streamingLock", True),
@@ -162,14 +183,13 @@ def build_cutscene_wrapper_scene(
         _uint32("localeId", locale_id),
         PROPERTY(
             theName="elementInfo", theType="array:2,0,CStorySceneSectionVariantElementInfo",
-            elements=[PROPERTY(
-                theName="CStorySceneSectionVariantElementInfo",
-                theType="CStorySceneSectionVariantElementInfo",
-                More=[
-                    _make_string_prop("elementId", element_id),
-                    PROPERTY(Value=float(duration), theName="approvedDuration", theType="Float"),
+            elements=[
+                _element_info(element_id, duration),
+                *[
+                    _element_info(line_element_id, line["approved_duration"])
+                    for line_element_id, line in zip(line_element_ids, lines)
                 ],
-            )],
+            ],
         ),
     ])
 
@@ -231,6 +251,21 @@ def build_cutscene_wrapper_scene(
     _add_chunk(cr2w, "CStorySceneGraphSocket",
                _graph_socket_props(cr2w, SEC_BLOCK, "Out", SECTION, True, []))
 
+    for line_element_id, line in zip(line_element_ids, lines):
+        line_props = [
+            _make_string_prop("elementID", line_element_id),
+            _make_cname_prop("voicetag", line.get("voicetag", "")),
+            _make_cname_prop("speakingTo", line.get("speaking_to", "")),
+            _localized_string("dialogLine", line["string_id"]),
+        ]
+        if line.get("voice_file_name"):
+            line_props.append(_make_string_prop("voiceFileName", line["voice_file_name"]))
+        if line.get("sound_event"):
+            line_props.append(_make_string_prop("soundEventName", line["sound_event"], "StringAnsi"))
+        # Cutscene sections require every contained line to be background VO.
+        line_props.append(_bool("isBackgroundLine", True))
+        _add_chunk(cr2w, "CStorySceneLine", line_props)
+
     # Parent IDs are 1-based; source-depot scenes use objectFlags 0.
     layout = [
         (0, 0),             # CStoryScene
@@ -256,6 +291,7 @@ def build_cutscene_wrapper_scene(
         (GRAPH + 1, 0),     # SectionBlock
         (0, 0),             # socket section in
         (0, 0),             # socket section out
+        *[(CS + 1, 0) for _line in lines],
     ]
     for idx, (parent, flags) in enumerate(layout):
         cr2w.CR2WExport[idx].parentID = parent

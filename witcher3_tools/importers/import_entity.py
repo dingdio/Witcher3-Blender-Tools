@@ -2411,7 +2411,7 @@ def _materialize_entity_asset(filename, load_face_poses = False, import_apperanc
 def import_entity_file(filename, load_face_poses=False, import_apperance=0,
                        parent_transform=None, selected_appearance_name="",
                        mesh_import_settings=None, entity_namespace="",
-                       load_appearance_equipment=False):
+                       load_appearance_equipment=True):
     from . import import_blender_fun
 
     entity = test_load_entity(filename, load_dlc_appearances=True)

@@ -339,7 +339,7 @@ try:
     assert len(bpy.data.actions) == n_actions, (n_actions, len(bpy.data.actions))
     for arm, _action in baked:
         names = [t.name for t in arm.animation_data.nla_tracks]
-        assert names.count("cutscene_anim") == 1 and not any(".00" in n for n in names), names
+        assert names.count(cutscene_bake.BAKE_TRACK_NAME) == 1 and not any(".00" in n for n in names), names
         assert sum(1 for t in arm.animation_data.nla_tracks if not t.mute) == 1, names
         baked_ids = list(_action.get(cutscene_bake.BAKED_SOURCE_CLIP_IDS_PROP, []) or [])
         assert baked_ids == source_ids_before.get(arm.name, []), (arm.name, baked_ids)

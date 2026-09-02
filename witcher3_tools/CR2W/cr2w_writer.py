@@ -617,6 +617,10 @@ def _encode_property_value(prop, name_to_index, import_index):
             value = value.String
         return _encode_cstring(value or "")
 
+    if p_type == "LocalizedString":
+        value = getattr(getattr(prop, "String", None), "val", getattr(prop, "Value", 0))
+        return struct.pack("<I", int(value or 0))
+
     if p_type == "CName":
         cname = _get_cname_value(prop)
         return struct.pack("<H", name_to_index.get(cname, 0))

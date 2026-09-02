@@ -45,6 +45,7 @@ _VOICE_BROWSER_INDEX_LANGUAGE = "en"
 _voice_cache_identity_loaded = None
 _voice_cache_source_revision = 0
 _voice_cache_source_revision_loaded = None
+_voice_game_override = None
 
 
 def _voice_browser_index_language():
@@ -52,6 +53,8 @@ def _voice_browser_index_language():
 
 
 def get_active_voice_game(context=None):
+    if _voice_game_override in {VOICE_GAME_W2, VOICE_GAME_W3}:
+        return _voice_game_override
     scene = getattr(context, "scene", None) if context is not None else None
     if scene is None and hasattr(context, "witcher_voice_game"):
         scene = context
@@ -627,6 +630,33 @@ def _remove_lipsync_tracks(meshes, armature=None, track_name="voice_import"):
         old_actions = _remove_nla_tracks(armature.animation_data, track_name)
         _remove_orphan_actions(old_actions)
 
+
+def remove_voice_lipsync_tracks(scene, track_name):
+    """Remove raw and phoneme preview tracks by name."""
+    track_names = (str(track_name or "").strip(), f"{str(track_name or '').strip()}_phoneme")
+    if not track_names[0]:
+        return 0
+    animation_data_items = []
+    seen = set()
+    for obj in getattr(scene, "objects", []) or []:
+        for owner in (obj, getattr(getattr(obj, "data", None), "shape_keys", None)):
+            anim_data = getattr(owner, "animation_data", None) if owner is not None else None
+            if anim_data is None or id(anim_data) in seen:
+                continue
+            seen.add(id(anim_data))
+            animation_data_items.append(anim_data)
+
+    removed = 0
+    removed_actions = []
+    for anim_data in animation_data_items:
+        for name in track_names:
+            before = len(anim_data.nla_tracks)
+            removed_actions.extend(_remove_nla_tracks(anim_data, name))
+            removed += before - len(anim_data.nla_tracks)
+    _remove_orphan_actions(removed_actions)
+    return removed
+
+
 def _recreate_phonemes_from_lipsync(context, armature, voice_id, track_name="voice_import"):
     """Solve phoneme curves from imported lipsync morph animation.
 
@@ -713,7 +743,10 @@ def _recreate_phonemes_from_lipsync(context, armature, voice_id, track_name="voi
         )
 
     action_name = f"{voice_id}_phonemes"
-    _apply_phoneme_action(armature, pose_bone, phoneme_list, frames, solved, action_name)
+    _apply_phoneme_action(
+        armature, pose_bone, phoneme_list, frames, solved, action_name,
+        track_name=f"{track_name}_phoneme",
+    )
     _remove_lipsync_tracks(face_meshes, armature=armature, track_name=track_name)
 
     rig_settings = getattr(armature.data, "witcherui_RigSettings", None)
@@ -881,6 +914,102 @@ def _refresh_speaker_stats(nodes):
     _voice_popular_speakers_cache = [
         sp for sp, _ in sorted(counts.items(), key=lambda x: (-x[1], x[0]))
     ][:VOICE_POPULAR_LIMIT]
+
+
+def get_voice_nodes_for_game(context=None, game=VOICE_GAME_W3):
+    """Return game nodes without changing the visible cache."""
+    global _voice_node_cache, _voice_cache_loaded, _voice_filtered_indices
+    global _voice_cache_identity_loaded, _voice_cache_source_revision_loaded
+    global _voice_speaker_counts, _voice_popular_speakers_cache, _voice_game_override
+
+    game = VOICE_GAME_W2 if str(game or "").upper() == VOICE_GAME_W2 else VOICE_GAME_W3
+    if get_active_voice_game(context) == game:
+        ensure_voice_cache(context)
+        return list(_voice_node_cache)
+
+    cache_state = (
+        _voice_node_cache,
+        _voice_cache_loaded,
+        _voice_filtered_indices,
+        _voice_cache_identity_loaded,
+        _voice_cache_source_revision_loaded,
+        _voice_speaker_counts,
+        _voice_popular_speakers_cache,
+        _voice_game_override,
+    )
+    try:
+        _voice_game_override = game
+        _voice_node_cache = []
+        _voice_cache_loaded = False
+        _voice_filtered_indices = []
+        _voice_cache_identity_loaded = None
+        _voice_cache_source_revision_loaded = None
+        _voice_speaker_counts = {}
+        _voice_popular_speakers_cache = []
+        ensure_voice_cache(context)
+        return list(_voice_node_cache)
+    finally:
+        (
+            _voice_node_cache,
+            _voice_cache_loaded,
+            _voice_filtered_indices,
+            _voice_cache_identity_loaded,
+            _voice_cache_source_revision_loaded,
+            _voice_speaker_counts,
+            _voice_popular_speakers_cache,
+            _voice_game_override,
+        ) = cache_state
+
+
+def get_voice_cache_key_for_game(context=None, game=VOICE_GAME_W3):
+    game = VOICE_GAME_W2 if str(game or "").upper() == VOICE_GAME_W2 else VOICE_GAME_W3
+    text_language = dialog_language.normalize_dialog_language(
+        dialog_language.get_active_text_language(context) or "en"
+    )
+    index_language = (
+        dialog_language.normalize_dialog_language(dialog_language.get_active_voice_language(context) or "en")
+        if game == VOICE_GAME_W2 else _voice_browser_index_language()
+    )
+    return f"{game}|{index_language}|{text_language}|{_voice_cache_source_revision}"
+
+
+def voice_speaker_aliases(tag):
+    """Return uppercase cache aliases for a cutscene voicetag."""
+    raw = str(tag or "").strip().upper()
+    if not raw:
+        return set()
+    aliases = {raw}
+    try:
+        from ..CR2W.witcher_cache.SceneDialog.scene_dialog_voice_tags import LoadSceneVoiceTags
+        from ..CR2W.witcher_cache.SceneDialog.w3_scene_dialog import _load_speaker_codes, _voice_tag_info
+
+        registry = LoadSceneVoiceTags()
+        speaker_codes = _load_speaker_codes()
+    except Exception:
+        log.debug("Scene voice tag registry unavailable", exc_info=True)
+        return aliases
+    tokens = "".join(ch if ch.isalnum() else " " for ch in raw).split()
+    # Try the full tag before its component words.
+    for candidate in [raw, " ".join(tokens), *tokens]:
+        info = _voice_tag_info(registry, speaker_codes, candidate)
+        if not info or not (info.get("entry") or speaker_codes.get(candidate.lower())):
+            continue
+        aliases.update(str(info.get(key, "") or "").upper() for key in ("speaker", "voicetag", "id"))
+        break
+    aliases.discard("")
+    return aliases
+
+
+def voice_speaker_voicetag(speaker):
+    """Return the engine voicetag for a cache speaker."""
+    try:
+        from ..CR2W.witcher_cache.SceneDialog.scene_dialog_voice_tags import LoadSceneVoiceTags
+
+        entry = LoadSceneVoiceTags().resolve_entry(str(speaker or "").strip())
+    except Exception:
+        entry = None
+    return str(entry.get("voicetag", "") or "").strip().upper() if entry else ""
+
 
 def _get_speaker_count(speaker):
     return _voice_speaker_counts.get(speaker, 0)
@@ -2656,13 +2785,19 @@ def _voice_language_asset_dir(base_path, context=None, language=None):
     return base_dir
 
 
-def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame = 0, recreate_phonemes = None, strip_props = None, nla_mode = None):
+def load_voice_and_lipsync(
+    voiceLineId, actor=None, context=None, at_frame=0, recreate_phonemes=None,
+    strip_props=None, nla_mode=None, allow_context_actor=True, nla_track="voice_import",
+):
     unpadded_line_id = ''+voiceLineId
     if context == None:
         context = bpy.context
     if recreate_phonemes is None:
         recreate_phonemes = getattr(context.scene, "witcher_voice_recreate_phonemes", False)
-    target_armature = _resolve_voice_target_armature(context, actor=actor)
+    target_armature = (
+        _resolve_voice_target_armature(context, actor=actor)
+        if allow_context_actor else _object_to_armature(actor)
+    )
     namelen = len(voiceLineId)
     if namelen != 10:
         zeros = "0000000000"
@@ -2738,15 +2873,16 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
         item:SpeechEntry = speech_matches[0]
         item.extract_to_file(str(item.id), output_dir=str(cr2w_directory_to_check))
 
-    if cr2wPath.is_file():
+    if cr2wPath.is_file() and (target_armature is not None or allow_context_actor):
         log.info('Importing Lipsync')
         _mode_map = {'REPLACE': 'replace', 'APPEND': 'append', 'APPEND_AT_CURSOR': 'append_at_cursor'}
         _nla_mode = nla_mode or _mode_map.get(getattr(context.scene, 'witcher_anim_nla_mode', 'REPLACE'), 'replace')
+        nla_track = str(nla_track or "voice_import")
         import_anims.import_lipsync(
             context,
             str(cr2wPath),
             use_NLA=True,
-            NLA_track="voice_import",
+            NLA_track=nla_track,
             override_select=target_armature if target_armature else actor,
             at_frame=at_frame,
             nla_mode=_nla_mode,
@@ -2764,7 +2900,9 @@ def load_voice_and_lipsync(voiceLineId, actor = None, context = None, at_frame =
                     "Set a character target or select an armature."
                 )
             # Will raise RuntimeError with a descriptive message on failure.
-            _recreate_phonemes_from_lipsync(context, armature, voiceLineId, track_name="voice_import")
+            _recreate_phonemes_from_lipsync(context, armature, voiceLineId, track_name=nla_track)
+    elif cr2wPath.is_file():
+        log.warning("Skipping lipsync for voice line %s because its cutscene speaker is not loaded", unpadded_line_id)
 
     if not soundPath.is_file() and not soundPath_wav.is_file():
         vgmstream_path = get_vgmstream_path(context)

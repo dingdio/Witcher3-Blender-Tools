@@ -4,16 +4,25 @@ Notable changes to **Witcher 3 Blender Tools** are documented here.
 
 ## [Unreleased]
 
-### Changed
-
-#### Cutscene authoring redesign
-- Redesigned the Cutscene panel around Actors, Clips, Camera, Events, Dialogue, and Export tabs.
-- Added a guided bake, validation, and export workflow.
-- Made baking and export transactional with exact rollback on failure.
-- Improved actor casting, entity management, and Witcher 2 retargeting.
-- Added W2/W3 clip browsing with stable IDs and reliable mute and re-import behavior.
-- Prevented promoted clips from also evaluating their `anim_import` or `mimic_import` sources.
-- Added camera shot/rig conversion, prop entity export, and copyable validation reports.
+- Cutscene tabs for Actors, Clips, Camera, Events, Dialogue, and Export
+- Transactional bake, validation, and export workflows
+- Editable dialogue timing, viewport subtitles, and three voice tiers
+- Dialogue markers in `.w2cutscene` with matching companion `.w2scene` lines
+- Game-voice search, preview, aliases, and REDkit or Radish string IDs
+- Cutscene and Speech linking with two-way text sync and reference-safe export
+- Custom WAV hand-off and optional external TTS commands
+- Improved actor casting, entity management, prop export, and Witcher 2 retargeting
+- W2/W3 clip browsing with stable IDs, mute state, re-imports, and isolated promoted clips
+- Camera shots, cut conversion, automatic rig rebakes, and compact shot controls
+- Multipart actor export from shot boundaries with shared boundary keys
+- Copyable validation reports with go-to controls
+- Clear track naming, bake status, and non-cutscene track warnings
+- Frame-zero cutscene setup with configurable length and FPS
+- Fixed face-animation detection for `lipsync` and `_mimic_` parent folders
+- Preserved actor Root placement and yaw across cutscene round-trips
+- Full-length NLA strips for static cutscene parts and separate face rigs
+- Shot change tracking for parents, constraints, and timeline scrubbing
+- Safer failed Speech hand-offs and atomic standalone strings CSV replacement
 
 ## [1.1.0] - 2026-06-23
 

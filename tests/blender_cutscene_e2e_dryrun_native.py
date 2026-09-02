@@ -10,6 +10,8 @@ sys.path.insert(0, str(REPO_ROOT))
 
 OUT_DIR = REPO_ROOT / "WORKING_TEMP" / "e2e_dlc" / "dlc" / "modw3tools_e2e" / "data"
 CS_REPO = "dlc\\modw3tools_e2e\\data\\cutscenes\\cs_e2e_dryrun.w2cutscene"
+SCENE_REPO = "dlc\\modw3tools_e2e\\data\\scenes\\cs_e2e_dryrun.w2scene"
+LEGACY_SCENE_REPO = "quests\\legacy_dialogue.w2scene"
 CS_PATH = OUT_DIR / "cutscenes" / "cs_e2e_dryrun.w2cutscene"
 SCENE_PATH = OUT_DIR / "scenes" / "cs_e2e_dryrun.w2scene"
 
@@ -32,8 +34,12 @@ try:
 
     from witcher3_tools.w3_casting import cast_actor
     from witcher3_tools.exporters import export_cutscene
-    from witcher3_tools.CR2W import scene_builder
     from witcher3_tools.CR2W.CR2W_file import read_CR2W
+    from witcher3_tools.CR2W.dc_scene import get_cutscene_dialog_lines
+    from witcher3_tools import dialog_language
+    from witcher3_tools.importers import import_cutscene
+    from witcher3_tools.lipsync import redkit_project
+    from witcher3_tools.ui import ui_animated_component, ui_cutscene
 
     scene = bpy.context.scene
     scene.render.fps = FPS
@@ -79,6 +85,27 @@ try:
     ciri_source = animate(ciri_arm, "ciri_sway", ["torso", "torso2", "pelvis"])
     animate(drw_arm, "drowner_sway", ["torso", "torso2", "pelvis", "spine1"])
 
+    scene.witcher_cutscene_export_repo_path = CS_REPO
+    scene.witcher_cutscene_used_in_files = (
+        LEGACY_SCENE_REPO + "; DLC/MODW3TOOLS_E2E/DATA/SCENES/CS_E2E_DRYRUN.W2SCENE"
+    )
+    scene.witcher_cutscene_dialog_id_space = 9999
+    scene.witcher_cutscene_dialog_lines.clear()
+    game_line_id = "337201"
+    game_line_text = dialog_language.resolve_localized_text(game_line_id)
+    assert game_line_text, f"Could not resolve vanilla GAME line {game_line_id}"
+    for speaker, text, tier, line_id, start, end in (
+        ("CIRI", "The hunt starts now.", 'SUBTITLE', "", 60, 90),
+        ("DROWNER", game_line_text, 'GAME', game_line_id, 12, 75),
+    ):
+        index = ui_cutscene.add_cutscene_dialog_line(scene, text=text)
+        line = scene.witcher_cutscene_dialog_lines[index]
+        line.speaker, line.tier = speaker, tier
+        line.start_frame, line.end_frame = start, end
+        if tier == 'GAME':
+            line.game_line_id = line_id
+            line.game_voice_file_name = line_id
+
     CS_PATH.parent.mkdir(parents=True, exist_ok=True)
     SCENE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -86,12 +113,20 @@ try:
     assert CS_PATH.is_file(), f"cutscene export produced no file ({result})"
     print(f"E2E cutscene written: {CS_PATH} ({CS_PATH.stat().st_size} bytes)")
 
-    duration = (NUM_FRAMES - 1) / float(FPS)
-    scene_builder.save_cutscene_wrapper_scene(
-        str(SCENE_PATH), CS_REPO, duration=duration,
-        section_name="cs_e2e_dryrun",
-    )
+    real_resolve_export_dir = ui_animated_component._resolve_export_dir
+    real_project_path = redkit_project.get_active_project_path
+    ui_animated_component._resolve_export_dir = lambda _context: str(REPO_ROOT / "WORKING_TEMP" / "e2e_dlc")
+    redkit_project.get_active_project_path = lambda _context: None
+    try:
+        assert bpy.ops.witcher.cutscene_export_scene_wrapper() == {'FINISHED'}
+    finally:
+        ui_animated_component._resolve_export_dir = real_resolve_export_dir
+        redkit_project.get_active_project_path = real_project_path
     assert SCENE_PATH.is_file()
+    strings_path = SCENE_PATH.with_suffix(".strings.csv")
+    assert strings_path.is_file() and Path(scene.witcher_cutscene_dialog_strings_path) == strings_path
+    assert scene.witcher_cutscene_dialog_lines[0].allocated_line_id == "2119999000"
+    assert "2119999000|||The hunt starts now." in strings_path.read_text(encoding="utf-8")
     print(f"E2E wrapper written: {SCENE_PATH} ({SCENE_PATH.stat().st_size} bytes)")
 
     cs = read_CR2W(str(CS_PATH))
@@ -108,6 +143,41 @@ try:
         for imp in (getattr(wrapper, "CR2WImport", []) or [])
     ]
     assert any(str(p or "").lower().endswith("cs_e2e_dryrun.w2cutscene") for p in imports), imports
+    wrapper_lines = get_cutscene_dialog_lines(str(SCENE_PATH), CS_REPO)
+    assert [line["actor"] for line in wrapper_lines] == ["CIRI", "DROWNER"]
+    assert [line["line_index"] for line in wrapper_lines] == [2119999000, int(game_line_id)]
+    assert [round(line["approved_duration"], 3) for line in wrapper_lines] == [1.0, 2.1]
+
+    cutscene_template = import_cutscene.loadCutsceneFile(str(CS_PATH))
+    assert list(cutscene_template.usedInFiles or []) == [SCENE_REPO, LEGACY_SCENE_REPO]
+    imported_lines = import_cutscene.load_cutscene_dialog_items(str(CS_PATH))
+    imported_events = import_cutscene.collect_cutscene_dialog_event_frames(str(CS_PATH))
+    assert [line["actor"] for line in imported_lines] == ["CIRI", "DROWNER"]
+    assert [line["line_index"] for line in imported_lines] == [2119999000, int(game_line_id)]
+    assert imported_lines[0]["line_text"] == "The hunt starts now."
+    assert [round(line["approved_duration"], 3) for line in imported_lines] == [1.0, 2.1]
+    scene.witcher_cutscene_dialog_lines.clear()
+    ui_cutscene._populate_cutscene_dialog_items(scene, imported_lines, imported_events)
+    assert [
+        (item.actor, item.start_frame, item.end_frame)
+        for item in scene.witcher_cutscene_dialog_items
+    ] == [("CIRI", 60, 90), ("DROWNER", 12, 75)]
+    assert ui_cutscene.copy_cutscene_preview_to_authored(scene) == 2
+    subtitle, game = scene.witcher_cutscene_dialog_lines
+    assert (subtitle.tier, subtitle.allocated_line_id, subtitle.text) == (
+        'SUBTITLE', "2119999000", "The hunt starts now.",
+    )
+    assert (game.tier, game.game_line_id, game.game_voice_file_name, game.text) == (
+        'GAME', game_line_id, game_line_id, game_line_text,
+    )
+    assert [(line.start_frame, line.end_frame) for line in (subtitle, game)] == [(60, 90), (12, 75)]
+
+    dialog_roots = [
+        event for event in (import_cutscene.loadCutsceneFile(str(CS_PATH)).animevents or [])
+        if str(getattr(event, "type_name", "")) == export_cutscene.CUTSCENE_DIALOG_EVENT_TYPE
+    ]
+    assert [round(float(event.start_time), 3) for event in dialog_roots] == [2.0, 0.4]
+    assert all(event.animation_name == export_cutscene.CUTSCENE_ROOT_ANIMATION_NAME for event in dialog_roots)
 
     print(f"E2E parse-back OK: cutscene chunks={len(cs_types)} "
           f"(anim entries={len(anim_entries)}), wrapper chunks={len(w_types)}")
@@ -116,6 +186,7 @@ try:
     OP_PATH = OUT_DIR / "cutscenes" / "cs_e2e_dryrun_op.w2cutscene"
     OP_REBAKE_PATH = OUT_DIR / "cutscenes" / "cs_e2e_dryrun_rebake.w2cutscene"
     OP_NO_BAKE_PATH = OUT_DIR / "cutscenes" / "cs_e2e_dryrun_no_bake.w2cutscene"
+    OP_DIALOGUE_INVALID_PATH = OUT_DIR / "cutscenes" / "cs_e2e_dryrun_dialogue_invalid.w2cutscene"
     OP_VALIDATE_FAIL_PATH = OUT_DIR / "cutscenes" / "cs_e2e_dryrun_validate_fail.w2cutscene"
     OP_WRITE_FAIL_PATH = OUT_DIR / "cutscenes" / "cs_e2e_dryrun_write_fail.w2cutscene"
     OP_CANCELLED_PATH = OUT_DIR / "cutscenes" / "cs_e2e_dryrun_cancelled.w2cutscene"
@@ -129,7 +200,6 @@ try:
     assert cutscene_bake.bake_state(scene)["baked"] and not cutscene_bake.bake_state(scene)["stale"]
     op_types = [exp.name for exp in read_CR2W(str(OP_PATH)).CR2WExport]
     assert op_types.count("CSkeletalAnimationSetEntry") == 2, op_types
-    from witcher3_tools.importers import import_cutscene
     roots = list(getattr(import_cutscene.loadCutsceneFile(str(OP_PATH)), "animevents", None) or [])
     assert any(str(getattr(e, "type_name", "")) == "CExtAnimCutsceneFadeEvent"
                and abs(float(getattr(e, "start_time", 0.0) or 0.0) - 1.25) < 1e-4 for e in roots), \
@@ -344,26 +414,42 @@ try:
         assert "invalid actor type" in scene.witcher_cutscene_validation_report
         ciri_arm["cutscene_actor_type"] = actor_type
 
+        original_game_line_id = game.game_line_id
+        game.game_line_id = "not-a-number"
+        dialogue_invalid_signature = bake_scene_signature()
+        OP_DIALOGUE_INVALID_PATH.write_bytes(b"dialogue-invalid-sentinel")
+        try:
+            assert_export_cancelled(
+                "valid numeric Game Line ID",
+                filepath=str(OP_DIALOGUE_INVALID_PATH), bake_before_export=True,
+            )
+            assert bake_scene_signature() == dialogue_invalid_signature
+            assert "valid numeric Game Line ID" in scene.witcher_cutscene_validation_report
+        finally:
+            game.game_line_id = original_game_line_id
+
         from witcher3_tools.animation import cutscene_validate
         scene.frame_start = 7
         scene.frame_end = NUM_FRAMES - 1
         scene.frame_set(23)
         cancelled_signature = bake_scene_signature()
-        real_validate = cutscene_validate.validate_cutscene
+        real_collect = cutscene_validate.collect_issues
 
         def forced_validation_failure(context, **kwargs):
-            lines, errors, warnings = real_validate(context, **kwargs)
-            return lines + ["ERROR forced post-bake validation failure"], \
-                errors + ["forced post-bake validation failure"], warnings
+            return real_collect(context, **kwargs) + [
+                cutscene_validate.issue("ERROR", "forced post-bake validation failure"),
+            ]
 
-        cutscene_validate.validate_cutscene = forced_validation_failure
+        cutscene_validate.collect_issues = forced_validation_failure
         try:
             assert_export_cancelled(
                 "forced post-bake validation failure",
                 filepath=str(OP_VALIDATE_FAIL_PATH), bake_before_export=True,
             )
         finally:
-            cutscene_validate.validate_cutscene = real_validate
+            cutscene_validate.collect_issues = real_collect
+        assert any(i.severity == "ERROR" and i.message == "forced post-bake validation failure"
+                   for i in scene.witcher_cutscene_validation_issues)
         assert bake_scene_signature() == cancelled_signature
 
         real_writer = export_cutscene.export_w3_cutscene

@@ -48,6 +48,7 @@ class ProjectIdInfo:
     id_space: int
     next_line_id: int
     used_count: int
+    csv_mtime: float = 0.0
 
     @property
     def project_name(self):
@@ -410,7 +411,23 @@ def _iter_metadata_candidates(project_path):
     yield from sorted(project_path.glob("packed/mods/*/content/info.json"))
 
 
+_ID_SPACE_CACHE = {}
+_STRING_OWNERS_CACHE = {}
+
+
+def _file_stamp(path):
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
 def read_project_id_space(project_path):
+    project_path = Path(project_path)
+    cached = _ID_SPACE_CACHE.get(str(project_path))
+    if cached and _file_stamp(cached[0]) == cached[1]:
+        return cached[2], cached[0]
     for candidate in _iter_metadata_candidates(project_path):
         try:
             data = json.loads(candidate.read_text(encoding="utf-8", errors="replace"))
@@ -418,30 +435,32 @@ def read_project_id_space(project_path):
             continue
         id_space = _json_int(data, "idSpace")
         if id_space is not None:
+            _ID_SPACE_CACHE[str(project_path)] = (candidate, _file_stamp(candidate), id_space)
             return id_space, candidate
     return None, None
 
 
-def read_project_string_ids(project_path):
+def read_project_string_owners(project_path):
+    """Return line-ID owners, cached by CSV file stamp."""
     csv_path = Path(project_path) / PROJECT_STRINGS_CSV
-    if not csv_path.is_file():
-        return set()
-
-    ids = set()
-    with open(csv_path, "r", encoding="utf-8", errors="replace", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter=";")
-        for row in reader:
+    stamp = _file_stamp(csv_path)
+    if stamp is None:
+        return {}
+    cached = _STRING_OWNERS_CACHE.get(str(csv_path))
+    if cached and cached[0] == stamp:
+        return cached[1]
+    owners = {}
+    with open(csv_path, "r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        for row in csv.DictReader(handle, delimiter=";"):
             raw_id = str(row.get("ID", "") or "").strip()
-            if not raw_id:
-                continue
-            match = re.match(r"^\d+$", raw_id)
-            if not match:
-                continue
-            try:
-                ids.add(int(raw_id))
-            except ValueError:
-                continue
-    return ids
+            if raw_id.isdecimal():
+                owners[int(raw_id)] = str(row.get("RESOURCE", "") or "").strip()
+    _STRING_OWNERS_CACHE[str(csv_path)] = (stamp, owners)
+    return owners
+
+
+def read_project_string_ids(project_path):
+    return set(read_project_string_owners(project_path))
 
 
 def next_project_line_id(project_path):
@@ -460,12 +479,14 @@ def next_project_line_id(project_path):
     if next_id > MAX_RADISH_LINE_ID:
         return None
 
+    stamp = _file_stamp(project_path / PROJECT_STRINGS_CSV)
     return ProjectIdInfo(
         project_path=project_path,
         metadata_path=metadata_path,
         id_space=id_space,
         next_line_id=next_id,
         used_count=len(used_ids),
+        csv_mtime=(stamp[0] / 1e9) if stamp else 0.0,
     )
 
 

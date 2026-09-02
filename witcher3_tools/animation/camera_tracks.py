@@ -16,6 +16,17 @@ CAMERA_TRACK_DEFAULTS = {
 }
 
 CAMERA_TRACK_NAMES = tuple(CAMERA_TRACK_DEFAULTS.keys())
+CAMERA_TRACK_LABELS = {
+    "hctFOV": "FOV (deg)",
+    "overrideFactor": "DOF Override",
+    "dofFocusDistFar": "Focus Far",
+    "dofBlurDistFar": "Blur Far",
+    "dofIntensity": "DOF Intensity",
+    "dofFocusDistNear": "Focus Near",
+    "dofBlurDistNear": "Blur Near",
+    "blenderDofFocusDistance": "Focus Distance (Blender)",
+    "blenderDofFocusDistanceWeight": "Focus Weight (Blender)",
+}
 CAMERA_DOF_TRACK_NAMES = (
     "overrideFactor",
     "dofFocusDistFar",
