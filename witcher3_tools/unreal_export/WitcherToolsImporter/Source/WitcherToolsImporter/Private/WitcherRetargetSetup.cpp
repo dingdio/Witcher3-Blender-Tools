@@ -47,6 +47,7 @@ struct FTargetProfile
     FString ControlRigAssetName;
     FString BaseMeshPath;
     FString BaseSkeletonPath;
+    FString MannequinMeshPath;   // preferred retarget source; the other mannequin is the fallback
 };
 
 FTargetProfile MakeTargetProfile(const FString& RequestedProfile)
@@ -62,6 +63,7 @@ FTargetProfile MakeTargetProfile(const FString& RequestedProfile)
             TEXT("CR_ManBase"),
             ManBaseMeshPath,
             ManBaseSkeletonPath,
+            MannyMeshPath,
         };
     }
 
@@ -73,6 +75,7 @@ FTargetProfile MakeTargetProfile(const FString& RequestedProfile)
         TEXT("CR_WomanBase"),
         WomanBaseMeshPath,
         WomanBaseSkeletonPath,
+        QuinnMeshPath,
     };
 }
 
@@ -297,18 +300,24 @@ void TrackAsset(UObject* Asset, TSet<UPackage*>& Packages, FWitcherRetargetSetup
     }
 }
 
-USkeletalMesh* LoadMannequinMesh(FWitcherRetargetSetup::FResult& Result)
+USkeletalMesh* LoadMannequinMesh(const FTargetProfile& Profile, FWitcherRetargetSetup::FResult& Result)
 {
-    if (USkeletalMesh* Quinn = LoadAsset<USkeletalMesh>(QuinnMeshPath))
+    // Manny for man_base, Quinn for woman_base; whichever is not preferred is the fallback.
+    const bool bPreferManny = Profile.MannequinMeshPath == MannyMeshPath;
+    const TCHAR* PreferredPath = bPreferManny ? MannyMeshPath : QuinnMeshPath;
+    const TCHAR* FallbackPath = bPreferManny ? QuinnMeshPath : MannyMeshPath;
+    const TCHAR* PreferredName = bPreferManny ? TEXT("SKM_Manny_Simple") : TEXT("SKM_Quinn_Simple");
+    const TCHAR* FallbackName = bPreferManny ? TEXT("SKM_Quinn_Simple") : TEXT("SKM_Manny_Simple");
+    if (USkeletalMesh* Preferred = LoadAsset<USkeletalMesh>(PreferredPath))
     {
-        return Quinn;
+        return Preferred;
     }
-    if (USkeletalMesh* Manny = LoadAsset<USkeletalMesh>(MannyMeshPath))
+    if (USkeletalMesh* Fallback = LoadAsset<USkeletalMesh>(FallbackPath))
     {
-        AddWarning(Result, TEXT("SKM_Quinn_Simple was not found; using SKM_Manny_Simple for IK_Mannequin."));
-        return Manny;
+        AddWarning(Result, FString::Printf(TEXT("%s was not found; using %s for IK_Mannequin."), PreferredName, FallbackName));
+        return Fallback;
     }
-    AddError(Result, TEXT("Witcher human retarget setup: neither SKM_Quinn_Simple nor SKM_Manny_Simple could be loaded."));
+    AddError(Result, TEXT("Witcher human retarget setup: neither SKM_Manny_Simple nor SKM_Quinn_Simple could be loaded."));
     return nullptr;
 }
 
@@ -755,7 +764,7 @@ FWitcherRetargetSetup::FResult FWitcherRetargetSetup::CreateOrRepairHumanBase(co
         Options.bForceRegenerate,
         PackagesToSave,
         Result);
-    USkeletalMesh* MannequinMesh = LoadMannequinMesh(Result);
+    USkeletalMesh* MannequinMesh = LoadMannequinMesh(Profile, Result);
     UIKRigDefinition* MannequinRig = MannequinMesh
         ? EnsureMannequinIKRig(MannequinMesh, Options.bForceRegenerate, PackagesToSave, Result)
         : nullptr;

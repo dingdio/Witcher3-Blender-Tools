@@ -2553,7 +2553,14 @@ def _texture_node_auto_repo_path(texture_node) -> str:
     image = getattr(texture_node, "image", None)
     if image is None:
         return ""
-    rel_path = win_unprefix_path(getattr(image, "filepath", "") or "")
+    # A converted texture's filepath points into the _converted_textures cache; the importer records the uncook
+    # source on the image, and that is the path the export must resolve.
+    original = ""
+    try:
+        original = str(image.get("witcher_original_texture_path", "") or "")
+    except Exception:
+        original = ""
+    rel_path = win_unprefix_path(original or getattr(image, "filepath", "") or "")
     if not rel_path:
         return ""
     try:

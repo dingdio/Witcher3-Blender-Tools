@@ -4,12 +4,15 @@ Notable changes to **Witcher 3 Blender Tools** are documented here.
 
 ## [Unreleased]
 
+- Unreal bridge: `SKM_Manny_Simple` is the retarget source mannequin for `man_base` (Quinn for `woman_base`, the other as fallback)
+- Unreal export: textures converted at import (large detail maps) now stage from their uncook source instead of failing to resolve
 - Cutscene tabs for Actors, Clips, Camera, Events, Dialogue, and Export
 - Transactional bake, validation, and export workflows
 - Editable dialogue timing, viewport subtitles, and three voice tiers
 - Dialogue markers in `.w2cutscene` with matching companion `.w2scene` lines
 - Game-voice search, preview, aliases, and REDkit or Radish string IDs
 - Cutscene and Speech linking with two-way text sync and reference-safe export
+- Unreal bridge: plugin README now states the UE 5.8 requirement; wiki tutorial 'Geralt to Unreal and Back'
 - Custom WAV hand-off and optional external TTS commands
 - Improved actor casting, entity management, prop export, and Witcher 2 retargeting
 - W2/W3 clip browsing with stable IDs, mute state, re-imports, and isolated promoted clips

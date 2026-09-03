@@ -3147,7 +3147,8 @@ def create_node_texture(
         final_texture= None
     
     tex_path = os.path.abspath( final_texture )
-    
+    original_texture_path = tex_path   # the uncook source, kept for export; tex_path may become a converted copy below
+
             
     ## didn't find the texture, try find and convert xbm
     if tex_path.lower().endswith(".xbm") and os.path.exists(win_safe_path(tex_path)):
@@ -3220,7 +3221,7 @@ def create_node_texture(
             tex_path = dds_path
 
     
-    texture_source_path = tex_path
+    texture_source_path = original_texture_path
     if tex_path and tex_path.lower().endswith(".dds"):
         convert_started = time.perf_counter()
         converted_image_path = _convert_dds_to_blender_image_cache(tex_path)
@@ -3234,7 +3235,7 @@ def create_node_texture(
         mat,
         tex_path,
         uncook_path,
-        metadata_source_path=texture_source_path if converted_from_dds else "",
+        metadata_source_path=texture_source_path if (converted_from_dds or converted_from_xbm) else "",
     )
     image_load_seconds = time.perf_counter() - image_started
     if texarray_source_repo_path:
