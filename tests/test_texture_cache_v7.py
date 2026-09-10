@@ -4,6 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 import zlib
 from pathlib import Path
 
@@ -68,6 +69,18 @@ def _write_cache(path, version, entries=ENTRIES, magic=MAGIC):
 
 
 class TextureCacheV7Tests(unittest.TestCase):
+    def test_index_only_requests_read_access_to_game_archive(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "texture.cache"
+            _write_cache(path, 7)
+            real_open = open
+            def read_only_open(filename, mode="r", *args, **kwargs):
+                if Path(filename) == path:
+                    self.assertEqual(mode, "rb")
+                return real_open(filename, mode, *args, **kwargs)
+            with patch("builtins.open", side_effect=read_only_open):
+                self.assertEqual(len(texture_cache_module.TextureCache(str(path)).Files), len(ENTRIES))
+
     def test_reads_version_6_and_7_entry_tables_and_mip_chains(self):
         for version in (6, 7):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as temp_dir:

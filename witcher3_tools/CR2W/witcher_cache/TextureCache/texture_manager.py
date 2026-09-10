@@ -25,9 +25,12 @@ def natural_sort_key(s):
 
 
 class TextureManager():
+    # v2 invalidates indexes built before the version-7 mip-count fix.
+    CACHE_VERSION = 2
     InstanceManager = None
     InstanceManagerMods = None
     def __init__(self):
+        self.cache_version = self.CACHE_VERSION
         self.base_path = None
         self.cache_files = None
         
@@ -58,7 +61,7 @@ class TextureManager():
         return self.HashDict.get(hash_value, None)
     
     def find_item_by_path_name(self, filePath):
-        return self.Items.get(filePath, None)
+        return self.Items.get(filePath) or self.Items.get(filePath.replace('/', '\\').lower())
     
     def LoadModBundle(self, filename):
         if filename in self.Archives:
@@ -203,7 +206,8 @@ class TextureManager():
 
         if (
             instance_manager is not None
-            and getattr(instance_manager, "base_path", None) != current_base_path
+            and (getattr(instance_manager, "base_path", None) != current_base_path
+                 or getattr(instance_manager, "cache_version", 0) != TextureManager.CACHE_VERSION)
         ):
             do_reload = True
 
@@ -221,12 +225,14 @@ class TextureManager():
                     tm.LoadModsBundles(Configuration.GameModDir, Configuration.GameDlcDir)
                 else:
                     tm.LoadAll(current_base_path)
+                signature, source = TextureManager.BuildSourceSignature(loadmods)
+                if signature.get("count", 0) and not tm.Items:
+                    raise RuntimeError("Texture archives were found but no textures could be indexed")
                 try:
                     with open(filename, 'wb') as f:
                         pickle.dump(tm, f, protocol=pickle.HIGHEST_PROTOCOL)
                 except Exception as e:
                     log.warning("Failed to save texture cache: %s", e)
-                signature, source = TextureManager.BuildSourceSignature(loadmods)
                 meta = cache_meta.make_meta(cache_name, filename, signature, source)
                 cache_meta.save_meta(meta_path, meta)
                 return tm
@@ -245,7 +251,10 @@ class TextureManager():
                         try:
                             tm = pickle.load(f)
                         except Exception as e:
-                            tm = load_tm(filename)
+                            tm = None
+                    if (getattr(tm, "cache_version", 0) != TextureManager.CACHE_VERSION
+                            or (current_sig.get("count", 0) and not tm.Items)):
+                        tm = load_tm(filename)
             time_taken = time.time() - start_time
             log.info('Loaded Texture Cache in %.2f seconds (%d items)', time_taken, len(tm.Items))
             if loadmods:

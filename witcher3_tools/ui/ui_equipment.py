@@ -69,16 +69,18 @@ from .equipment_item_picker import (
     _on_equipment_preset_picker_filter_changed,
     draw_inventory_preset_picker,
     inventory_preset_picker_width,
+    prepare_inventory_preset_picker,
     clear_inventory_preset_attrs_memo,
 )
 
 _UNCOOK_ITEM_TEMPLATE_INDEX = {}
 _LAST_EQUIPMENT_LOAD_FAILURES = {}
 _OPERATOR_ENUM_CACHE = {}
-# cache_key -> icon_id. Absent means unresolved; 0 means neutral placeholder.
+# Stable image key -> icon_id. Absent means unresolved; 0 means neutral placeholder.
 _EQUIPMENT_ITEM_ICON_ID_CACHE = {}
 _EQUIPMENT_ITEM_ICON_REQUESTS = []
 _EQUIPMENT_ITEM_ICON_PENDING_KEYS = set()
+_EQUIPMENT_ITEM_ICON_POPUP_REGIONS = set()
 _EQUIPMENT_ITEM_ICON_TIMER_RUNNING = False
 _EQUIPMENT_ITEM_ICON_RETRY_COUNTS = {}
 _EQUIPMENT_ICON_CACHE_KEY_MEMO = {}
@@ -93,7 +95,7 @@ _EQUIPMENT_BACKEND_WARM_FAILED = {}
 # their paths recorded to JSON so icons load once and survive Blender restarts
 # (no re-resolution / no UI lag on later sessions).
 _EQUIPMENT_ICON_PREVIEWS = None
-_EQUIPMENT_ICON_PATH_DISK = None          # stable_key(str) -> persistent image path ("" = unresolvable)
+_EQUIPMENT_ICON_PATH_DISK = None          # stable_key(str) -> persistent image path
 _EQUIPMENT_ICON_PATH_DISK_DIRTY = False
 _EQUIPMENT_ICON_PATH_CACHE_FILE = Path(get_cache_root(create=True)) / "equipment_icon_paths.json"
 _EQUIPMENT_ICON_PERSIST_DIR = Path(get_cache_root(create=True)) / "equipment_icons"
@@ -226,6 +228,9 @@ def _clear_equipment_placeholder_icon():
 
 def _equipment_icon_stable_key(cache_key_tuple):
     """Stable, JSON-safe key for the cross-session icon path cache."""
+    if cache_key_tuple[2]:
+        # Explicit icon paths identify the image independently of item/character.
+        cache_key_tuple = cache_key_tuple[:3]
     return hashlib.sha1(repr(cache_key_tuple).encode("utf-8", "ignore")).hexdigest()
 
 
@@ -1234,18 +1239,11 @@ def _iter_equipment_icon_candidate_paths(asset_previews, context, raw_icon_path)
         seen.add(key)
         yield normalized
 
-    def _add_preview_lookup_paths(path_value):
-        lookup_paths = asset_previews.iter_preview_lookup_paths(path_value)
-        for lookup_path in lookup_paths:
-            for normalized in _add(lookup_path):
-                yield normalized
-
-    for candidate in _add_preview_lookup_paths(raw_icon_path):
-        yield candidate
+    # The browser resolver already tries the alternate image extensions.
+    yield from _add(raw_icon_path)
     expanded = asset_previews.expand_scaleform_icon_candidates(context, raw_icon_path)
     for candidate in expanded:
-        for normalized in _add_preview_lookup_paths(candidate):
-            yield normalized
+        yield from _add(candidate)
 
 
 def _get_equipment_icon_cache_type(asset_previews, source_game="w3"):
@@ -1422,8 +1420,8 @@ def _get_equipment_item_icon_cache_key(context, item_name, attrs=None, source_ga
 
 def _resolve_equipment_item_preview_path(context, item_name, attrs=None, source_game="w3", fallback_template=""):
     """Run the (expensive) icon resolution and return the resolved preview image
-    path on disk, or "" if none. This is the slow path run in the background; its
-    result is persisted so it only happens once per item, ever."""
+    path on disk, or "" if none. Runs on the main-thread timer; successful
+    results are persisted and shared by items using the same image."""
     raw_icon_path = _resolve_equipment_item_icon_path(
         item_name,
         attrs,
@@ -1450,7 +1448,7 @@ def _resolve_equipment_item_preview_path(context, item_name, attrs=None, source_
                     preview_path = str(icon_info.get("preview_path", "") or "")
                     if preview_path:
                         break
-            if not preview_path:
+            if not preview_path and not raw_icon_path:
                 preview_path = _resolve_equipment_item_entity_preview_path(
                     context,
                     asset_previews,
@@ -1466,6 +1464,15 @@ def _resolve_equipment_item_preview_path(context, item_name, attrs=None, source_
 
 
 def _tag_equipment_item_icon_redraw():
+    # Popups live outside screen.areas. Rebuild their UI when queued icons arrive,
+    # using Blender's extension notification pattern to reject closed regions.
+    for window, region in list(_EQUIPMENT_ITEM_ICON_POPUP_REGIONS):
+        try:
+            with bpy.context.temp_override(window=window, region=region):
+                region.tag_redraw()
+                region.tag_refresh_ui()
+        except (TypeError, ReferenceError):
+            _EQUIPMENT_ITEM_ICON_POPUP_REGIONS.discard((window, region))
     try:
         wm = bpy.context.window_manager
         for window in getattr(wm, "windows", []) or []:
@@ -1511,6 +1518,8 @@ def _equipment_backends_ready(loadmods, base_path):
     return (
         _manager_singleton_warm(BundleManager, loadmods, base_path)
         and _manager_singleton_warm(TextureManager, loadmods, base_path)
+        and getattr(TextureManager.InstanceManagerMods if loadmods else TextureManager.InstanceManager,
+                    "cache_version", 0) == TextureManager.CACHE_VERSION
     )
 
 
@@ -1617,7 +1626,7 @@ def _equipment_item_icon_timer():
                 _record_equipment_icon_failure(
                     cache_key, request.get("item_name", ""), "asset cache unavailable", force=True
                 )
-                _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(cache_key)
+                _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(request.get("stable_key"))
                 resolved_any = True
                 continue
             _start_equipment_backend_warm(loadmods, base_path)
@@ -1639,17 +1648,14 @@ def _equipment_item_icon_timer():
             )
         except Exception as exc:
             _record_equipment_icon_failure(cache_key, item_name, f"resolve error: {exc}")
-            _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(cache_key)
+            _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(stable_key)
             resolved_any = True
             continue
 
         if not src_path:
-            disk[stable_key] = ""
-            _mark_equipment_icon_disk_dirty()
-            if cache_key is not None:
-                _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = 0
-                _EQUIPMENT_ITEM_ICON_RETRY_COUNTS.pop(cache_key, None)
-            _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(cache_key)
+            # Missing assets may be temporary; never persist a failed lookup.
+            _record_equipment_icon_failure(cache_key, item_name, "preview image not found")
+            _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(stable_key)
             resolved_any = True
             continue
 
@@ -1663,7 +1669,7 @@ def _equipment_item_icon_timer():
                 _EQUIPMENT_ITEM_ICON_RETRY_COUNTS.pop(cache_key, None)
         else:
             _record_equipment_icon_failure(cache_key, item_name, "preview image could not be loaded")
-        _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(cache_key)
+        _EQUIPMENT_ITEM_ICON_PENDING_KEYS.discard(stable_key)
         resolved_any = True
 
     if resolved_any:
@@ -1679,7 +1685,7 @@ def _equipment_item_icon_timer():
 
 def _ensure_equipment_item_icon_timer():
     global _EQUIPMENT_ITEM_ICON_TIMER_RUNNING
-    if _EQUIPMENT_ITEM_ICON_TIMER_RUNNING:
+    if bpy.app.timers.is_registered(_equipment_item_icon_timer):
         return
     try:
         bpy.app.timers.register(_equipment_item_icon_timer, first_interval=0.0)
@@ -1689,6 +1695,9 @@ def _ensure_equipment_item_icon_timer():
 
 
 def _get_cached_or_queue_equipment_item_icon_id(context, item_name, attrs=None, source_game="w3", fallback_template=""):
+    region = getattr(context, "region_popup", None)
+    if region is not None:
+        _EQUIPMENT_ITEM_ICON_POPUP_REGIONS.add((context.window, region))
     cache_key, _raw_icon_path, _template_keys, _loadmods = _get_equipment_item_icon_cache_key(
         context,
         item_name,
@@ -1699,39 +1708,45 @@ def _get_cached_or_queue_equipment_item_icon_id(context, item_name, attrs=None, 
     if cache_key is None:
         return 0
 
+    stable_key = _equipment_icon_stable_key(cache_key)
     # Fast path: already loaded this session.
-    cached = _EQUIPMENT_ITEM_ICON_ID_CACHE.get(cache_key)
+    cached = _EQUIPMENT_ITEM_ICON_ID_CACHE.get(stable_key)
     if cached is not None:
         return int(cached or 0)
 
     # Cross-session path: we resolved this icon in a previous run. Just lazily
     # (re)load the persisted image — cheap, no resolution, no UI lag.
-    stable_key = _equipment_icon_stable_key(cache_key)
     disk = _load_equipment_icon_path_disk()
+    if stable_key not in disk:
+        legacy_key = hashlib.sha1(repr(cache_key).encode("utf-8", "ignore")).hexdigest()
+        if disk.get(legacy_key):
+            disk[stable_key] = disk[legacy_key]
+            _mark_equipment_icon_disk_dirty()
     if stable_key in disk:
         path = disk[stable_key]
         if not path:
-            # Known to be unresolvable — don't keep retrying.
-            _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = 0
-            return 0
+            # Discard misses saved by older versions so these can recover.
+            disk.pop(stable_key)
+            _mark_equipment_icon_disk_dirty()
         icon_id = _equipment_icon_id_from_path(stable_key, path)
         if icon_id:
-            _EQUIPMENT_ITEM_ICON_ID_CACHE[cache_key] = icon_id
+            _EQUIPMENT_ITEM_ICON_ID_CACHE[stable_key] = icon_id
             return icon_id
         # Persisted file disappeared (e.g. cache dir wiped) — fall through and
         # re-resolve it in the background.
 
-    if cache_key not in _EQUIPMENT_ITEM_ICON_PENDING_KEYS:
-        _EQUIPMENT_ITEM_ICON_PENDING_KEYS.add(cache_key)
+    if stable_key not in _EQUIPMENT_ITEM_ICON_PENDING_KEYS:
+        _EQUIPMENT_ITEM_ICON_PENDING_KEYS.add(stable_key)
         _EQUIPMENT_ITEM_ICON_REQUESTS.append({
-            "cache_key": cache_key,
+            "cache_key": stable_key,
             "stable_key": stable_key,
             "item_name": str(item_name or ""),
             "attrs": dict(attrs) if isinstance(attrs, dict) else {},
             "source_game": _normalize_source_game(source_game),
             "fallback_template": str(fallback_template or ""),
         })
-        _ensure_equipment_item_icon_timer()
+    # A file load can remove the timer while requests are still pending.
+    _ensure_equipment_item_icon_timer()
     return 0
 
 
@@ -7560,13 +7575,7 @@ class EQUIPMENT_OT_SelectInventoryPreset(bpy.types.Operator):
         if temp_data is None:
             return {'CANCELLED'}
         target = _normalize_inventory_preset_selection_target(self.target)
-        try:
-            temp_data.preset_picker_target = target
-            temp_data.preset_picker_search = ""
-            temp_data.preset_picker_page = 0
-            temp_data.preset_picker_filter_token = ""
-        except Exception:
-            pass
+        prepare_inventory_preset_picker(context, target)
         _get_equipment_placeholder_icon_id()
         try:
             context.window_manager.invoke_props_dialog(
@@ -9966,6 +9975,9 @@ def register():
 
 def unregister():
     _unregister_equipment_load_handler()
+    if bpy.app.timers.is_registered(_equipment_item_icon_timer):
+        bpy.app.timers.unregister(_equipment_item_icon_timer)
+    _EQUIPMENT_ITEM_ICON_POPUP_REGIONS.clear()
     _clear_equipment_item_icon_cache()
     _clear_equipment_placeholder_icon()
     _clear_equipment_icon_previews()

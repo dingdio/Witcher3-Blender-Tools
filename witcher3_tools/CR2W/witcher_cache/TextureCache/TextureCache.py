@@ -45,7 +45,7 @@ class TextureCache(object):
         if True:
             archive_absolute_path = filepath
 
-            stream:bStream = bStream(path = archive_absolute_path)
+            stream:bStream = bStream(path=archive_absolute_path, reader=open(archive_absolute_path, 'rb'))
             stream.decoder = 'ISO-8859-1'
 
             mip_offsets = []

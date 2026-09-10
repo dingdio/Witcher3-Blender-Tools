@@ -46,8 +46,23 @@ try:
     ec._CATEGORY_CACHE_FILE = sandbox / "equipment_categories.json"
     ec.reset_w3_category_cache_runtime()
 
-    result = bpy.ops.witcher.import_geralt(inventory_preset_id=PRESET_ID)
+    result = bpy.ops.witcher.import_geralt(inventory_preset_id="__none__")
     assert result == {'FINISHED'}, result
+
+    # Reproduce Character > Equipment > Inventory > Select Preset after a bare import.
+    from witcher3_tools.ui import equipment_item_picker as picker
+    temp_data = bpy.context.window_manager.witcherui_temp_data
+    temp_data.preset_picker_target = 'INVENTORY'
+    result = bpy.ops.witcher.equipment_pick_inventory_preset(preset_id=PRESET_ID)
+    assert result == {'FINISHED'}, result
+    assert temp_data.inventory_preset_id == PRESET_ID
+    assert len(temp_data.inventory_entries) >= len(PRESET_CATEGORIES)
+    for view in ('LIST', 'GRID'):
+        temp_data.preset_picker_view = view
+        picker.prepare_inventory_preset_picker(bpy.context, 'INVENTORY')
+        page_size = picker._inventory_preset_picker_page_size(temp_data)
+        start = temp_data.preset_picker_page * page_size
+        assert PRESET_ID in [row.identifier for row in temp_data.preset_picker_rows[start:start + page_size]]
 
     # Bundle-only DLC items
     _cats, attrs = ec.get_equipment_catalog("w3")

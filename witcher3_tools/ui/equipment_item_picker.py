@@ -661,6 +661,10 @@ def _set_inventory_preset_selection(context, preset_id):
         ))
     if equipment._get_inventory_preset(preset_id, source_game=source_game) is None:
         return False
+    if target == "INVENTORY":
+        return bpy.ops.witcher.equipment_apply_inventory_preset(
+            preset_id=preset_id, source_game=source_game,
+        ) == {'FINISHED'}
     return bool(equipment._set_inventory_preset_selection(
         context,
         preset_id,
@@ -760,7 +764,7 @@ class EQUIPMENT_OT_PickInventoryPreset(bpy.types.Operator):
     bl_idname = "witcher.equipment_pick_inventory_preset"
     bl_label = "Pick Preset"
     bl_description = "Pick this inventory preset"
-    bl_options = {'INTERNAL'}
+    bl_options = {'INTERNAL', 'UNDO'}
 
     preset_id: bpy.props.StringProperty(default="", options={'HIDDEN'})
     tooltip: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
@@ -874,6 +878,22 @@ class EQUIPMENT_OT_ShowInventoryPresetDetails(bpy.types.Operator):
 
 def inventory_preset_picker_width():
     return _EQUIPMENT_PRESET_PICKER_WIDTH
+
+
+def _inventory_preset_picker_page_size(temp_data):
+    if temp_data.preset_picker_view == 'GRID':
+        columns, _scale, _chars = _equipment_grid_size_params(temp_data.preset_picker_grid_size)
+        return columns * _EQUIPMENT_PRESET_PICKER_GRID_PAGE_ROWS
+    return _EQUIPMENT_PRESET_PICKER_LIST_PAGE_ROWS
+
+
+def prepare_inventory_preset_picker(context, target):
+    temp_data = _equipment_module()._get_temp_equipment_data(context)
+    temp_data.preset_picker_target = target
+    temp_data.preset_picker_search = ""
+    temp_data.preset_picker_filter_token = ""
+    _populate_inventory_preset_picker_rows(context, "", temp_data.preset_picker_sort)
+    temp_data.preset_picker_page = max(0, temp_data.preset_picker_index) // _inventory_preset_picker_page_size(temp_data)
 
 
 def _inventory_preset_entry_icon_id(context, entry):
@@ -1040,11 +1060,7 @@ def draw_inventory_preset_picker(context, layout):
     rows = list(temp_data.preset_picker_rows)
     total = len(rows)
 
-    page_size = (
-        grid_columns * _EQUIPMENT_PRESET_PICKER_GRID_PAGE_ROWS
-        if is_grid
-        else _EQUIPMENT_PRESET_PICKER_LIST_PAGE_ROWS
-    )
+    page_size = _inventory_preset_picker_page_size(temp_data)
     page_count = max(1, (total + page_size - 1) // page_size)
     page = max(0, min(int(temp_data.preset_picker_page), page_count - 1))
 
