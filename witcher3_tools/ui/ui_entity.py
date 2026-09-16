@@ -913,6 +913,44 @@ class WITCH_OT_w3app(bpy.types.Operator, ImportHelper):
         return ImportHelper.invoke(self, context, event)
 
 class _W2EntImportOperatorMixin:
+    filename_ext = ".w2ent"
+
+    filter_glob: StringProperty(default='*.w2ent;*.w2ent.json', options={'HIDDEN'})
+    import_apperance: IntProperty(
+        name="Select Appearance",
+        default=0,
+        description="Legacy appearance index; prefer selected_appearance_name",
+        options={'HIDDEN', 'SKIP_SAVE'},
+    )
+    selected_appearance_name: EnumProperty(
+        name="Appearance",
+        items=_enum_entity_appearance_items,
+        description="Choose which appearance to import",
+    )
+    do_import_lods: BoolProperty(
+        name="Include LODs",
+        description="Include lower-detail mesh LODs",
+        default=False,
+    )
+    keep_empty_lods: BoolProperty(
+        name="Keep Empty LODs",
+        description="Keep empty mesh LODs with zero polygons when LODs are imported",
+        default=False,
+    )
+    keep_proxy_meshes: BoolProperty(
+        name="Keep Proxy Meshes",
+        description="Keep proxy meshes even when higher LOD meshes are skipped",
+        default=False,
+    )
+    hide_zero_weight_faces: BoolProperty(
+        name="Hide Zero-Weight Faces",
+        description="Hide faces without bone weights on skinned meshes during import",
+        default=True,
+    )
+    appearance_selection_initialized: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+    appearance_metadata_json: StringProperty(default="{}", options={'HIDDEN', 'SKIP_SAVE'})
+    appearance_metadata_path: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+
     def _resolve_legacy_appearance_name(self, metadata):
         all_names = list(metadata.get("all_names", []) or [])
         if not all_names:
@@ -1064,44 +1102,7 @@ class _W2EntImportOperatorMixin:
 class WITCH_OT_w2ent(_W2EntImportOperatorMixin, bpy.types.Operator, ImportHelper):
     bl_idname = "witcher.import_w2ent"
     bl_label = "Import Entity (.w2ent)"
-    filename_ext = ".w2ent"
     bl_options = {'REGISTER', 'UNDO'}
-
-    filter_glob: StringProperty(default='*.w2ent;*.w2ent.json', options={'HIDDEN'})
-    import_apperance: IntProperty(
-        name="Select Appearance",
-        default=0,
-        description="Legacy appearance index; prefer selected_appearance_name",
-        options={'HIDDEN', 'SKIP_SAVE'},
-    )
-    selected_appearance_name: EnumProperty(
-        name="Appearance",
-        items=_enum_entity_appearance_items,
-        description="Choose which appearance to import",
-    )
-    do_import_lods: BoolProperty(
-        name="Include LODs",
-        description="Include lower-detail mesh LODs",
-        default=False,
-    )
-    keep_empty_lods: BoolProperty(
-        name="Keep Empty LODs",
-        description="Keep empty mesh LODs with zero polygons when LODs are imported",
-        default=False,
-    )
-    keep_proxy_meshes: BoolProperty(
-        name="Keep Proxy Meshes",
-        description="Keep proxy meshes even when higher LOD meshes are skipped",
-        default=False,
-    )
-    hide_zero_weight_faces: BoolProperty(
-        name="Hide Zero-Weight Faces",
-        description="Hide faces without bone weights on skinned meshes during import",
-        default=True,
-    )
-    appearance_selection_initialized: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
-    appearance_metadata_json: StringProperty(default="{}", options={'HIDDEN', 'SKIP_SAVE'})
-    appearance_metadata_path: StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
 
 
 class WITCH_OT_flyr(bpy.types.Operator, ImportHelper):
@@ -1132,7 +1133,7 @@ class WITCH_OT_flyr(bpy.types.Operator, ImportHelper):
         return ImportHelper.invoke(self, context, event)
 
 
-class WITCH_OT_ENTITY_w2ent_chara(WITCH_OT_w2ent):
+class WITCH_OT_ENTITY_w2ent_chara(_W2EntImportOperatorMixin, bpy.types.Operator, ImportHelper):
     bl_idname = "witcher.import_w2ent_character"
     bl_label = "Import Entity (Compatibility)"
     bl_options = {'INTERNAL', 'UNDO'}

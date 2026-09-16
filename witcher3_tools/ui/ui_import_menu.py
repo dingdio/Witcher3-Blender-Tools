@@ -251,7 +251,6 @@ classes = (
     WITCH_OT_create_trimesh_collider,
     WITCH_OT_create_sound_info,
     WITCH_OT_remove_sound_info,
-    WITCH_OT_apx,
     WITCH_OT_redcloth,
     WITCH_OT_redapex,
     WITCH_OT_nxs,

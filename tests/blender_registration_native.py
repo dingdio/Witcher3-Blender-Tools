@@ -30,6 +30,15 @@ try:
         assert bpy.app.handlers.load_post.count(
             ui_equipment._repair_equipment_state_on_load
         ) == 1
+        registered = {
+            cls
+            for mod_name, mod in list(sys.modules.items()) if mod_name.startswith("witcher3_tools")
+            for cls in vars(mod).values()
+            if isinstance(cls, type) and "bl_rna" in vars(cls) and cls.__module__.startswith("witcher3_tools")
+        }
+        for cls in registered:
+            # Registering a subclass of a registered class detaches the parent's Python class (issue #13).
+            assert not registered.intersection(cls.__mro__[1:]), f"{cls.__name__} subclasses a registered class"
 
         addon.unregister()
         registered = False

@@ -677,7 +677,6 @@ def import_redapex_resource(
 
 class WITCH_OT_apx(bpy.types.Operator, ImportHelper):
     """Load a Redcloth file with materials using io_mesh_apx."""
-    bl_idname = "witcher.import_apx_materials"  # important since its how bpy.ops.import.apx is constructed
     bl_label = "Import APX"
 
     # ImportHelper mixin class uses this
