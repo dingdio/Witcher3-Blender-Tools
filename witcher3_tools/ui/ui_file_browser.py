@@ -34,6 +34,7 @@ from ..CR2W.common_blender import (
 )
 
 from .. import (
+    asset_search_core,
     file_helpers,
     clear_external_import_dependency_alert,
     get_all_addon_prefs,
@@ -249,8 +250,7 @@ class FolderStructure:
     def add_path(self, path):
         parts = path.split("\\")
         current_level = self.items
-        normalized_path = path.lower().replace('_', ' ')
-        self.index[normalized_path] = path # todo improve index
+        self.index[asset_search_core.normalize(path)] = path
         for i, part in enumerate(parts):
             if part not in current_level:
                 current_level[part] = {}
@@ -268,17 +268,8 @@ class FolderStructure:
             items.append(item)
         return items
     
-    def search_items(self, query, max_results=100):
-        """Search with result limit for performance."""
-        # Normalize query -> lowercase, spaces for underscores
-        tokens = query.lower().replace('_', ' ').split()
-        results = []
-        for key, original_path in self.index.items():
-            if all(token in key for token in tokens):
-                results.append(original_path)
-                if len(results) >= max_results:
-                    break
-        return results
+    def search_items(self, query, max_results=100, path_filter=""):
+        return asset_search_core.search(self.index.items(), query, max_results, path_filter)
 
     def path_exists(self, path):
         """Check if a path (folder or file) exists in the structure."""
@@ -319,10 +310,17 @@ def _sync_path_to_address_bar(self, context):
 
 
 def _on_browser_query_filter_update(self, context):
+    query = self.search_query.strip()
+    if query != self.search_query:
+        self.search_query = query
+        return
     self.file_page_index = 0
     self.search_page_index = 0
+    # State restores run suspended, so a restored Home query waits for the Search button instead of loading every cache.
     if _is_browser_state_save_suspended():
         return
+    if query:
+        get_cached_search_results(self)
     try:
         _persist_current_browser_state(context)
     except Exception:
@@ -331,9 +329,10 @@ def _on_browser_query_filter_update(self, context):
 
 def _on_root_search_scope_update(self, context):
     self.search_page_index = 0
-    clear_search_cache()
     if _is_browser_state_save_suspended():
         return
+    if self.search_query and not self.active_cache_type:
+        get_cached_search_results(self)
     try:
         _persist_current_browser_state(context)
     except Exception:
@@ -1132,6 +1131,11 @@ def get_cache_type_display_label(cache_type: str) -> str:
         WITCHER2_BUNDLE_CACHE_TYPE: "W2 DZIP",
         WITCHER2_SPEECH_CACHE_TYPE: "W2Speech",
     }.get(cache_type, cache_type or "")
+
+
+def _search_result_cache_tag(cache_type: str) -> str:
+    tag = get_effective_cache_type(cache_type)[:3] or cache_type[:3]
+    return f"W2 {tag}" if cache_type in (WITCHER2_BUNDLE_CACHE_TYPE, WITCHER2_SPEECH_CACHE_TYPE) else tag
 
 
 def get_cache_type_icon(cache_type: str) -> str:
@@ -4795,13 +4799,7 @@ def get_status_icon(context, cache_type, item_path, loadmods=False):
 collision_extension_map: dict = {}
 
 # Search result cache to avoid expensive re-searches on every UI redraw
-_search_cache = {
-    'query': '',
-    'cache_type': '',  # "" for global, or specific cache type
-    'scope': 'ALL',
-    'loadmods': False,
-    'results': [],
-}
+_search_cache = {'key': None}
 
 
 def _normal_root_search_scope(scope):
@@ -4841,73 +4839,78 @@ def _global_search_cache_loaders(scope, loadmods=False):
     return cache_loaders
 
 
-def get_cached_search_results(query, cache_type, folder_struct, loadmods=False, search_scope="ALL"):
-    """Return cached search results, or perform search if query changed."""
-    global _search_cache
-    search_scope = _normal_root_search_scope(search_scope)
-
-    if (_search_cache['query'] == query
-            and _search_cache['cache_type'] == cache_type
-            and _search_cache.get('scope', 'ALL') == search_scope
-            and _search_cache['loadmods'] == loadmods):
-        return _search_cache['results']
-
-    # Perform the search
-    results = []
-
-    if cache_type:
-        # Search within specific cache (uses folder_structure.index)
-        results = folder_struct.search_items(query, max_results=BROWSER_SEARCH_RESULT_LIMIT)
-    else:
-        cache_loaders = _global_search_cache_loaders(search_scope, loadmods=loadmods)
-        cache_matches = []
-        for ct, loader in cache_loaders:
+def _global_search_entries(cache_loaders):
+    wm = bpy.context.window_manager
+    wm.progress_begin(0, len(cache_loaders))
+    try:
+        for index, (ct, loader) in enumerate(cache_loaders):
+            wm.progress_update(index)
             try:
-                manager = loader()
-                tokens = query.lower().replace('_', ' ').split()
-                matches = []
-                for key in manager.Items.keys():
-                    if ct == WITCHER2_SPEECH_CACHE_TYPE:
-                        key_str = _w2_speech_virtual_path(key)
-                    else:
-                        key_str = str(key) if not isinstance(key, str) else key
-                    if _should_skip_buffer_name(key_str):
-                        continue
-                    normalized = key_str.lower().replace('_', ' ')
-                    if all(token in normalized for token in tokens):
-                        matches.append((ct, key_str))
-                        if len(matches) >= BROWSER_SEARCH_RESULT_LIMIT:
-                            break
-                cache_matches.append(matches)
+                keys = loader().Items.keys()
             except Exception as e:
                 log.error("Failed to search %s: %s", ct, e)
+                continue
+            for key in keys:
+                key_str = _w2_speech_virtual_path(key) if ct == WITCHER2_SPEECH_CACHE_TYPE else str(key)
+                normalized = asset_search_core.normalize(key_str)
+                if ".buffer" in normalized and not _is_w2ter_buffer_name(key_str):
+                    continue
+                yield normalized, (ct, key_str)
+    finally:
+        wm.progress_end()
 
-        # Mix cache results before applying the global cap, so broad searches
-        # do not fill the whole result set from Bundle before other caches run.
-        row_index = 0
-        while len(results) < BROWSER_SEARCH_RESULT_LIMIT:
-            added = False
-            for matches in cache_matches:
-                if row_index < len(matches):
-                    results.append(matches[row_index])
-                    added = True
-                    if len(results) >= BROWSER_SEARCH_RESULT_LIMIT:
-                        break
-            if not added:
-                break
-            row_index += 1
 
-    _search_cache['query'] = query
-    _search_cache['cache_type'] = cache_type
-    _search_cache['scope'] = search_scope
-    _search_cache['loadmods'] = loadmods
-    _search_cache['results'] = results
-    return results
+def _browser_search_key(browser):
+    cache_type = browser.active_cache_type
+    return (
+        browser.search_query.strip(),
+        cache_type,
+        "" if cache_type else _normal_root_search_scope(browser.root_search_scope),
+        bool(browser.loadmods),
+        browser.extension_filter.strip().lower(),
+    )
+
+
+def get_cached_search_results(browser, compute=True):
+    """Search state {'ranked', 'total', 'sorted'} for the browser's query, or None if not computed and compute=False."""
+    global _search_cache
+    key = _browser_search_key(browser)
+    if _search_cache['key'] == key:
+        return _search_cache
+    if not compute:
+        return None
+
+    query, cache_type, scope, loadmods, path_filter = key
+    if cache_type:
+        ranked, total = folder_structure.search_items(query, BROWSER_SEARCH_RESULT_LIMIT, path_filter)
+    else:
+        ranked, total = asset_search_core.search(
+            _global_search_entries(_global_search_cache_loaders(scope, loadmods=loadmods)),
+            query,
+            BROWSER_SEARCH_RESULT_LIMIT,
+            path_filter,
+        )
+    _search_cache = {'key': key, 'ranked': ranked, 'total': total, 'sorted': {}}
+    return _search_cache
+
+
+def _sorted_search_results(state, browser):
+    """Display order: best match rank first, then the browser sort; cached per sort setting."""
+    if not state:
+        return []
+    sort_key = _get_browser_sort_prefs(browser)
+    ordered = state['sorted'].get(sort_key)
+    if ordered is None:
+        payloads = [payload for _rank, payload in state['ranked']]
+        sort_fn = _sort_browser_search_results if browser.active_cache_type else _sort_browser_global_search_results
+        ordered = state['sorted'][sort_key] = asset_search_core.group_by_rank(state['ranked'], sort_fn(payloads, browser))
+    return ordered
+
 
 def clear_search_cache():
     """Clear the search cache."""
     global _search_cache
-    _search_cache = {'query': '', 'cache_type': '', 'scope': 'ALL', 'loadmods': False, 'results': []}
+    _search_cache = {'key': None}
 
 
 def _report_locked_bundle_cache(reporter, manager):
@@ -4936,6 +4939,7 @@ def _report_locked_bundle_cache(reporter, manager):
 def refresh_mod_cache_managers(reporter=None):
     """Force rebuild of mod cache managers so removed mods disappear immediately."""
     clear_mod_index_cache()
+    clear_search_cache()
     try:
         manager = LoadBundleManager(loadmods=True, reset_cache=True)
         _report_locked_bundle_cache(reporter, manager)
@@ -5930,7 +5934,7 @@ def get_visible_batch_file_paths(context):
     else:
         filtered_items = folder_items
 
-    file_items = [item for item in filtered_items if not item['is_folder']]
+    file_items = _sort_browser_items([item for item in filtered_items if not item['is_folder']], witcher_file_browser)
     page_size = _get_browser_file_page_size(context, getattr(witcher_file_browser, "file_display_mode", "LIST"))
     file_stats = _get_browser_page_stats(file_items, witcher_file_browser.file_page_index, page_size)
     visible_files = []
@@ -6687,7 +6691,7 @@ class SimpleFileBrowser(Operator):
             import_row = actions_row.row(align=True)
             import_row.operator_context = 'INVOKE_DEFAULT'
             op_import = import_row.operator("witcher.file_action_import_to_scene", text="", icon='IMPORT')
-            op_import.file_path = item['name']
+            op_import.file_path = full_item_path
             op_import.cache_type = witcher_file_browser.active_cache_type
 
         if cache_supports_sound_preview(witcher_file_browser.active_cache_type):
@@ -6748,8 +6752,7 @@ class SimpleFileBrowser(Operator):
             if parent_leaf:
                 display_label = f"{display_label} ({parent_leaf})"
             if include_cache:
-                cache_abbrev = get_effective_cache_type(cache_type)[:3] or cache_type[:3]
-                display_label = f"[{cache_abbrev}] {display_label}"
+                display_label = f"[{_search_result_cache_tag(cache_type)}] {display_label}"
         else:
             display_label = normalized_path
 
@@ -6786,7 +6789,7 @@ class SimpleFileBrowser(Operator):
         stats,
         page_size: int,
         *,
-        limit_reached: bool = False,
+        total_matches: int = 0,
     ):
         header = col.row(align=True)
         if stats["total"] > page_size:
@@ -6822,8 +6825,8 @@ class SimpleFileBrowser(Operator):
             next_row.enabled = stats["page_index"] < (stats["total_pages"] - 1)
             next_row.operator("witcher.browser_page", text=">").action = "next"
 
-        if limit_reached:
-            col.label(text=f"Search capped at {BROWSER_SEARCH_RESULT_LIMIT} matches", icon='INFO')
+        if total_matches > stats["total"]:
+            col.label(text=f"Showing the best {stats['total']:,} of {total_matches:,} matches", icon='INFO')
 
     def _draw_search_result_action_buttons(
         self,
@@ -6919,8 +6922,7 @@ class SimpleFileBrowser(Operator):
     ):
         if is_global:
             row_split = col.split(factor=0.1, align=True)
-            cache_abbrev = get_effective_cache_type(cache_type)[:3] or cache_type[:3]
-            row_split.label(text=f"[{cache_abbrev}]")
+            row_split.label(text=f"[{_search_result_cache_tag(cache_type)}]")
             path_btn_split = row_split.split(factor=0.78, align=True)
         else:
             path_btn_split = col.split(factor=0.70, align=True)
@@ -7093,12 +7095,12 @@ class SimpleFileBrowser(Operator):
         layout,
         context,
         witcher_file_browser,
-        results,
+        state,
         *,
         is_global: bool,
-        limit_reached: bool = False,
     ):
         col = layout.column(align=True)
+        results = _sorted_search_results(state, witcher_file_browser)
         if not results:
             col.label(text="No results found", icon='ERROR')
             return
@@ -7114,7 +7116,7 @@ class SimpleFileBrowser(Operator):
             witcher_file_browser,
             stats,
             page_size,
-            limit_reached=limit_reached,
+            total_matches=state['total'],
         )
         col.separator(factor=0.3)
 
@@ -7199,7 +7201,7 @@ class SimpleFileBrowser(Operator):
             layout.separator(factor=0.3)
 
             if witcher_file_browser.search_query:
-                self.draw_global_search_results(layout, witcher_file_browser.search_query)
+                self.draw_global_search_results(layout, context)
             else:
                 w3_game_ok = not _get_witcher3_game_path_issue(context)
                 w2_game_ok = not _get_witcher2_game_path_issue(context)
@@ -7487,19 +7489,12 @@ class SimpleFileBrowser(Operator):
 
         # If searching, show search results (uses cached results)
         if witcher_file_browser.search_query:
-            search_results = get_cached_search_results(witcher_file_browser.search_query, witcher_file_browser.active_cache_type, folder_structure, loadmods=witcher_file_browser.loadmods)
-            search_limit_reached = len(search_results) >= BROWSER_SEARCH_RESULT_LIMIT
-            filter_text = witcher_file_browser.extension_filter.strip().lower()
-            if filter_text:
-                search_results = [item for item in search_results if filter_text in item.lower()]
-            search_results = _sort_browser_search_results(search_results, witcher_file_browser)
             self._draw_search_results(
                 layout,
                 context,
                 witcher_file_browser,
-                search_results,
+                get_cached_search_results(witcher_file_browser),
                 is_global=False,
-                limit_reached=search_limit_reached,
             )
         else:
             # Split layout: left = folders, right = files
@@ -7768,7 +7763,7 @@ class SimpleFileBrowser(Operator):
                         import_row.operator_context = 'INVOKE_DEFAULT'
                         op1 = import_row.operator("witcher.file_action_import_to_scene",
                                                   text="", icon='IMPORT')
-                        op1.file_path = item['name']
+                        op1.file_path = full_item_path
                         op1.cache_type = witcher_file_browser.active_cache_type
 
                     _add_browser_preview_button_slot(
@@ -7831,36 +7826,25 @@ class SimpleFileBrowser(Operator):
 
 
 
-    def draw_global_search_results(self, layout, query):
-        """Search selected game-cache scope and display results with cache source."""
-        context = bpy.context
+    def draw_global_search_results(self, layout, context):
+        """Display results for the selected game-cache scope; the search itself runs on query confirm, not in draw."""
         witcher_file_browser = context.scene.witcher_file_browser
-        loadmods = witcher_file_browser.loadmods
-        search_scope = getattr(witcher_file_browser, "root_search_scope", "ALL")
-
-        results = get_cached_search_results(
-            query,
-            "",
-            folder_structure,
-            loadmods=loadmods,
-            search_scope=search_scope,
-        )
-        limit_reached = len(results) >= BROWSER_SEARCH_RESULT_LIMIT
-        filter_text = witcher_file_browser.extension_filter.strip().lower()
-        if filter_text:
-            results = [result for result in results if filter_text in result[1].lower()]
-        results = _sort_browser_global_search_results(results, witcher_file_browser)
         header = layout.row(align=True)
-        header.label(text=_get_root_search_scope_label(search_scope), icon='FILEBROWSER')
-        if filter_text:
+        header.label(text=_get_root_search_scope_label(witcher_file_browser.root_search_scope), icon='FILEBROWSER')
+        if witcher_file_browser.extension_filter.strip():
             header.label(text="Filtered", icon='FILTER')
+        state = get_cached_search_results(witcher_file_browser, compute=False)
+        if state is None:
+            hint = layout.row(align=True)
+            hint.label(text="Search not run yet", icon='INFO')
+            hint.operator("witcher.run_browser_search", text="Search", icon='VIEWZOOM')
+            return
         self._draw_search_results(
             layout,
             context,
             witcher_file_browser,
-            results,
+            state,
             is_global=True,
-            limit_reached=limit_reached,
         )
 
     def draw_recent_view(self, layout, context):
@@ -8036,6 +8020,20 @@ class ClearSearchOperator(Operator):
         )
         return {'FINISHED'}
 
+
+class RunBrowserSearchOperator(Operator):
+    """Run the asset browser search for the current query"""
+    bl_idname = "witcher.run_browser_search"
+    bl_label = "Search"
+
+    def execute(self, context):
+        witcher_file_browser = context.scene.witcher_file_browser
+        if not witcher_file_browser.search_query:
+            return {'CANCELLED'}
+        get_cached_search_results(witcher_file_browser)
+        return {'FINISHED'}
+
+
 class StatusIconHelpOperator(Operator):
     """Show help for status icons"""
     bl_idname = "witcher.status_icon_help"
@@ -8150,7 +8148,7 @@ class GoHomeOperator(Operator):
     bl_label = "Go Home"
 
     def execute(self, context):
-        global folder_structure, _nav_history, _nav_index, _search_cache, _file_source_map, _file_source_info
+        global folder_structure, _nav_history, _nav_index, _file_source_map, _file_source_info
 
         witcher_file_browser = context.scene.witcher_file_browser
         _clear_browser_reveal(context)
@@ -8175,8 +8173,7 @@ class GoHomeOperator(Operator):
         _nav_history = []
         _nav_index = -1
 
-        # Clear search cache
-        _search_cache = {'query': '', 'cache_type': '', 'scope': 'ALL', 'loadmods': False, 'results': []}
+        clear_search_cache()
 
         save_browser_state(context, "", "", allow_empty_home=True)
         return {'FINISHED'}
@@ -8411,30 +8408,7 @@ class BrowserPageOperator(Operator):
     def execute(self, context):
         browser = context.scene.witcher_file_browser
         if browser.search_query:
-            if browser.active_cache_type:
-                items = get_cached_search_results(
-                    browser.search_query,
-                    browser.active_cache_type,
-                    folder_structure,
-                    loadmods=browser.loadmods,
-                )
-                filter_text = browser.extension_filter.strip().lower()
-                if filter_text:
-                    items = [item for item in items if filter_text in item.lower()]
-                items = _sort_browser_search_results(items, browser)
-            else:
-                items = get_cached_search_results(
-                    browser.search_query,
-                    "",
-                    folder_structure,
-                    loadmods=browser.loadmods,
-                    search_scope=getattr(browser, "root_search_scope", "ALL"),
-                )
-                filter_text = browser.extension_filter.strip().lower()
-                if filter_text:
-                    items = [item for item in items if filter_text in item[1].lower()]
-                items = _sort_browser_global_search_results(items, browser)
-
+            items = _sorted_search_results(get_cached_search_results(browser, compute=bool(browser.active_cache_type)), browser)
             page_size = _get_browser_file_page_size(context, browser.file_display_mode)
             stats = _get_browser_page_stats(items, browser.search_page_index, page_size)
             current = stats["page_index"]
@@ -8497,43 +8471,15 @@ class CopyAllSearchPathsOperator(Operator):
 
     def execute(self, context):
         wfb = context.scene.witcher_file_browser
-        filter_text = wfb.extension_filter.strip().lower()
-        if wfb.active_cache_type:
-            results = get_cached_search_results(
-                wfb.search_query,
-                wfb.active_cache_type,
-                folder_structure,
-                loadmods=wfb.loadmods,
-            )
-        else:
-            results = get_cached_search_results(
-                wfb.search_query,
-                "",
-                folder_structure,
-                loadmods=wfb.loadmods,
-                search_scope=getattr(wfb, "root_search_scope", "ALL"),
-            )
+        results = _sorted_search_results(get_cached_search_results(wfb, compute=bool(wfb.active_cache_type)), wfb)
         if not results:
             self.report({'WARNING'}, "No search results to copy")
             return {'CANCELLED'}
 
-        if wfb.active_cache_type:
-            paths = [
-                get_asset_browser_copy_path(item, loadmods=bool(getattr(wfb, "loadmods", False)))
-                for item in results
-                if not filter_text or filter_text in item.lower()
-            ]
-        else:
-            paths = [
-                get_asset_browser_copy_path(path, loadmods=bool(getattr(wfb, "loadmods", False)))
-                for _, path in results
-                if not filter_text or filter_text in path.lower()
-            ]
-
-        if not paths:
-            self.report({'WARNING'}, "No results match the current filter")
-            return {'CANCELLED'}
-
+        paths = [
+            get_asset_browser_copy_path(result if wfb.active_cache_type else result[1], loadmods=bool(wfb.loadmods))
+            for result in results
+        ]
         bpy.context.window_manager.clipboard = "\n".join(paths)
         self.report({'INFO'}, f"Copied {len(paths)} paths to clipboard")
         return {'FINISHED'}
@@ -9096,15 +9042,7 @@ class FileActionOperatorImportToScene(Operator):
         witcher_file_browser = context.scene.witcher_file_browser
         cache_type = _browser_operator_cache_type(context, self.cache_type)
         overwrite_existing = witcher_file_browser.mods_overwrite
-
-        # Build full path for lookup
-        full_path = (witcher_file_browser.current_folder + "\\" + self.file_path
-                     if witcher_file_browser.current_folder else self.file_path)
-
-        # For search results, file_path is already the full path
-        if "\\" in self.file_path or "/" in self.file_path:
-            full_path = self.file_path
-
+        full_path = self.file_path
         loadmods = witcher_file_browser.loadmods
         effective_cache_type = get_effective_cache_type(cache_type)
         full_path_norm = full_path.replace("/", "\\")
@@ -10006,10 +9944,7 @@ class SoundPreviewToggleOperator(Operator):
             self.report({'WARNING'}, "Sound preview is only available for Sound cache items.")
             return {'CANCELLED'}
 
-        full_path = self.file_path
-        if "\\" not in full_path and witcher_file_browser.current_folder:
-            full_path = witcher_file_browser.current_folder + "\\" + self.file_path
-        full_path = full_path.replace("/", "\\")
+        full_path = self.file_path.replace("/", "\\")
 
         if _sound_preview_matches(cache_type, full_path):
             _clear_sound_preview(context)
@@ -10789,10 +10724,7 @@ class FileActionOperator(Operator):
             self.report({'INFO'}, "Export not available for disk sources")
             return {'CANCELLED'}
 
-        # Build full path
         full_path = self.file_path
-        if "\\" not in full_path and witcher_file_browser.current_folder:
-            full_path = witcher_file_browser.current_folder + "\\" + self.file_path
         log.debug("Action on file [%s]: %s", cache_type, full_path)
         if is_external_cache(cache_type):
             output_root = _get_external_archive_output_root(context, cache_type, create=True)
@@ -11076,6 +11008,7 @@ def register():
     bpy.utils.register_class(OpenExternalBundleOperator)
     bpy.utils.register_class(SimpleFileBrowser)
     bpy.utils.register_class(ClearSearchOperator)
+    bpy.utils.register_class(RunBrowserSearchOperator)
     bpy.utils.register_class(StatusIconHelpOperator)
     bpy.utils.register_class(FileItemStatsOperator)
     bpy.utils.register_class(GoHomeOperator)
@@ -11170,6 +11103,7 @@ def unregister():
     bpy.utils.unregister_class(ClearExtensionFilterOperator)
     bpy.utils.unregister_class(GoHomeOperator)
     bpy.utils.unregister_class(StatusIconHelpOperator)
+    bpy.utils.unregister_class(RunBrowserSearchOperator)
     bpy.utils.unregister_class(ClearSearchOperator)
     bpy.utils.unregister_class(NavigateFolderOperator)
     bpy.utils.unregister_class(SelectCacheTypeOperator)
