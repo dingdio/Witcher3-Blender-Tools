@@ -13,6 +13,7 @@ import os
 from typing import Iterable
 
 from .source_game import (
+    _existing_path,
     configured_w2_repo_roots,
     is_under_root,
     normalize_roots,
@@ -289,7 +290,7 @@ def _resolve_existing_path(identifier, source_game, roots, extensions):
         for root_index, root in enumerate(roots):
             if not is_under_root(identifier, root):
                 continue
-            if not os.path.exists(identifier):
+            if not _existing_path(identifier):
                 continue
             try:
                 rel_path = os.path.relpath(identifier, root).replace("/", "\\")
@@ -305,7 +306,7 @@ def _resolve_existing_path(identifier, source_game, roots, extensions):
     for root_index, root in enumerate(roots):
         for rel_path in _candidate_repo_paths(rel_name, extensions):
             candidate = os.path.join(root, rel_path)
-            if not os.path.exists(candidate):
+            if not _existing_path(candidate):
                 continue
             return EntityPathResolveResult(
                 repo_path=rel_path,

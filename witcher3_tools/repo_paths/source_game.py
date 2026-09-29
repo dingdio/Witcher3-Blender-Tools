@@ -87,14 +87,14 @@ def source_root_candidates_from_file(source_filepath, *, include_parents=False, 
         marker_idx = lowered.find(marker)
         if marker_idx >= 0:
             root = normalized[:marker_idx + len(marker) - 1]
-            if os.path.isdir(root):
+            if _existing_path(root):
                 roots.append(root)
 
     if include_parents:
         parent = os.path.dirname(normalized)
         previous = ""
         while parent and parent != previous:
-            if os.path.isdir(parent):
+            if _existing_path(parent):
                 roots.append(parent)
             previous = parent
             parent = os.path.dirname(parent)

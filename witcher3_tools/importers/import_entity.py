@@ -4070,7 +4070,8 @@ def inspect_entity_import_profile(entity):
 
     moving_component = _get_entry_attr(entity, "MovingPhysicalAgentComponent", None)
     moving_skeleton = str(_get_entry_attr(moving_component, "skeleton", "") or "").strip()
-    if moving_skeleton:
+    # "none" is the w3_types placeholder for an entity without a skeleton.
+    if moving_skeleton and moving_skeleton.lower() != "none":
         root_entry = moving_component
         root_component_type = _get_entry_component_type(moving_component, fallback="CMovingPhysicalAgentComponent")
         root_path_key = "skeleton"

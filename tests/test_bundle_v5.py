@@ -124,6 +124,22 @@ class BundleV5Tests(unittest.TestCase):
             self.assertEqual(item.page_offset, offset)
             self.assertEqual(item.date_string, "30/7/2026 19:15:10")
 
+    def test_pathhashes_skip_non_ascii_names(self):
+        # bob.bundle ships a name with a curly apostrophe; it must not abort the whole CSV.
+        names = (b"signs\\reginald\xe2\x80\x99s.w2mesh", b"gameplay\\after.w2ent")
+        rows = [name.ljust(256, b"\0") + bytes(48) for name in names]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "content" / "content0" / "bundles" / "bob.bundle"
+            path.parent.mkdir(parents=True)
+            path.write_bytes(_preamble(5, 304 * 2, 32 + 304 * 2) + b"".join(rows))
+
+            self.assertEqual(list(pathhash_module.hash_bundle_paths(path)), ["gameplay\\after.w2ent"])
+            csv_path = Path(temp_dir) / "pathhashes.csv"
+            pathhash_module.create_pathhashes(temp_dir, str(csv_path))
+            with csv_path.open(newline="") as csv_file:
+                self.assertEqual([row["Path"] for row in csv.DictReader(csv_file)], ["gameplay\\after.w2ent"])
+
 
 if __name__ == "__main__":
     unittest.main()

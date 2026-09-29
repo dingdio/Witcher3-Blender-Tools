@@ -4145,12 +4145,21 @@ def ensure_sound_wav(context, sound_abs_path: str, item_path: str) -> str:
         return output_wav
 
     import subprocess
+    import tempfile
+
+    # vgmstream reads "?" in -o as a wildcard and never returns on a \\?\ path.
+    temp_dir = tempfile.mkdtemp(prefix="w3_wav_") if output_wav.startswith("\\\\?\\") else ""
+    target_wav = os.path.join(temp_dir, "out.wav") if temp_dir else output_wav
 
     command = [vgmstream_path, "-i"]
     if sound_abs_path.lower().endswith(".bnk"):
         command.extend(["-s", "1"])
-    command.extend(["-o", output_wav, sound_abs_path])
+    command.extend(["-o", target_wav, sound_abs_path])
     completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    if temp_dir:
+        if os.path.exists(target_wav):
+            shutil.move(target_wav, output_wav)
+        shutil.rmtree(temp_dir, ignore_errors=True)
     if completed.returncode != 0 or not win_path_exists(output_wav):
         details = (completed.stderr or completed.stdout or "").strip()
         raise RuntimeError(details or f"vgmstream conversion failed with exit code {completed.returncode}")

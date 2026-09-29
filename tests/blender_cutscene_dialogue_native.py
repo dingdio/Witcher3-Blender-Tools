@@ -170,6 +170,8 @@ def assert_game_voice_picker(scene, ui_cutscene, ui_voice, import_cutscene):
     def fake_load(*args, **kwargs):
         load_calls.append((args, kwargs))
         scene.frame_set(0)
+        # The real loader fits the scene range to the lipsync strip.
+        scene.frame_start, scene.frame_end = 1, 116
         return SimpleNamespace()
 
     ui_voice.load_voice_and_lipsync = fake_load
@@ -239,6 +241,7 @@ def assert_game_voice_picker(scene, ui_cutscene, ui_voice, import_cutscene):
         line.speaker = "CIRI"
         line.text = ""
         scene.frame_set(73)
+        scene.frame_start, scene.frame_end = 0, 228
         execute_operator = SimpleNamespace(line_index=-1, report=lambda *args: reports.append(args))
         assert ui_cutscene.WITCH_OT_CutsceneDialogPickGameVoice.execute(
             execute_operator, bpy.context,
@@ -249,6 +252,7 @@ def assert_game_voice_picker(scene, ui_cutscene, ui_voice, import_cutscene):
         )
         assert (line.start_frame, line.end_frame) == (42, 87)
         assert scene.frame_current == 73
+        assert (scene.frame_start, scene.frame_end) == (0, 228)
         assert [kwargs["line_id"] for _args, kwargs in remove_calls[:2]] == ["111", "222"]
         assert all(
             kwargs["source_path"] == ui_cutscene._AUTHORED_DIALOG_SOURCE_PATH

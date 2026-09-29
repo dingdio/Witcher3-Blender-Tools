@@ -14,6 +14,7 @@ from .. import (
     get_all_addon_prefs,
     get_uncook_path,
 )
+from ..CR2W.common_blender import win_extended_path, win_path_isdir, win_safe_path
 from ..CR2W.witcher_cache import cache_meta
 from ..CR2W.witcher_cache.Bundles import BundleManager, LoadBundleManager
 from ..extension_paths import get_cache_root, get_dev_override
@@ -278,7 +279,7 @@ def _bundle_xml_cache_has_xml():
         return False
     return any(
         name.lower().endswith(".xml")
-        for _dirpath, _dirnames, names in os.walk(root)
+        for _dirpath, _dirnames, names in os.walk(win_extended_path(str(root)))
         for name in names
     )
 
@@ -815,10 +816,10 @@ def extract_categories_from_xml(folder_path):
     attrs_by_item = {}
     bodypart_index = build_geralt_bodypart_template_index(folder_path)
 
-    if not folder_path or not os.path.isdir(folder_path):
+    if not folder_path or not win_path_isdir(folder_path):
         return [], categories, attrs_by_item
 
-    for dirpath, dirnames, file_names in os.walk(folder_path):
+    for dirpath, dirnames, file_names in os.walk(win_extended_path(folder_path)):
         dirnames.sort()
         for file_name in sorted(file_names):
             if not file_name.lower().endswith(".xml"):
@@ -1039,9 +1040,6 @@ def extract_equipment_xmls_from_bundles(force_refresh=False):
             continue
 
         found += 1
-        export_dir = os.path.dirname(export_path)
-        if export_dir:
-            os.makedirs(export_dir, exist_ok=True)
         try:
             final_item.extract_to_file(export_path)
             extracted_files.add(rel_key.replace("\\", "/"))
@@ -1137,7 +1135,7 @@ def get_equipment_xml_sources(context, addon_prefs, force_bundle_refresh=False):
         if norm in seen:
             continue
         seen.add(norm)
-        result.append((label, path, os.path.isdir(path)))
+        result.append((label, path, win_path_isdir(path)))
     return result
 
 
@@ -1229,7 +1227,7 @@ def strip_duplicate_xml_attributes(xml_text):
 def is_plaintext_xml_candidate(file_path):
     """Return False for packed/binary files that use an .xml extension."""
     try:
-        with open(file_path, "rb") as f:
+        with open(win_safe_path(file_path), "rb") as f:
             raw = f.read(512)
     except Exception:
         return True
@@ -1272,6 +1270,7 @@ def parse_xml_text_with_game_fallbacks(text):
 
 
 def parse_xml_root_with_fallbacks(file_path):
+    file_path = win_safe_path(file_path)
     try:
         return ET.parse(file_path).getroot()
     except (ET.ParseError, ValueError) as first_exc:

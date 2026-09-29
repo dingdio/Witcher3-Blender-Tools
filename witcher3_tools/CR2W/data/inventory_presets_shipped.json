@@ -3036,6 +3036,74 @@
       "source_game": "w3"
     },
     {
+      "id": "shipped_outfit_scarlet_crest",
+      "name": "Scarlet Crest Armor Set",
+      "source": "shipped",
+      "entries": [
+        {
+          "category": "pants",
+          "item": "Scarlet Crest Trousers",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Scarlet Crest Trousers"
+          },
+          "equip_template": "l_01_mg__w3r_fire",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\legs\\scarlet\\l_01_mg__w3r_fire.w2ent",
+          "bodypart_set_folder": "scarlet",
+          "xml_source_path": "gameplay\\items\\w3r_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "armor",
+          "item": "Scarlet Crest Armor",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Scarlet Crest Armor"
+          },
+          "equip_template": "t_01_mg__w3r_fire",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\trunk\\scarlet\\t_01_mg__w3r_fire.w2ent",
+          "bodypart_set_folder": "scarlet",
+          "xml_source_path": "gameplay\\items\\w3r_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "gloves",
+          "item": "Scarlet Crest Gauntlets",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Scarlet Crest Gauntlets"
+          },
+          "equip_template": "g_01_mg__w3r_fire",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\gloves\\scarlet\\g_01_mg__w3r_fire.w2ent",
+          "bodypart_set_folder": "scarlet",
+          "xml_source_path": "gameplay\\items\\w3r_items.xml",
+          "source_game": "w3"
+        },
+        {
+          "category": "boots",
+          "item": "Scarlet Crest Boots",
+          "quantity": 1,
+          "isMount": true,
+          "isLootable": false,
+          "initializer": {
+            "itemName": "Scarlet Crest Boots"
+          },
+          "equip_template": "s_01_mg__w3r_fire",
+          "bodypart_entity_path": "items\\bodyparts\\geralt_items\\shoes\\scarlet\\s_01_mg__w3r_fire.w2ent",
+          "bodypart_set_folder": "scarlet",
+          "xml_source_path": "gameplay\\items\\w3r_items.xml",
+          "source_game": "w3"
+        }
+      ],
+      "source_game": "w3"
+    },
+    {
       "id": "shipped_bodyparts_common_light_level_1",
       "name": "Common Light - Level 1",
       "source": "shipped",

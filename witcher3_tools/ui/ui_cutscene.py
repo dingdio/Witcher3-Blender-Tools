@@ -23,6 +23,7 @@ from bpy_extras.io_utils import ImportHelper
 from .. import dialog_language
 from .. import get_tts_command, get_uncook_path
 from ..CR2W import w3_types
+from ..CR2W.common_blender import win_path_getmtime, win_path_isfile
 from ..importers import import_cutscene
 from ..exporters import export_anims, export_cutscene
 from ..animation import cutscene_bake
@@ -2129,6 +2130,7 @@ def load_authored_cutscene_game_line(context, line_index=None, cleanup=True):
 
     frame_current = int(getattr(scene, "frame_current", 0) or 0)
     frame_subframe = float(getattr(scene, "frame_subframe", 0.0) or 0.0)
+    frame_range = (scene.frame_start, scene.frame_end)
     try:
         return load_voice_and_lipsync(
             voice_line_id,
@@ -2141,6 +2143,8 @@ def load_authored_cutscene_game_line(context, line_index=None, cleanup=True):
             nla_track=_authored_cutscene_dialog_nla_track(preview_line_id),
         )
     finally:
+        # The voice loader fits the scene range to the lipsync strip.
+        scene.frame_start, scene.frame_end = frame_range
         scene.frame_set(frame_current, subframe=frame_subframe)
 
 
@@ -3204,7 +3208,7 @@ def _update_cutscene_preview(operator):
         return True
 
     try:
-        mtime = os.path.getmtime(filepath)
+        mtime = win_path_getmtime(filepath)
     except OSError:
         _clear_cutscene_preview(operator)
         operator.cutscene_preview_path = filepath
@@ -4367,7 +4371,7 @@ def _retag_clip_group(group, source_index, *, source_path=""):
 
 def _file_animation_names_by_index(scene):
     filepath = str(getattr(scene, "witcher_loaded_w2cutscene_path", "") or "").strip()
-    if not filepath or not os.path.isfile(filepath):
+    if not filepath or not win_path_isfile(filepath):
         return None
     try:
         _cutscene, _actors, animations, _events = import_cutscene.collect_cutscene_preview(filepath)

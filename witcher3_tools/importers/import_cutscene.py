@@ -8,7 +8,7 @@ from ..CR2W.prop_utils import read_enum_prop
 from ..importers import import_entity
 from ..animation.action_compat import iter_action_fcurves, remove_action_fcurve
 from ..CR2W.dc_anims import load_bin_cutscene
-from ..CR2W.common_blender import redkit_repo_context, win_path_isfile
+from ..CR2W.common_blender import redkit_repo_context, win_path_isfile, win_safe_path
 from ..repo_paths import (
     materialize_entity_repo_path,
     materialize_repo_path,
@@ -125,7 +125,7 @@ def loadCutsceneFile(filename):
     if not ext.lower().endswith('.w2cutscene'):
         return None
     try:
-        stat = os.stat(filename)
+        stat = os.stat(win_safe_path(filename))
         cache_key = (os.path.normcase(os.path.abspath(filename)), stat.st_mtime_ns, stat.st_size)
     except OSError:
         cache_key = None

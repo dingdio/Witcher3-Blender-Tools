@@ -11,7 +11,14 @@ log = logging.getLogger(__name__)
 import os
 from pathlib import Path
 
-from .common_blender import get_repo_resolution_context, repo_file, redkit_repo_context
+from .common_blender import (
+    get_repo_resolution_context,
+    repo_file,
+    redkit_repo_context,
+    win_path_exists,
+    win_path_isfile,
+    win_safe_path,
+)
 from .CR2W_file import create_level, read_CR2W
 from .CR2W_types import Entity_Type_List, getCR2W, is_entity_chunk
 from .bStream import bStream, bReadStream
@@ -89,7 +96,7 @@ def _dependencies_current(dependencies):
             current = memo[1]
         else:
             try:
-                stat = os.stat(path)
+                stat = os.stat(win_safe_path(path))
                 current = (
                     int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
                     int(stat.st_size),
@@ -108,7 +115,7 @@ def _template_file_signature(path_value):
         return "file", "", 0, 0
     path = os.path.normcase(os.path.normpath(os.path.abspath(raw_path)))
     try:
-        stat = os.stat(path)
+        stat = os.stat(win_safe_path(path))
         return (
             "file",
             path,
@@ -332,7 +339,7 @@ def _candidate_import_indices(import_index):
 def _template_cache_key(template_filename: str, game_version=None):
     path = os.path.normcase(os.path.normpath(os.path.abspath(str(template_filename or ""))))
     try:
-        stat = os.stat(path)
+        stat = os.stat(win_safe_path(path))
         file_identity = (
             int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))),
             int(stat.st_size),
@@ -439,7 +446,7 @@ def _repo_path_exists(chunk, repo_path: str) -> bool:
     rel_path = repo_path.replace("/", "\\").lstrip("\\")
     source_roots = _source_repo_roots_for_chunk(chunk)
     for root in source_roots:
-        if os.path.exists(os.path.join(root, rel_path)):
+        if win_path_exists(os.path.join(root, rel_path)):
             return True
     if version <= 115 and source_roots:
         return False
@@ -447,7 +454,7 @@ def _repo_path_exists(chunk, repo_path: str) -> bool:
         resolved = repo_file(repo_path, version)
     except Exception:
         resolved = ""
-    if resolved and os.path.exists(resolved):
+    if resolved and win_path_exists(resolved):
         return True
     return False
 
@@ -732,13 +739,13 @@ def _resolve_w2_related_full_path(cr2w_file, repo_path: str):
         candidate = os.path.join(root, rel_path)
         if not fallback:
             fallback = candidate
-        if os.path.exists(candidate):
+        if win_path_exists(candidate):
             return candidate
     try:
         candidate = repo_file(repo_path, version)
     except Exception:
         candidate = ""
-    if candidate and os.path.exists(candidate):
+    if candidate and win_path_exists(candidate):
         return candidate
     return candidate or fallback or str(repo_path)
 
@@ -1677,12 +1684,12 @@ def read_entity_template_appearance_metadata(template_filename: str):
         return copy.deepcopy(empty_result)
 
     if os.path.isabs(template_filename):
-        if not os.path.exists(template_filename):
+        if not win_path_exists(template_filename):
             return copy.deepcopy(empty_result)
         resolved_path = template_filename
     else:
         resolved_path = materialize_entity_repo_path(template_filename)
-        if not resolved_path or not os.path.isabs(resolved_path) or not os.path.exists(resolved_path):
+        if not resolved_path or not os.path.isabs(resolved_path) or not win_path_exists(resolved_path):
             return copy.deepcopy(empty_result)
 
     def _append_name(target, seen, value):
@@ -1767,7 +1774,7 @@ def read_entity_template_appearance_metadata(template_filename: str):
                                 depot_path,
                                 version=getattr(getattr(owner_file, "HEADER", None), "version", 999),
                             )
-                            if not include_path or not os.path.exists(include_path):
+                            if not include_path or not win_path_exists(include_path):
                                 complete = False
                                 continue
                             norm_include_path = os.path.normcase(os.path.normpath(include_path))
@@ -2808,7 +2815,7 @@ def _w2_head_parent_slot_name(chunks):
 
 def _w2_embedded_skeleton_data_for_plan(cr2w_file, chunk_index):
     source_path = str(getattr(cr2w_file, "fileName", "") or "").strip()
-    if not source_path or not os.path.isfile(source_path):
+    if not source_path or not win_path_isfile(source_path):
         return None
     try:
         chunk_index = int(chunk_index)
@@ -2819,7 +2826,7 @@ def _w2_embedded_skeleton_data_for_plan(cr2w_file, chunk_index):
     try:
         from .dc_skeleton import _read_w2_mimic_skeleton, read_skelly
 
-        with open(source_path, "rb") as source_file:
+        with open(win_safe_path(source_path), "rb") as source_file:
             raw_data = source_file.read()
         chunks = list(getattr(getattr(cr2w_file, "CHUNKS", None), "CHUNKS", None) or [])
         for candidate_index in dict.fromkeys((chunk_index, chunk_index - 1)):
@@ -3217,7 +3224,7 @@ def _switchable_foliage_entries(w2sf_repo_path):
     entries = {}
     try:
         abs_path = repo_file(w2sf_repo_path)
-        if abs_path and os.path.isfile(abs_path):
+        if abs_path and win_path_isfile(abs_path):
             from .dc_environment import resource_path as _handle_resource_path
             w2sf = read_CR2W(abs_path)
             for res_chunk in w2sf.CHUNKS.CHUNKS:
@@ -3535,7 +3542,7 @@ def ReadTemplate(CR2W_FILE, new_mesh, this_Entity = None) -> ModelEnt:
     return new_mesh, this_Entity
 
 def LoadCEntityTemplateFile(templateFilename: str, game_version=None) -> ModelEnt:
-    if os.path.isabs(templateFilename) and os.path.exists(templateFilename):
+    if os.path.isabs(templateFilename) and win_path_exists(templateFilename):
         file_name_full = templateFilename
     else:
         file_name_full = materialize_entity_repo_path(templateFilename, version=game_version)
@@ -5570,7 +5577,7 @@ def create_CEntity(
     return this_Entity
 
 def load_bin_entity(fileName) -> w3_types.Entity:
-    with open(fileName,"rb") as f:
+    with open(win_safe_path(fileName),"rb") as f:
         theFile = getCR2W(f)
         f.close()
         with redkit_repo_context(fileName):

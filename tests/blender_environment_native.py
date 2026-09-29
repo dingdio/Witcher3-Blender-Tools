@@ -83,6 +83,8 @@ def main() -> None:
         water_object.data.materials.append(water_material)
 
         from witcher3_tools.importers import import_environment
+        # This run covers the no-stars path; a machine with game files would find the default cubemap.
+        import_environment._load_stars_image = lambda *_args, **_kwargs: (None, "")
         from witcher3_tools.environment_catalog import ENVIRONMENT_OFF_IDENTIFIER
         from witcher3_tools.ui import ui_environment
 
@@ -133,22 +135,25 @@ def main() -> None:
 
         from witcher3_tools.importers import environment_balance_preview
 
-        balance_image = bpy.data.images.new("Environment Balance Bloom Smoke", 8, 8)
-        balance_tree = environment_balance_preview._build_tree(
-            balance_image,
-            {"exposure": 0.0},
-            1.0,
-            1.0,
-            0.0,
-            (0.22, 0.30, 0.10, 0.20, 0.01, 0.30),
-            1.0,
-        )
-        try:
-            assert not any(node.type == "GLARE" for node in balance_tree.nodes)
-            assert len({node.location.x for node in balance_tree.nodes}) > 1
-        finally:
-            bpy.data.node_groups.remove(balance_tree)
-            bpy.data.images.remove(balance_image)
+        # The balance preview needs the compositor data-block API (Blender 5.0+).
+        has_balance_preview = hasattr(scene, "compositing_node_group")
+        if has_balance_preview:
+            balance_image = bpy.data.images.new("Environment Balance Bloom Smoke", 8, 8)
+            balance_tree = environment_balance_preview._build_tree(
+                balance_image,
+                {"exposure": 0.0},
+                1.0,
+                1.0,
+                0.0,
+                (0.22, 0.30, 0.10, 0.20, 0.01, 0.30),
+                1.0,
+            )
+            try:
+                assert not any(node.type == "GLARE" for node in balance_tree.nodes)
+                assert len({node.location.x for node in balance_tree.nodes}) > 1
+            finally:
+                bpy.data.node_groups.remove(balance_tree)
+                bpy.data.images.remove(balance_image)
 
         class ScalarCurve:
             is_scalar = True
@@ -780,41 +785,40 @@ def main() -> None:
 
         # Reloading Python loses the in-memory balance-preview state. A tagged
         # compositor left in the .blend must still be removable on the fast path.
-        from witcher3_tools.importers import environment_balance_preview
-
-        orphan_scene = bpy.data.scenes.new("Environment Balance Orphan Smoke")
-        orphan_tree = bpy.data.node_groups.new(
-            "Environment Balance Orphan Smoke",
-            "CompositorNodeTree",
-        )
-        previous_tree = bpy.data.node_groups.new(
-            "Environment Balance Previous Smoke",
-            "CompositorNodeTree",
-        )
-        orphan_tree_name = orphan_tree.name
-        orphan_tree[environment_balance_preview._OWNER_PROP] = True
-        orphan_scene[environment_balance_preview._PREVIOUS_TREE_PROP] = previous_tree.name
-        orphan_scene[environment_balance_preview._VIEW_SETTINGS_PROP] = {
-            "view_transform": "AgX",
-            "look": "None",
-            "exposure": 0.25,
-            "gamma": 1.0,
-            "use_curve_mapping": False,
-            "use_white_balance": False,
-        }
-        orphan_scene.view_settings.view_transform = "Standard"
-        orphan_scene.compositing_node_group = orphan_tree
-        orphan_context = SimpleNamespace(
-            scene=orphan_scene,
-            window_manager=bpy.context.window_manager,
-        )
-        assert environment_balance_preview.clear_balance_preview(orphan_context)
-        assert orphan_scene.compositing_node_group is previous_tree
-        assert orphan_scene.view_settings.view_transform == "AgX"
-        assert abs(orphan_scene.view_settings.exposure - 0.25) < 1e-6
-        assert orphan_tree_name not in bpy.data.node_groups
-        bpy.data.scenes.remove(orphan_scene)
-        bpy.data.node_groups.remove(previous_tree)
+        if has_balance_preview:
+            orphan_scene = bpy.data.scenes.new("Environment Balance Orphan Smoke")
+            orphan_tree = bpy.data.node_groups.new(
+                "Environment Balance Orphan Smoke",
+                "CompositorNodeTree",
+            )
+            previous_tree = bpy.data.node_groups.new(
+                "Environment Balance Previous Smoke",
+                "CompositorNodeTree",
+            )
+            orphan_tree_name = orphan_tree.name
+            orphan_tree[environment_balance_preview._OWNER_PROP] = True
+            orphan_scene[environment_balance_preview._PREVIOUS_TREE_PROP] = previous_tree.name
+            orphan_scene[environment_balance_preview._VIEW_SETTINGS_PROP] = {
+                "view_transform": "AgX",
+                "look": "None",
+                "exposure": 0.25,
+                "gamma": 1.0,
+                "use_curve_mapping": False,
+                "use_white_balance": False,
+            }
+            orphan_scene.view_settings.view_transform = "Standard"
+            orphan_scene.compositing_node_group = orphan_tree
+            orphan_context = SimpleNamespace(
+                scene=orphan_scene,
+                window_manager=bpy.context.window_manager,
+            )
+            assert environment_balance_preview.clear_balance_preview(orphan_context)
+            assert orphan_scene.compositing_node_group is previous_tree
+            assert orphan_scene.view_settings.view_transform == "AgX"
+            assert abs(orphan_scene.view_settings.exposure - 0.25) < 1e-6
+            assert orphan_tree_name not in bpy.data.node_groups
+            bpy.data.scenes.remove(orphan_scene)
+            bpy.data.node_groups.remove(previous_tree)
 
         # An edit after the last refresh must win over managed restoration.
         import_environment._ensure_view_exposure(scene, 0.5)

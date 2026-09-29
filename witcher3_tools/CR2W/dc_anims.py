@@ -1893,7 +1893,7 @@ def _read_buffered_cutscene_events(chunk_set, cr2w_file):
         return []
 
     try:
-        with open(file_name, "rb") as f:
+        with open(win_safe_path(file_name), "rb") as f:
             f.seek(last_prop_end)
             if f.tell() + 2 > class_end:
                 return []
@@ -1950,7 +1950,7 @@ def _read_cutscene_entry_events(entry_chunk, cr2w_file):
         return []
 
     try:
-        with open(file_name, "rb") as f:
+        with open(win_safe_path(file_name), "rb") as f:
             f.seek(last_prop_end)
             if f.tell() + 2 > class_end:
                 return []
@@ -2160,7 +2160,7 @@ _RIG_NAMING_INFO_CACHE = {}
 def _rig_naming_info(rigPath):
     """Return cached rig bone/track naming metadata."""
     try:
-        stat = os.stat(rigPath)
+        stat = os.stat(win_safe_path(rigPath))
         cache_key = (os.path.normcase(os.path.abspath(rigPath)), stat.st_mtime_ns, stat.st_size)
     except OSError:
         cache_key = None

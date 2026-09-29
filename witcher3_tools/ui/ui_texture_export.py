@@ -10,6 +10,7 @@ from bpy.props import EnumProperty, PointerProperty, StringProperty
 from bpy_extras.io_utils import ExportHelper
 
 from .. import get_texture_path, get_uncook_path
+from ..CR2W.common_blender import win_path_isfile, win_safe_path
 from ..exporters.texture_groups import get_texture_group_enum_items, get_texture_group_info
 from .ui_mesh import _compute_full_export_path, _get_active_redkit_project, _get_workspace_root
 
@@ -112,7 +113,7 @@ def _find_metadata_xbm_path(filepath: str) -> str:
         return normalized_path
 
     xbm_path = base + ".xbm"
-    return xbm_path if os.path.isfile(xbm_path) else ""
+    return xbm_path if win_path_isfile(xbm_path) else ""
 
 
 def _derive_texture_repo_path(context, filepath: str) -> str:
@@ -143,7 +144,7 @@ def resolve_texture_image_metadata(context, source_path, *, repo_path="", textur
     resolved_texture_group = texture_group or "Default"
     xbm_path = _find_metadata_xbm_path(normalized_path)
 
-    if xbm_path and os.path.isfile(xbm_path):
+    if xbm_path and win_path_isfile(xbm_path):
         derived_repo_path = _derive_texture_repo_path(context, xbm_path)
         if derived_repo_path:
             resolved_repo_path = derived_repo_path
@@ -188,7 +189,7 @@ def read_xbm_texture_group(filepath: str) -> str:
     from ..CR2W.CR2W_types import getCR2W
 
     try:
-        with open(filepath, "rb") as handle:
+        with open(win_safe_path(filepath), "rb") as handle:
             cr2w = getCR2W(handle)
     except Exception:
         return "Default"

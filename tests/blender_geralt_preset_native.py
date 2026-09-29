@@ -46,6 +46,16 @@ try:
     ec._CATEGORY_CACHE_FILE = sandbox / "equipment_categories.json"
     ec.reset_w3_category_cache_runtime()
 
+    # Remembered operator props would retarget the Inventory tab picker/apply buttons.
+    for op_name, prop in (
+        ("equipment_select_inventory_preset", "target"),
+        ("equipment_clear_inventory_preset", "target"),
+        ("equipment_apply_inventory_preset", "preset_id"),
+        ("equipment_apply_inventory_preset", "source_game"),
+    ):
+        rna = getattr(bpy.ops.witcher, op_name).get_rna_type()
+        assert rna.properties[prop].is_skip_save, f"{op_name}.{prop} must be SKIP_SAVE"
+
     result = bpy.ops.witcher.import_geralt(inventory_preset_id="__none__")
     assert result == {'FINISHED'}, result
 

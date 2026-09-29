@@ -34,10 +34,15 @@ def hash_bundle_paths(filename):
         for _ in range(files_offset // entry_size):
             str_data = f.read(256)
             str_data = str_data.split(b"\x00", 1)[0]
-            path = str_data.decode('ascii')
+            f.seek(entry_size - 256, 1)
+            try:
+                path = str_data.decode('ascii')
+            except UnicodeDecodeError:
+                # Vanilla bob.bundle ships one name with a curly apostrophe.
+                log.debug("Skipping non-ASCII bundle path in %s: %r", filename, str_data)
+                continue
             hashint = fnv1a64(path)
             filenames.update({path: hashint})
-            f.seek(entry_size - 256, 1)
     return filenames
 
 

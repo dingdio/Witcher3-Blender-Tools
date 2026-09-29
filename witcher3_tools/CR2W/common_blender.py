@@ -1508,7 +1508,7 @@ def repo_collision_file(mesh_filepath: str) -> str:
         output_path = output_path + '.nxs'
 
     # Extract if not already present
-    if not os.path.exists(output_path):
+    if not os.path.exists(win_safe_path(output_path)):
         try:
             extracted_path = item.extract_to_file(output_path)
             log.info("Extracted collision file: %s", extracted_path)
@@ -1548,7 +1548,7 @@ def repo_collision_file_with_poses(mesh_filepath: str):
     if not output_path.endswith('.nxs'):
         output_path = output_path + '.nxs'
 
-    if not os.path.exists(output_path):
+    if not os.path.exists(win_safe_path(output_path)):
         try:
             extracted_path = item.extract_to_file(output_path)
             log.info("Extracted collision file: %s", extracted_path)

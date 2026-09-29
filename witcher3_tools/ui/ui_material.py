@@ -246,7 +246,7 @@ def _read_w2cube_chunk_metadata(path: str):
     """Read CCubeTexture metadata from cooked or uncooked .w2cube using CR2W parser."""
     meta = {
         "source_path": path,
-        "exists": os.path.exists(path),
+        "exists": os.path.exists(win_safe_path(path)),
         "ccube_texture": None,
         "cube_faces": {},
         "has_face_metadata": False,
@@ -259,7 +259,7 @@ def _read_w2cube_chunk_metadata(path: str):
         return meta
 
     try:
-        with open(path, "rb") as f:
+        with open(win_safe_path(path), "rb") as f:
             cr2w = getCR2W(f)
     except Exception as e:
         meta["errors"].append(f"parse_failed: {e}")
@@ -453,7 +453,7 @@ def _find_uncooked_w2cube_rgba8_payload_layout(raw: bytes):
 def _is_probable_uncooked_w2cube_raw_tail_file(path: str) -> bool:
     """Fast content-based probe so uncooked files don't go through slow CR2W parsing."""
     try:
-        raw = Path(path).read_bytes()
+        raw = Path(win_safe_path(path)).read_bytes()
     except Exception:
         return False
     # Try several plausible raw-tail payload layouts used by uncooked cubemaps:
@@ -657,7 +657,7 @@ def _read_uncooked_w2cube_raw_faces(path: str):
     This bypasses the CR2W parser and uses the observed layout:
       [CR2W header/metadata][6 x RGBA8 cubemap faces with full mip chains]
     """
-    raw = Path(path).read_bytes()
+    raw = Path(win_safe_path(path)).read_bytes()
     if b"CCubeTexture" not in raw[:4096]:
         raise ValueError("Not an uncooked CCubeTexture source (CCubeTexture marker not found near file start)")
     if b"CBitmapTexture" not in raw[:4096]:
@@ -768,7 +768,7 @@ def _parse_rgba8_cubemap_dds_top_faces(dds_path: str):
     Returns `None` if the DDS is not a legacy uncompressed 32-bit cubemap.
     """
     try:
-        raw = Path(dds_path).read_bytes()
+        raw = Path(win_safe_path(dds_path)).read_bytes()
     except Exception:
         return None
     if len(raw) < 128 or raw[:4] != b"DDS ":
@@ -828,7 +828,7 @@ def _parse_rgba8_cubemap_dds_top_faces(dds_path: str):
 def _parse_block_compressed_cubemap_dds_top_faces(dds_path: str):
     """Return `(width, height, eformat, {face_key: bytes})` for BC cubemap DDS (top mip only)."""
     try:
-        raw = Path(dds_path).read_bytes()
+        raw = Path(win_safe_path(dds_path)).read_bytes()
     except Exception:
         return None
     if len(raw) < 128 or raw[:4] != b"DDS ":

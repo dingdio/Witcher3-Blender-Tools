@@ -8429,6 +8429,11 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
             full_path = _anim_compute_full_export_path(workspace_root, repo_path)
             if full_path:
                 self.filepath = _normalize_w2cutscene_export_path(full_path)
+                # A missing folder makes the file browser open (and export) one level up.
+                try:
+                    os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
+                except OSError:
+                    log.debug("Could not create cutscene export folder", exc_info=True)
                 return ExportHelper.invoke(self, context, event)
 
         loaded_path = getattr(scene, "witcher_loaded_w2cutscene_path", "")

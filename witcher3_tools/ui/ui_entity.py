@@ -37,6 +37,8 @@ from ..read_game_bin import (
 from ..CR2W.common_blender import (
     mod_loading_context,
     win_safe_path,
+    win_path_exists,
+    win_path_getmtime,
     win_path_isfile,
     win_path_isdir,
     win_unprefix_path,
@@ -429,7 +431,7 @@ def _collect_inventory_preview(filepath):
 
 def _update_inventory_preview(self):
     filepath = self.filepath
-    if not filepath or not os.path.isfile(filepath):
+    if not filepath or not win_path_isfile(filepath):
         self.inventory_preview_items.clear()
         self.inventory_preview_status = "Select a .w2ent file"
         self.inventory_preview_path = ""
@@ -444,7 +446,7 @@ def _update_inventory_preview(self):
         return False
 
     try:
-        mtime = os.path.getmtime(filepath)
+        mtime = win_path_getmtime(filepath)
     except Exception:
         mtime = 0.0
 
@@ -810,7 +812,7 @@ def _import_standalone_item(context, category, item_name, template, result):
                 resolved_entity.repo_path,
                 source_game=source_game,
             )
-            if os.path.exists(export_path):
+            if win_path_exists(export_path):
                 return _import_standalone_entity_file(export_path, template, result)
 
         search_pattern = "\\" + template + ".w2ent"
@@ -829,7 +831,7 @@ def _import_standalone_item(context, category, item_name, template, result):
             return False
 
         export_path = materialize_entity_repo_path(final_item.name, source_game="w3")
-        if not os.path.exists(export_path):
+        if not win_path_exists(export_path):
             final_item.extract_to_file(export_path)
 
         if not _import_standalone_entity_file(export_path, template, result):
@@ -977,7 +979,7 @@ class _W2EntImportOperatorMixin:
         )
         if metadata_ready:
             metadata = _load_entity_appearance_metadata_json(prev_json)
-        elif os.path.isfile(filepath) and filepath.lower().endswith((".w2ent", ".w2ent.json")):
+        elif win_path_isfile(filepath) and filepath.lower().endswith((".w2ent", ".w2ent.json")):
             metadata = import_entity.get_entity_appearance_metadata(filepath)
         metadata = _normalize_entity_appearance_metadata(metadata)
         next_json = _entity_appearance_metadata_json(metadata)
@@ -1017,7 +1019,7 @@ class _W2EntImportOperatorMixin:
         _changed, metadata = self._refresh_appearance_metadata()
 
         if not (
-            os.path.isfile(self.filepath)
+            win_path_isfile(self.filepath)
             and self.filepath.lower().endswith((".w2ent", ".w2ent.json"))
         ):
             layout.label(text="Selected file is not an entity file.", icon='ERROR')
@@ -1437,7 +1439,7 @@ class WITCH_OT_ENTITY_import_geralt(bpy.types.Operator):
         with mod_loading_context(context):
             rel_path = "gameplay\\templates\\characters\\player\\player.w2ent"
             uncook_path = os.path.join(get_uncook_path(context), rel_path)
-            use_uncook_file = os.path.exists(uncook_path)
+            use_uncook_file = win_path_exists(uncook_path)
 
             if not use_uncook_file:
                 _ensure_witcher3_game_path_initialized(context)
@@ -1456,7 +1458,7 @@ class WITCH_OT_ENTITY_import_geralt(bpy.types.Operator):
 
             # 2. Import Geralt with slots and default equipment
             path = uncook_path if use_uncook_file else materialize_entity_repo_path(rel_path, source_game="w3")
-            if not os.path.exists(path):
+            if not win_path_exists(path):
                 self.report({'ERROR'}, f"player.w2ent not found and could not be extracted at: {path}")
                 return {'CANCELLED'}
 
@@ -1506,7 +1508,7 @@ class WITCH_OT_ENTITY_import_ciri(bpy.types.Operator):
         with mod_loading_context(context):
             rel_path = "gameplay\\templates\\characters\\player\\ciri_player.w2ent"
             uncook_path = os.path.join(get_uncook_path(context), rel_path)
-            use_uncook_file = os.path.exists(uncook_path)
+            use_uncook_file = win_path_exists(uncook_path)
 
             if not use_uncook_file:
                 _ensure_witcher3_game_path_initialized(context)
@@ -1517,7 +1519,7 @@ class WITCH_OT_ENTITY_import_ciri(bpy.types.Operator):
                     return {'CANCELLED'}
 
             path = uncook_path if use_uncook_file else materialize_entity_repo_path(rel_path, source_game="w3")
-            if not os.path.exists(path):
+            if not win_path_exists(path):
                 self.report({'ERROR'}, f"ciri_player.w2ent not found and could not be extracted at: {path}")
                 return {'CANCELLED'}
 
@@ -1932,9 +1934,9 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
                 if anim_path and ":" not in anim_path:
                     fdir = repo_file_for_source(anim_path, source_game)  # Extract if available.
                     log.debug("Loading anims from: %s", fdir)
-                    if fdir and os.path.exists(fdir + '.json'):
+                    if fdir and win_path_exists(fdir + '.json'):
                         fdir = fdir + '.json'
-                    if not fdir or not os.path.exists(fdir):
+                    if not fdir or not win_path_exists(fdir):
                         roots = "; ".join(source_roots(context, source_game)) or "<no configured roots>"
                         self.report({'ERROR'}, f"Animation set not found for {source_game.upper()}: {anim_path}")
                         self.report({'WARNING'}, f"Checked roots: {roots}")

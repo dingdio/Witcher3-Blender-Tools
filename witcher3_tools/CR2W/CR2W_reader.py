@@ -1,7 +1,7 @@
 #import CR2W_file
 import os
 
-from .common_blender import repo_file
+from .common_blender import repo_file, win_path_exists
 from . import CR2W_file
 
 
@@ -75,7 +75,7 @@ import os
 def load_material(fileName_in = False):
     if fileName_in:
         fileName = fileName_in
-    if not os.path.exists(fileName):
+    if not win_path_exists(fileName):
         return []
     CR2WFile = CR2W_file.read_CR2W(fileName)
     #data = CR2W_file.create_level(CR2WFile, fileName)

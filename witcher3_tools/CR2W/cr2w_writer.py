@@ -12,49 +12,56 @@ DEADBEEF = 0xDEADBEEF
 
 
 def _ensure_parent_dir(file_path):
-    """Ensure the parent directory of file_path exists."""
+    """Ensure the parent directory exists; return the long-path-safe file path."""
+    try:
+        from .common_blender import win_safe_path
+    except Exception:
+        pass
+    else:
+        file_path = win_safe_path(file_path)
     parent = os.path.dirname(file_path)
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
+    return file_path
 
 
 def write_w2mesh(cr2w, file_path):
-    _ensure_parent_dir(file_path)
+    file_path = _ensure_parent_dir(file_path)
     data = _build_cr2w_bytes(cr2w)
     with open(file_path, "wb") as f:
         f.write(data)
 
 
 def write_w2anims(cr2w, file_path):
-    _ensure_parent_dir(file_path)
+    file_path = _ensure_parent_dir(file_path)
     data = _build_cr2w_bytes(cr2w)
     with open(file_path, "wb") as f:
         f.write(data)
 
 
 def write_w2cutscene(cr2w, file_path):
-    _ensure_parent_dir(file_path)
+    file_path = _ensure_parent_dir(file_path)
     data = _build_cr2w_bytes(cr2w)
     with open(file_path, "wb") as f:
         f.write(data)
 
 
 def write_w2scene(cr2w, file_path):
-    _ensure_parent_dir(file_path)
+    file_path = _ensure_parent_dir(file_path)
     data = _build_cr2w_bytes(cr2w)
     with open(file_path, "wb") as f:
         f.write(data)
 
 
 def write_w2ent(cr2w, file_path):
-    _ensure_parent_dir(file_path)
+    file_path = _ensure_parent_dir(file_path)
     data = _build_cr2w_bytes(cr2w)
     with open(file_path, "wb") as f:
         f.write(data)
 
 
 def write_xbm(cr2w, file_path):
-    _ensure_parent_dir(file_path)
+    file_path = _ensure_parent_dir(file_path)
     data = _build_cr2w_bytes(cr2w)
     with open(file_path, "wb") as f:
         f.write(data)

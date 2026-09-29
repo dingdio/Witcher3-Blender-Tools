@@ -11,7 +11,7 @@ from ..CR2W.dc_anims import (
     load_bin_anims_info,
     load_w2_anims_info,
 )
-from ..CR2W.dc_w2_havok import W2_MIMIC_FLOATTRACKS_RIG
+from ..CR2W.dc_w2_havok import W2_MIMIC_FLOATTRACKS_RIG, is_w2_cr2w_version_file
 from ..CR2W.CR2W_helpers import Enums
 log = logging.getLogger(__name__)
 
@@ -2281,16 +2281,7 @@ def import_from_list_item(context, item, ANIMSET, target_obj=None, use_NLA=None,
 
 def _is_w2_cr2w_version(filename):
     """Check if a file is a Witcher 2 CR2W file (version <= 115)."""
-    try:
-        import struct
-        with open(filename, 'rb') as f:
-            magic = f.read(4)
-            if magic != b'CR2W':
-                return False
-            version = struct.unpack('<I', f.read(4))[0]
-            return version <= 115
-    except Exception:
-        return False
+    return is_w2_cr2w_version_file(filename)
 
 
 def import_w3_animSet(filename, rigPath = False)->w3_types.CSkeletalAnimationSet:

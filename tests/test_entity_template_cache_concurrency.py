@@ -21,7 +21,7 @@ class TemplateDependencyFreshnessTests(unittest.TestCase):
         cls.namespace = exec_functions(
             DC_ENTITY_PATH,
             {"_dependencies_current", "_template_file_signature"},
-            {"os": os, "time": time, "_dep_stat_memo": {}},
+            {"os": os, "time": time, "_dep_stat_memo": {}, "win_safe_path": lambda path: path},
         )
 
     def test_edited_file_dependency_goes_stale(self):

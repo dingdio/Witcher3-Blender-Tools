@@ -3447,7 +3447,7 @@ def _import_sector_w2mesh_collision(mesh, errors, parent_transform, **kwargs):
         return None
     if _is_missing_nxs(collision_path):
         return None
-    if not os.path.exists(collision_path):
+    if not os.path.exists(win_safe_path(collision_path)):
         _note_missing_nxs_once(collision_path, "Mesh collision")
         return None
 

@@ -95,7 +95,7 @@ def _load_material_root_chunk(material_path: str, version: int = 999):
         return cached
 
     full_path = repo_file(material_path, version=version)
-    if not os.path.exists(full_path):
+    if not os.path.exists(win_safe_path(full_path)):
         return None
 
     material_file_chunks = CR2W_reader.load_material(full_path)

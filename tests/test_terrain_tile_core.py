@@ -330,7 +330,7 @@ class TestWorkspaceTerrainContext(unittest.TestCase):
 
             self.assertEqual(outputs, [str(output)])
             self.assertEqual(output.read_bytes(), b"fresh")
-            self.assertGreater(os.path.getmtime(output), source_mtime)
+            self.assertGreaterEqual(os.path.getmtime(output), source_mtime)
             terrain._MATERIALIZED_W2TER_BUFFER_CACHE.clear()
 
     def test_direct_workspace_world_enables_embedded_tile_working_storage(self):

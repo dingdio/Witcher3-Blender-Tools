@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import struct
 
-from .bStream import bStream
+from .bStream import bStream, _win_safe_path
 from .witcher_cache.TextureCache.DDSUtils import DDSUtils
 from .witcher_cache.TextureCache.DDS_Metadata import DDSMetadata
 from .witcher_cache.TextureCache.DDS_Enums import EFormat
@@ -29,7 +29,7 @@ def swizzle_rgba8_bytes_to_bgra(raw_bytes: bytes) -> bytes:
 def write_dds_payload(dds_path: str, metadata: DDSMetadata, payload: bytes) -> str:
     dir_name = os.path.dirname(dds_path)
     if dir_name:
-        os.makedirs(dir_name, exist_ok=True)
+        os.makedirs(_win_safe_path(dir_name), exist_ok=True)
 
     output_stream = bStream(path=dds_path)
     output_stream.decoder = "ISO-8859-1"
@@ -174,12 +174,13 @@ def block_bytes_for_eformat(eformat: EFormat):
 
 def is_valid_dds_file(dds_path: str) -> bool:
     try:
-        if not dds_path or not os.path.exists(dds_path):
+        safe_path = _win_safe_path(dds_path)
+        if not dds_path or not os.path.exists(safe_path):
             return False
-        with open(dds_path, "rb") as handle:
+        with open(safe_path, "rb") as handle:
             header_data = handle.read(148)
         format_name, width, height, _mip_count, data_offset = dds_format_name_from_header(header_data)
-        file_size = os.path.getsize(dds_path)
+        file_size = os.path.getsize(safe_path)
         min_payload = dds_top_mip_size(format_name, width, height)
         return file_size >= (data_offset + min_payload)
     except Exception:

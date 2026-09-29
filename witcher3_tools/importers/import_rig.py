@@ -3,6 +3,7 @@ import json
 import math
 import copy
 from ..CR2W.CR2W_types import getCR2W
+from ..CR2W.common_blender import win_safe_path
 from ..CR2W.dc_skeleton import create_Skeleton, load_bin_face, load_bin_skeleton, load_bin_w2_faces
 
 from math import degrees
@@ -34,7 +35,7 @@ def _face_file_cache_key(filename):
         path = os.path.abspath(os.path.normpath(str(filename)))
     norm_path = os.path.normcase(path)
     try:
-        stat = os.stat(path)
+        stat = os.stat(win_safe_path(path))
         return (norm_path, stat.st_mtime_ns, stat.st_size), norm_path
     except OSError:
         return (norm_path, None, None), norm_path

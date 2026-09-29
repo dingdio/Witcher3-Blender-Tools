@@ -187,11 +187,10 @@ def load_w2cube_image(fdir, *, check_existing=True, colorspace='sRGB'):
 
     Returns `(image, dds_path)`. `image` can be `None` if conversion/load failed.
     """
-    import os as _os
-    from ..CR2W.common_blender import bpy_image_load_safe
+    from ..CR2W.common_blender import bpy_image_load_safe, win_path_exists
 
     dds_path = convert_w2cube_to_dds(fdir)
-    if not dds_path or not _os.path.exists(dds_path):
+    if not dds_path or not win_path_exists(dds_path):
         return None, dds_path
 
     img = bpy_image_load_safe(dds_path, check_existing=check_existing)
@@ -402,12 +401,12 @@ def load_w2cube_blick_equirect_image(fdir, *, check_existing=True, colorspace='s
 
     Returns `(image, dds_path)`. Falls back to `(None, dds_path)` on equirect build failure.
     """
-    import os as _os
     from pathlib import Path
+    from ..CR2W.common_blender import win_path_exists
 
     # Ensure the cubemap DDS exists first.
     _unused_img, dds_path = load_w2cube_image(fdir, check_existing=check_existing, colorspace=colorspace)
-    if not dds_path or not _os.path.exists(dds_path):
+    if not dds_path or not win_path_exists(dds_path):
         return None, dds_path
 
     # Reuse existing exported face files if present; otherwise export them.
@@ -417,7 +416,7 @@ def load_w2cube_blick_equirect_image(fdir, *, check_existing=True, colorspace='s
     for cube_face_key, face_name in _BLICK_EQ_CUBEMAP_FACE_TO_NAME.items():
         suffix = _BLICK_EQ_FACE_W2_SUFFIX[face_name]
         candidate = str(dds_parent / f"{dds_stem}__{suffix}.dds")
-        if _os.path.exists(candidate):
+        if win_path_exists(candidate):
             face_files[cube_face_key] = candidate
 
     if len(face_files) < 6:

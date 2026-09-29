@@ -15,7 +15,7 @@ W2_MIMIC_FLOATTRACKS_RIG = r"characters\templates\mimics\floattracks.w2rig"
 
 def is_w2_cr2w_version_file(file_name):
     try:
-        with open(file_name, "rb") as f:
+        with open(win_safe_path(file_name), "rb") as f:
             if f.read(4) != b"CR2W":
                 return False
             version = struct.unpack("<I", f.read(4))[0]

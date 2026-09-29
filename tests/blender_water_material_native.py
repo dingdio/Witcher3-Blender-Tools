@@ -23,7 +23,7 @@ def main() -> None:
     nodes = material.node_tree.nodes
 
     assert material is not user_material
-    assert user_material.node_tree.nodes.get("User Water Node") is user_node
+    assert user_material.node_tree.nodes.get("User Water Node") == user_node
     assert material.get("witcher_world_water_material") is True
     assert material.get("witcher_world_water_version") == 9
     surface = nodes["W3 Water Surface"]

@@ -1,5 +1,6 @@
 import struct
 import io
+import os
 import logging
 log = logging.getLogger(__name__)
 
@@ -33,16 +34,17 @@ class bReadStream(io.BytesIO):
         raise io.UnsupportedOperation("bReadStream is read-only")
 
 
-def open_cr2w_read_stream(path):
-    open_path = path
+def _win_safe_path(path):
     # Normalize long Windows paths only when Blender helpers are available.
     try:
         from .common_blender import win_safe_path
     except Exception:
-        pass
-    else:
-        open_path = win_safe_path(path)
-    with open(open_path, "rb") as fh:
+        return path
+    return win_safe_path(os.fspath(path))
+
+
+def open_cr2w_read_stream(path):
+    with open(_win_safe_path(path), "rb") as fh:
         data = fh.read()
     return bReadStream(data, name=path)
 
@@ -61,6 +63,7 @@ class bStream():
                 self.fhandle = reader
                 self.name = self.fhandle.name
             else:
+                path = _win_safe_path(path)
                 try:
                     self.fhandle = open(path, 'r+b')
                 except OSError:

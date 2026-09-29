@@ -7,7 +7,7 @@ import hashlib
 import os
 import struct
 
-from .bStream import bStream, bReadStream, open_cr2w_read_stream
+from .bStream import bStream, bReadStream, open_cr2w_read_stream, _win_safe_path
 from .CR2W_helpers import Enums
 from .CR2W_types import getCR2W
 from .texture_dds import (
@@ -137,10 +137,10 @@ def _find_witcher2_xbm_mip_table_start(data: bytes, start_offset: int, width: in
 
 def _convert_witcher2_xbm_to_dds_raw(fdir, dds_path, xbm_file, texture_chunk, force=False):
     """Convert old Witcher 2 XBM by extracting inline mip payloads from the parsed texture chunk."""
-    if os.path.exists(dds_path) and not force:
+    if os.path.exists(_win_safe_path(dds_path)) and not force:
         return dds_path
 
-    with open(fdir, "rb") as handle:
+    with open(_win_safe_path(fdir), "rb") as handle:
         data = handle.read()
 
     if len(data) < 44 or data[:4] != b"CR2W":
@@ -259,13 +259,13 @@ def convert_xbm_to_dds(fdir, force=False, out_path=None):
             else:
                 raise ValueError(f"Unknown DXT compression: {dxt}")
 
-        if os.path.exists(dds_path) and not force:
+        if os.path.exists(_win_safe_path(dds_path)) and not force:
             return dds_path
         br.seek(chunk.PROPS[-1].dataEnd)
 
         if xbmFile.HEADER.version <= 115:
             br.seek(27, 1)
-            with open(dds_path, 'wb') as new:
+            with open(_win_safe_path(dds_path), 'wb') as new:
                 new.write(ddsheader)
                 new.seek(0xC)
                 new.write(packed_height)
@@ -318,7 +318,7 @@ def convert_xbm_to_dds(fdir, force=False, out_path=None):
                 if metadata is not None:
                     write_dds_payload(dds_path, metadata, payload)
                 else:
-                    with open(dds_path, 'wb') as new:
+                    with open(_win_safe_path(dds_path), 'wb') as new:
                         new.write(ddsheader)
                         new.seek(0xC)
                         new.write(packed_height)
@@ -400,7 +400,7 @@ def _write_texture_array_slices(
     for slice_index, payload in enumerate(slice_payloads):
         output_path = f"{texarray_path}.texture_{slice_index}.dds"
         output_paths.append(output_path)
-        if os.path.exists(output_path) and not force and is_valid_dds_file(output_path):
+        if os.path.exists(_win_safe_path(output_path)) and not force and is_valid_dds_file(output_path):
             continue
         if eformat == EFormat.R8G8B8A8_UNORM:
             payload = swizzle_rgba8_bytes_to_bgra(payload)
@@ -472,13 +472,13 @@ def convert_texarray_to_dds(fdir: str, force: bool = False) -> list[str]:
     Returns paths named like `foo.texarray.texture_0.dds`. TextureCache is used
     first for full resolution; the embedded resident mips are used as fallback.
     """
-    if not fdir or not os.path.isfile(fdir):
+    if not fdir or not os.path.isfile(_win_safe_path(fdir)):
         return []
 
-    with open(fdir, "rb") as handle:
+    with open(_win_safe_path(fdir), "rb") as handle:
         file_bytes = handle.read()
 
-    with open(fdir, "rb") as handle:
+    with open(_win_safe_path(fdir), "rb") as handle:
         texarray_file = getCR2W(handle)
 
     br = bStream(data=file_bytes)
@@ -869,7 +869,7 @@ def convert_w2cube_to_dds(fdir):
     # metal1.w2cube) is referenced by many materials on one character; without
     # this guard every reference re-exported the DDS from scratch.
     dds_path = fdir.replace('.w2cube', '_cubemap.dds')
-    if os.path.exists(dds_path) and is_valid_dds_file(dds_path):
+    if is_valid_dds_file(dds_path):
         return dds_path
 
     # Cache .w2cube files that previously raised (e.g. uncooked source cubes like
@@ -890,7 +890,7 @@ _W2CUBE_CONVERT_FAILED = {}  # normalized .w2cube path -> exception raised on fi
 
 
 def _convert_w2cube_to_dds_impl(fdir, dds_path):
-    with open(fdir, "rb") as f:
+    with open(_win_safe_path(fdir), "rb") as f:
         file_bytes = f.read()
     file_size = len(file_bytes)
 
@@ -952,7 +952,7 @@ def _convert_w2cube_to_dds_impl(fdir, dds_path):
                     if items:
                         texture_item = items[-1]
                         texture_item.extract_to_file(dds_path)
-                        if os.path.exists(dds_path):
+                        if os.path.exists(_win_safe_path(dds_path)):
                             return dds_path
                 except Exception:
                     pass

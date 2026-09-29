@@ -244,7 +244,7 @@ try:
     )
     authored_anchor[ui_animated_component.P_ATTACHMENT_FLAGS] = 0
     authored_anchor[ui_animated_component.P_ATTACHMENT_RELATIVE] = json.dumps({"X": 0.5})
-    authored_mesh["witcher_component_transform"] = json.dumps({"Scale_x": 1.25})
+    authored_mesh.scale.x = 1.25
     attachments, skipped = ui_animated_component.collect_hard_attachment_export_data(authored)
     assert not skipped
     assert len(attachments) == 1

@@ -22,6 +22,9 @@ from ..CR2W.common_blender import (
     mod_loading_context,
     win_safe_path,
     win_extended_path,
+    win_path_exists,
+    win_path_getmtime,
+    win_path_getsize,
     win_path_isfile,
     win_path_isdir,
     win_unprefix_path,
@@ -3123,7 +3126,7 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
             resolved_path = materialize_entity_repo_path(rel_path, source_game="w2")
         except Exception:
             resolved_path = ""
-        if resolved_path and os.path.exists(resolved_path):
+        if resolved_path and win_path_exists(resolved_path):
             repo_name = rel_path.replace("/", "\\").lstrip("\\")
             return SimpleNamespace(name=repo_name), resolved_path, "\\" + repo_name
         return None
@@ -3139,12 +3142,12 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
             )
         except Exception:
             export_path = ""
-        if export_path and os.path.exists(export_path):
+        if export_path and win_path_exists(export_path):
             _remember_uncook_item_relpath(uncook_root, repo_name)
             return SimpleNamespace(name=repo_name), export_path, "\\" + repo_name
         if source_root:
             candidate = os.path.join(source_root, repo_name)
-            if os.path.exists(candidate):
+            if win_path_exists(candidate):
                 _remember_uncook_item_relpath(source_root, repo_name)
                 return SimpleNamespace(name=repo_name), candidate, "\\" + repo_name
         return None
@@ -3177,7 +3180,7 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
         for rel_path in rel_candidates:
             for root in roots_to_search:
                 export_path = os.path.join(root, rel_path)
-                if os.path.exists(export_path):
+                if win_path_exists(export_path):
                     return SimpleNamespace(name=rel_path), export_path, "\\" + rel_path
 
     def _lookup_indexed_rel_path():
@@ -3199,7 +3202,7 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
                     if resolved:
                         return resolved
                     continue
-                if os.path.exists(export_path):
+                if win_path_exists(export_path):
                     return SimpleNamespace(name=indexed_rel_path), export_path, "\\" + indexed_rel_path
         return None
 
@@ -3216,7 +3219,7 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
                 repo_path = materialize_entity_repo_path(rel_path, source_game="w3")
             except Exception:
                 repo_path = ""
-            if repo_path and os.path.exists(repo_path):
+            if repo_path and win_path_exists(repo_path):
                 return SimpleNamespace(name=rel_path), repo_path, "\\" + rel_path
 
     # Basename fallback: many equipment templates are referenced by short IDs
@@ -3310,7 +3313,7 @@ def _resolve_bundle_item_by_template(template_name, search_roots=None, source_ga
     if not hasattr(final_item, 'name'):
         return None, None, search_info
     export_path = materialize_entity_repo_path(final_item.name, source_game="w3")
-    if not os.path.exists(export_path):
+    if not win_path_exists(export_path):
         final_item.extract_to_file(export_path)
     _remember_uncook_item_relpath(uncook_root, final_item.name)
     return final_item, export_path, search_info
@@ -3432,7 +3435,7 @@ def _update_entry_resolved_repo_path(entry, context=None, armature=None, rig_set
 
 
 def _get_cached_equipment_item_entity(export_path, prepared_context=None):
-    if not export_path or not os.path.exists(export_path):
+    if not export_path or not win_path_exists(export_path):
         return None
     if os.path.splitext(str(export_path or ""))[1].lower() != ".w2ent":
         return None
@@ -3440,8 +3443,8 @@ def _get_cached_equipment_item_entity(export_path, prepared_context=None):
     try:
         cache_key = (
             os.path.normcase(os.path.normpath(export_path)),
-            os.path.getmtime(export_path),
-            os.path.getsize(export_path),
+            win_path_getmtime(export_path),
+            win_path_getsize(export_path),
         )
     except Exception:
         cache_key = (os.path.normcase(os.path.normpath(export_path)),)
@@ -3573,7 +3576,7 @@ def try_update_loaded_equipment_appearance_in_place(context, armature, slot_inde
         search_roots=source_roots,
         prepared_context=prepared,
     )
-    if not final_item or not export_path or not os.path.exists(export_path):
+    if not final_item or not export_path or not win_path_exists(export_path):
         return False
 
     item_entity = _get_cached_equipment_item_entity(export_path, prepared_context=prepared)
@@ -7559,7 +7562,8 @@ class EQUIPMENT_OT_SelectInventoryPreset(bpy.types.Operator):
             ('GERALT_W2', "Geralt W2", "Select the preset used by the Geralt W2 quick import"),
         ],
         default='INVENTORY',
-        options={'HIDDEN'},
+        # SKIP_SAVE: a remembered GERALT_* target would hijack the Inventory tab button, which doesn't set it.
+        options={'HIDDEN', 'SKIP_SAVE'},
     )
     tooltip: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
 
@@ -7608,7 +7612,7 @@ class EQUIPMENT_OT_ClearInventoryPreset(bpy.types.Operator):
             ('GERALT_W2', "Geralt W2", "Disable the Geralt W2 quick import preset"),
         ],
         default='INVENTORY',
-        options={'HIDDEN'},
+        options={'HIDDEN', 'SKIP_SAVE'},
     )
 
     @classmethod
@@ -7633,8 +7637,8 @@ class EQUIPMENT_OT_ApplyInventoryPreset(bpy.types.Operator):
     bl_description = "Apply the selected inventory preset to the current character"
     bl_options = {'REGISTER', 'UNDO'}
 
-    preset_id: bpy.props.StringProperty(default="", options={'HIDDEN'})
-    source_game: bpy.props.StringProperty(default="", options={'HIDDEN'})
+    preset_id: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
+    source_game: bpy.props.StringProperty(default="", options={'HIDDEN', 'SKIP_SAVE'})
 
     def execute(self, context):
         armature, rig_settings = _get_armature_and_rig_settings(context)
@@ -8693,7 +8697,7 @@ def _load_equipment_item_core(context, armature, slot_index, rig_settings=None, 
         return False
 
     log.info(f"Exporting to: {export_path}")
-    if not export_path or not os.path.exists(export_path):
+    if not export_path or not win_path_exists(export_path):
         reason = f"Resolved template has no exported file: '{getattr(final_item, 'name', effective_template)}' -> '{export_path}'"
         _set_last_equipment_load_failure(armature, slot_index, reason)
         log.warning(reason)
