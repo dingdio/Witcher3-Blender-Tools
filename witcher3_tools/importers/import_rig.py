@@ -1,7 +1,6 @@
 import os
 import json
 import math
-import copy
 from ..CR2W.CR2W_types import getCR2W
 from ..CR2W.common_blender import win_safe_path
 from ..CR2W.dc_skeleton import create_Skeleton, load_bin_face, load_bin_skeleton, load_bin_w2_faces
@@ -12,7 +11,6 @@ import bpy
 from typing import List, Tuple
 from pathlib import Path
 from mathutils import Vector, Quaternion, Euler, Matrix
-from ..CR2W.json_convert.CR2WJsonObject import CR2WJsonData, CR2WJsonScalar, getRigTemplate
 
 from .. import file_helpers
 from ..CR2W import w3_types
@@ -316,114 +314,6 @@ def get_ordered_bones(armature):
         if bone not in ordered_bones:
             ordered_bones.append(bone)
     return ordered_bones
-
-def export_w3_rig(context, filename):
-    xpsBones = []
-    selected_objects = set(context.selected_objects)
-
-    for obj in selected_objects:
-        if obj.type == 'ARMATURE':
-            armature = obj
-            break
-    if armature:
-        bones = armature.data.bones
-        log.info("Exporting Armature %d Bones", len(bones))
-        # activebones = [bone for bone in bones if bone.layers[0]]
-
-        activebones = bones
-
-        names = []
-        parentIdx = []
-        positions = []
-        rotations = []
-        scales = []
-        nbBones = len(activebones)
-        output = list()
-        
-        ordered_bones = get_ordered_bones(armature)
-
-        for bl_bone in ordered_bones:
-            if bl_bone.parent:
-                objectMatrix = bl_bone.parent.matrix_local.inverted()
-            else:
-                objectMatrix = armature.matrix_world.inverted()
-            for idx, b in enumerate(ordered_bones):
-                if bl_bone.name == b.name:
-                    id = idx
-                    break
-            name = bl_bone.name
-            names.append(file_helpers.rm_ns(name))
-            co = objectMatrix @ bl_bone.head_local.xyz
-
-            positions.append({
-                            "X": round(co[0], 3),
-                            "Y": round(co[1], 3),
-                            "Z": round(co[2], 3)
-                        })
-
-            origRot = bl_bone.matrix.to_quaternion()
-            rotations.append({
-                            "X": round(origRot.x, 6),
-                            "Y": round(origRot.y, 6),
-                            "Z": round(origRot.z, 6),
-                            "W": round(-origRot.w, 6)
-                        })
-            scales.append({
-                            "X": 1.0,
-                            "Y": 1.0,
-                            "Z": 1.0,
-                        })
-            parentId = -1
-            if bl_bone.parent:
-                for idx, b in enumerate(ordered_bones):
-                    if bl_bone.parent.name == b.name:
-                        parentId = idx
-                        break
-            parentIdx.append(parentId)
-            #xpsBone = w3_types.W3Bone(id, name, co, parentId)
-            #xpsBones.append(xpsBone)
-        output = {"nbBones": nbBones,
-                    "names": names,
-                    "parentIdx":parentIdx,
-                    "positions":positions,
-                    "rotations":rotations,
-                    "scales":scales}
-        with open(filename+'_OLD_FORMAT.json', "w") as file:
-            file.write(json.dumps(output, indent=2, sort_keys=False))
-
-        for rot in rotations:
-            rot['W'] = -rot['W']
-        rig:CR2WJsonData = getRigTemplate()
-        skelly = rig._chunks['CSkeleton #0']
-        bones = skelly._vars['bones']._elements
-        rigdata = skelly._vars['rigdata']._elements
-        bones_json = bones[0]
-        rigdata_json = rigdata[0]
-        
-        new_bones_json = []
-        new_rigdata_json = []
-        for idx, name in enumerate(names):
-            b_n = copy.deepcopy(bones_json)
-            b_n._vars['name'] = CR2WJsonScalar(_type = 'StringAnsi', _value = name)
-            b_n._vars['nameAsCName'] = CR2WJsonScalar(_type = 'CName', _value = name)
-            new_bones_json.append(b_n)
-
-            b_rd = copy.deepcopy(rigdata_json)
-            for var in ('X','Y','Z'):
-                b_rd._vars['Position']._vars[var] = CR2WJsonScalar(_type = 'Float', _value = positions[idx][var])
-                b_rd._vars['Scale']._vars[var] = CR2WJsonScalar(_type = 'Float', _value = scales[idx][var])
-            for var in ('X','Y','Z','W'):
-                b_rd._vars['Rotation']._vars[var] = CR2WJsonScalar(_type = 'Float', _value = rotations[idx][var])
-            new_rigdata_json.append(b_rd)
-
-        skelly._vars['bones']._elements = new_bones_json
-        skelly._vars['parentIndices']._elements = list(map(lambda x: CR2WJsonScalar(_type = 'Int16', _value = x), parentIdx))
-        skelly._vars['rigdata']._elements = new_rigdata_json
-
-        with open(filename, "w") as file:
-            file.write(json.dumps(rig, default=vars, sort_keys=False, separators=(',', ":")))
-
-
 
 def loadFaceFile(filename, w2_chunk_index=None, w2_track_skeleton_file=None):
     cache_key, norm_path = _face_file_cache_key(filename)

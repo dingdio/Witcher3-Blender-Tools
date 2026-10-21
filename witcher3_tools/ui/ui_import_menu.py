@@ -15,7 +15,7 @@ from ..ui.ui_anims import (
     WITCH_OT_import_w3_fbx,
     WITCH_OT_ImportW2Rig,
     WITCH_OT_ExportW2AnimJson,
-    WITCH_OT_ExportW2RigJson,
+    WITCH_OT_ExportW2Rig,
     WITCH_OT_ExportW2Cutscene,
 )
 from ..ui.ui_mesh import (WITCH_OT_w2mesh, WITCH_OT_w2mesh_export, WITCH_OT_apx, WITCH_OT_redcloth, WITCH_OT_redapex, WITCH_OT_nxs,
@@ -226,7 +226,7 @@ class WITCH_MT_MenuExport(bpy.types.Menu):
         layout = self.layout
         layout.operator(WITCH_OT_w2mesh_export.bl_idname, text="Mesh (.w2mesh)", icon='MESH_DATA')
         layout.separator()
-        layout.operator(WITCH_OT_ExportW2RigJson.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
+        layout.operator(WITCH_OT_ExportW2Rig.bl_idname, text="Rig (.w2rig)", icon='ARMATURE_DATA')
         layout.operator(WITCH_OT_ExportW2AnimJson.bl_idname, text="Animation (.w2anims)", icon='ARMATURE_DATA')
         layout.operator(WITCH_OT_ExportW2Cutscene.bl_idname, text="Cutscene (.w2cutscene)", icon='SCENE_DATA')
         layout.separator()

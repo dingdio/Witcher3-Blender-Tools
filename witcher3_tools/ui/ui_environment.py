@@ -20,8 +20,11 @@ from bpy.props import (
 from ..environment_catalog import (
     ENVIRONMENT_OFF_IDENTIFIER,
     EnvironmentDefinitionItem,
+    catalog_from_depot_paths,
+    merge_catalogs,
     scan_environment_definitions,
 )
+from ..read_game_bin import is_valid_witcher3_game_path
 from .ui_cr2w_fields import _draw_imported_class_sections, _schema_from_field_items
 from .ui_utils import WITCH_PT_Base
 
@@ -40,10 +43,11 @@ _BLENDER_CAMERA_LIGHT_ENERGY_SCALE = 20.0
 
 _SCENE_PROP = "witcher_environment"
 _RUNTIME: dict[int, dict[str, Any]] = {}
-_ENVIRONMENT_SELECTOR_CACHE_KEY: tuple[str, ...] | None = None
+_ENVIRONMENT_SELECTOR_CACHE_KEY: tuple | None = None
 _ENVIRONMENT_SELECTOR_CATALOG: tuple[EnvironmentDefinitionItem, ...] = ()
 _ENVIRONMENT_SELECTOR_LOOKUP: dict[str, EnvironmentDefinitionItem] = {}
 _ENVIRONMENT_SELECTOR_ITEMS = ((ENVIRONMENT_OFF_IDENTIFIER, "ENV - OFF"),)
+_ENVIRONMENT_SELECTOR_BUNDLES_PENDING = False
 
 
 @dataclass(frozen=True)
@@ -1507,8 +1511,7 @@ def _ensure_loaded(context) -> dict[str, Any]:
     )
     if selector_identifier != ENVIRONMENT_OFF_IDENTIFIER:
         if runtime.get("selector_environment") is None:
-            _rebuild_environment_selector_cache(context)
-            item = _ENVIRONMENT_SELECTOR_LOOKUP.get(selector_identifier)
+            item = _selector_item(context, selector_identifier)
             if item is None:
                 raise FileNotFoundError("Selected preview environment is no longer available")
             _load_environment(scene, item.depot_path, slot="selector_environment")
@@ -1614,41 +1617,83 @@ def _sync_environment_fields(scene) -> None:
         item.has_children = len(item.children) > 0
 
 
-def _environment_selector_roots(context) -> tuple[str, ...]:
+def _pref_roots(prefs, attrs: tuple[str, ...]) -> tuple[str, ...]:
+    roots = []
+    seen = set()
+    for attr in attrs:
+        value = str(getattr(prefs, attr, "") or "").strip() if prefs is not None else ""
+        if not value:
+            continue
+        expanded = os.path.normpath(bpy.path.abspath(value))
+        key = os.path.normcase(expanded)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(expanded)
+    return tuple(roots)
+
+
+def _environment_selector_roots(context) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """(REDkit depot roots, uncook roots) from the preferences."""
     try:
         from .. import get_all_addon_prefs
 
         prefs = get_all_addon_prefs(context)
     except Exception:
         prefs = None
-
-    roots = []
-    seen = set()
-    for attr in ("redkit_depot_path", "redkit_uncooked_path", "uncook_path"):
-        value = str(getattr(prefs, attr, "") or "").strip() if prefs is not None else ""
-        if not value:
-            continue
-        expanded = bpy.path.abspath(value)
-        key = os.path.normcase(os.path.normpath(expanded))
-        if key in seen:
-            continue
-        seen.add(key)
-        roots.append(os.path.normpath(expanded))
-    return tuple(roots)
+    return (
+        _pref_roots(prefs, ("redkit_depot_path", "redkit_uncooked_path")),
+        _pref_roots(prefs, ("uncook_path",)),
+    )
 
 
-def _rebuild_environment_selector_cache(context, *, force: bool = False):
+def _game_installed(context) -> bool:
+    try:
+        from .. import get_all_addon_prefs
+
+        value = str(getattr(get_all_addon_prefs(context), "witcher_game_path", "") or "").strip()
+        return bool(value) and is_valid_witcher3_game_path(bpy.path.abspath(value))
+    except Exception:
+        return False
+
+
+def _bundle_manager(*, load: bool):
+    """Vanilla bundle index; None while unloaded unless loading was requested (draw must not load)."""
+    from ..CR2W.witcher_cache.Bundles import BundleManager, LoadBundleManager
+
+    manager = BundleManager.InstanceManager
+    if manager is None and load:
+        manager = LoadBundleManager(loadmods=False)
+    return manager
+
+
+def _rebuild_environment_selector_cache(context, *, force: bool = False, load_bundles: bool = False):
     global _ENVIRONMENT_SELECTOR_CACHE_KEY
     global _ENVIRONMENT_SELECTOR_CATALOG
     global _ENVIRONMENT_SELECTOR_LOOKUP
     global _ENVIRONMENT_SELECTOR_ITEMS
+    global _ENVIRONMENT_SELECTOR_BUNDLES_PENDING
 
-    roots = _environment_selector_roots(context)
-    cache_key = tuple(os.path.normcase(os.path.normpath(root)) for root in roots)
+    redkit_roots, local_roots = _environment_selector_roots(context)
+    game_installed = _game_installed(context)
+    manager = _bundle_manager(load=load_bundles and game_installed)
+    cache_key = (
+        tuple(os.path.normcase(root) for root in redkit_roots + local_roots),
+        game_installed,
+        id(manager),
+    )
     if not force and cache_key == _ENVIRONMENT_SELECTOR_CACHE_KEY:
         return _ENVIRONMENT_SELECTOR_ITEMS
 
-    catalog = scan_environment_definitions(roots)
+    redkit = scan_environment_definitions(redkit_roots)
+    catalogs = [redkit, scan_environment_definitions(local_roots)]
+    # Without a REDkit depot the uncook folder only holds incidental extractions;
+    # the bundles are the real source and selection extracts on demand.
+    use_bundles = not redkit and game_installed
+    if use_bundles and manager is not None:
+        catalogs.append(catalog_from_depot_paths(str(key) for key in manager.Items.keys()))
+    _ENVIRONMENT_SELECTOR_BUNDLES_PENDING = use_bundles and manager is None
+    catalog = merge_catalogs(*catalogs)
     _ENVIRONMENT_SELECTOR_CACHE_KEY = cache_key
     _ENVIRONMENT_SELECTOR_CATALOG = catalog
     _ENVIRONMENT_SELECTOR_LOOKUP = {item.identifier: item for item in catalog}
@@ -1657,6 +1702,15 @@ def _rebuild_environment_selector_cache(context, *, force: bool = False):
         *((item.identifier, item.label) for item in catalog),
     )
     return _ENVIRONMENT_SELECTOR_ITEMS
+
+
+def _selector_item(context, identifier: str):
+    _rebuild_environment_selector_cache(context)
+    item = _ENVIRONMENT_SELECTOR_LOOKUP.get(identifier)
+    if item is None:
+        _rebuild_environment_selector_cache(context, force=True, load_bundles=True)
+        item = _ENVIRONMENT_SELECTOR_LOOKUP.get(identifier)
+    return item
 
 
 def _disable_preview_environment_selector(settings, context) -> None:
@@ -1686,8 +1740,7 @@ def _apply_preview_environment_identifier(settings, context, identifier: str) ->
         _disable_preview_environment_selector(settings, context)
         return EnvironmentUIResult(True, "Preview environment off")
 
-    _rebuild_environment_selector_cache(context)
-    item = _ENVIRONMENT_SELECTOR_LOOKUP.get(identifier)
+    item = _selector_item(context, identifier)
     if item is None:
         message = "Environment is no longer available"
         _set_status(
@@ -2006,6 +2059,7 @@ class WITCH_OT_EnvironmentSelectorSelect(bpy.types.Operator):
         current = str(getattr(settings, "preview_environment", "") or ENVIRONMENT_OFF_IDENTIFIER)
         self.environment = ""
         self.filter_text = ""
+        _rebuild_environment_selector_cache(context, load_bundles=True)
         self._rebuild_items(context)
         for index, item in enumerate(self.environment_items):
             if item.identifier == current:
@@ -2054,12 +2108,12 @@ class WITCH_OT_EnvironmentSelectorSelect(bpy.types.Operator):
 class WITCH_OT_EnvironmentSelectorRefresh(bpy.types.Operator):
     bl_idname = "witcher.environment_selector_refresh"
     bl_label = "Refresh Environments"
-    bl_description = "Rescan environment\\definitions in the configured depots"
+    bl_description = "Rescan the configured depots and the game bundles for environment definitions"
 
     def execute(self, context):
         settings = _settings(context.scene)
         previous = str(getattr(settings, "preview_environment", "") or ENVIRONMENT_OFF_IDENTIFIER)
-        items = _rebuild_environment_selector_cache(context, force=True)
+        items = _rebuild_environment_selector_cache(context, force=True, load_bundles=True)
         identifiers = {item[0] for item in items}
         if previous not in identifiers:
             _apply_preview_environment_identifier(settings, context, ENVIRONMENT_OFF_IDENTIFIER)
@@ -2338,7 +2392,12 @@ def draw_entity_environment_selector(layout, context) -> None:
     )
     row.operator(WITCH_OT_EnvironmentSelectorRefresh.bl_idname, text="", icon="FILE_REFRESH")
     if len(items) <= 1:
-        box.label(text="No .env definitions found in configured depots.", icon="INFO")
+        hint = (
+            "No .env definitions on disk. Refresh loads them from the game bundles."
+            if _ENVIRONMENT_SELECTOR_BUNDLES_PENDING
+            else "No .env definitions found in configured depots."
+        )
+        box.label(text=hint, icon="INFO")
     status = box.row(align=True)
     status.label(text=_short_text(settings.status_text), icon=_status_icon(settings))
     status.operator(WITCH_OT_EnvironmentDetails.bl_idname, text="", icon="INFO")
@@ -2498,6 +2557,7 @@ def unregister():
     global _ENVIRONMENT_SELECTOR_CATALOG
     global _ENVIRONMENT_SELECTOR_LOOKUP
     global _ENVIRONMENT_SELECTOR_ITEMS
+    global _ENVIRONMENT_SELECTOR_BUNDLES_PENDING
 
     try:
         preview = _preview_module()
@@ -2511,6 +2571,7 @@ def unregister():
     _ENVIRONMENT_SELECTOR_CATALOG = ()
     _ENVIRONMENT_SELECTOR_LOOKUP = {}
     _ENVIRONMENT_SELECTOR_ITEMS = ((ENVIRONMENT_OFF_IDENTIFIER, "ENV - OFF"),)
+    _ENVIRONMENT_SELECTOR_BUNDLES_PENDING = False
     if hasattr(bpy.types.Scene, _SCENE_PROP):
         delattr(bpy.types.Scene, _SCENE_PROP)
     for cls in reversed(classes):

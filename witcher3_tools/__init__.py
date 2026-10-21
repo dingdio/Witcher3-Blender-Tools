@@ -535,7 +535,7 @@ from .ui.ui_entity import WITCH_OT_ENTITY_lod_toggle
 from .ui.ui_entity import WITCH_OT_w2ent
 from .ui.ui_material import WITCH_OT_w2mg, WITCH_OT_w2mi, WITCH_OT_xbm, WITCH_OT_w2cube
 
-from .ui.ui_anims import WITCH_OT_ImportW2Rig, WITCH_OT_ExportW2AnimJson, WITCH_OT_ExportW2RigJson
+from .ui.ui_anims import WITCH_OT_ImportW2Rig, WITCH_OT_ExportW2AnimJson, WITCH_OT_ExportW2Rig
 
 from .materials import nodes as material_nodes
 from . import w3_asset_browser
@@ -5223,7 +5223,7 @@ _classes = [
     #anims
     WITCH_OT_AddConstraints,
     #WITCH_OT_ImportW2Rig,
-    # WITCH_OT_ExportW2RigJson,
+    # WITCH_OT_ExportW2Rig,
     # WITCH_OT_ExportW2AnimJson,
     WITCH_OT_ViewportNormals,
     WITCH_OT_ToggleClothSimulation,

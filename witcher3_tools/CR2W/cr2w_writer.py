@@ -39,6 +39,13 @@ def write_w2anims(cr2w, file_path):
         f.write(data)
 
 
+def write_w2rig(cr2w, file_path):
+    file_path = _ensure_parent_dir(file_path)
+    data = _build_cr2w_bytes(cr2w)
+    with open(file_path, "wb") as f:
+        f.write(data)
+
+
 def write_w2cutscene(cr2w, file_path):
     file_path = _ensure_parent_dir(file_path)
     data = _build_cr2w_bytes(cr2w)
@@ -1017,20 +1024,8 @@ def _encode_matrix4x4(mat):
 def _encode_string_ansi(value):
     if not value:
         return b"\x00"
-    requires_wide = any(ord(c) > 255 for c in value)
-    if requires_wide:
-        encoded = value.encode("utf-16le")
-        num_wchars = len(value)
-        if num_wchars > 127:
-            num_wchars = 127  # clamp; very long strings unsupported
-        return struct.pack("<B", 0x80 | num_wchars) + encoded
-    else:
-        encoded = value.encode("iso-8859-1")
-        length = len(encoded)
-        if length > 127:
-            length = 127
-            encoded = encoded[:127]
-        return struct.pack("<B", length) + encoded
+    encoded = value.encode("iso-8859-1", "replace")[:126]
+    return struct.pack("<B", len(encoded) + 1) + encoded + b"\x00"
 
 
 def _encode_cstring(value):

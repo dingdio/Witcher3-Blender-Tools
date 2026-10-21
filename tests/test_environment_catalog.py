@@ -1,3 +1,4 @@
+from dataclasses import replace
 import importlib.util
 from pathlib import Path
 import sys
@@ -17,20 +18,29 @@ class EnvironmentCatalogTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"")
 
-    def test_scans_only_env_files_below_native_definition_root(self):
+    def test_scans_env_files_below_vanilla_and_dlc_definition_roots(self):
         with TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             self._touch(root / "environment" / "definitions" / "env_novigrad" / "day.env")
             self._touch(root / "environment" / "definitions" / "interiors" / "night.ENV")
             self._touch(root / "environment" / "definitions" / "ignored.txt")
-            self._touch(root / "dlc" / "bob" / "data" / "environment" / "definitions" / "dlc.env")
+            self._touch(root / "dlc" / "bob" / "data" / "environment" / "definitions" / "sunny" / "dlc.env")
+            self._touch(root / "dlc" / "bob" / "data" / "stray.env")
 
             items = environment_catalog.scan_environment_definitions([str(root)])
+            self.assertTrue(all(Path(item.absolute_path).is_file() for item in items))
 
-        self.assertEqual([item.label for item in items], [r"env_novigrad\day.env", r"interiors\night.ENV"])
+        self.assertEqual(
+            [item.label for item in items],
+            [r"dlc\bob\sunny\dlc.env", r"env_novigrad\day.env", r"interiors\night.ENV"],
+        )
         self.assertEqual(
             [item.depot_path for item in items],
-            [r"environment\definitions\env_novigrad\day.env", r"environment\definitions\interiors\night.ENV"],
+            [
+                r"dlc\bob\data\environment\definitions\sunny\dlc.env",
+                r"environment\definitions\env_novigrad\day.env",
+                r"environment\definitions\interiors\night.ENV",
+            ],
         )
         self.assertTrue(all(item.identifier.startswith("ENV_") for item in items))
 
@@ -51,6 +61,48 @@ class EnvironmentCatalogTests(unittest.TestCase):
             items[0].identifier,
             environment_catalog.environment_identifier(r"environment\definitions\shared.env"),
         )
+
+    def test_catalog_from_depot_paths_keeps_only_definitions(self):
+        items = environment_catalog.catalog_from_depot_paths(
+            [
+                "environment/definitions/env_skellige/storm.env",
+                r"dlc\ep1\data\environment\definitions\leshy_forest.ENV",
+                r"environment\definitions\balancemap\map.xbm",
+                r"environment\weather_conditions\novigrad.env",
+                r"dlc\bob\data\other.env",
+                r"environment\definitions\env_skellige\storm.env",
+            ]
+        )
+
+        self.assertEqual(
+            [item.depot_path for item in items],
+            [
+                r"dlc\ep1\data\environment\definitions\leshy_forest.ENV",
+                r"environment\definitions\env_skellige\storm.env",
+            ],
+        )
+        self.assertEqual([item.label for item in items], [r"dlc\ep1\leshy_forest.ENV", r"env_skellige\storm.env"])
+        self.assertEqual([item.absolute_path for item in items], ["", ""])
+        self.assertEqual(
+            items[1].identifier,
+            environment_catalog.environment_identifier(r"environment\definitions\env_skellige\storm.env"),
+        )
+
+    def test_merge_catalogs_prefers_earlier_sources(self):
+        disk = environment_catalog.catalog_from_depot_paths([r"environment\definitions\a.env"])
+        disk = (replace(disk[0], absolute_path=r"C:\uncook\a.env"),)
+        bundles = environment_catalog.catalog_from_depot_paths(
+            [r"environment\definitions\A.ENV", r"environment\definitions\b.env"]
+        )
+
+        merged = environment_catalog.merge_catalogs(disk, bundles)
+
+        self.assertEqual(
+            [item.depot_path for item in merged],
+            [r"environment\definitions\a.env", r"environment\definitions\b.env"],
+        )
+        self.assertEqual(merged[0].absolute_path, r"C:\uncook\a.env")
+        self.assertEqual(merged[1].absolute_path, "")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,16 @@ Notable changes to **Witcher 3 Blender Tools** are documented here.
 
 ## [Unreleased]
 
+### Added
+- Native `.w2rig` export, no WolvenKit needed; control rig, teleport and LOD data carried over from the source rig; legacy `.w2rig.json` export kept as an option
+
+### Fixed
+- AO power turned materials black at 1.0 and over-darkened every tint-mask material; `Witcher3_Main`, `Witcher3_Sword` and `pbr_std_wear_paint` now apply occlusion the way the engine does and honour `AmbientPower`; scenes saved with the old node group keep it
+- Rig export ignored the rotate-90 display fix and wrote a rolled rest pose
+- Rig export crashed with no armature selected and left a stray `_OLD_FORMAT.json`
+- Native writer wrote `StringAnsi` values one character short
+- Preview environment list was empty without a REDkit depot; it now lists the game bundles' definitions, DLC included, and extracts them on selection
+
 ## [1.1.0] - 2026-09-29
 
 Everything since 1.0.1 (24 April): 177 commits. Ready for The Witcher 3 Remastered.

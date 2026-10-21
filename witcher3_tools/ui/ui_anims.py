@@ -26,7 +26,7 @@ from ..repo_paths import (
     source_roots,
 )
 from ..importers import import_anims, import_cutscene, import_entity, import_rig, import_scene_animation
-from ..exporters import export_anims, export_cutscene
+from ..exporters import export_anims, export_cutscene, export_rig
 from ..animation import cutscene_bake
 from ..animation import pose_keys as pose_key_tools
 from ..animation.action_compat import (
@@ -7987,34 +7987,41 @@ class WITCH_OT_ImportW2Rig(bpy.types.Operator, ImportHelper):
             self.filepath = UNCOOK_PATH if self.filepath == '' else self.filepath
         return ImportHelper.invoke(self, context, event)
 
-class WITCH_OT_ExportW2RigJson(bpy.types.Operator, ExportHelper):
-    """export W2 rig Json"""
+class WITCH_OT_ExportW2Rig(bpy.types.Operator, ExportHelper):
+    """Export Witcher 3 rig (.w2rig)"""
     bl_idname = "witcher.export_w2_rig"
-    bl_label = "Export"
-    filename_ext = ".json"
-    filename = ".w2rig"
+    bl_label = "Export Rig"
+    filename_ext = ".w2rig"
+    filter_glob: StringProperty(default='*.w2rig;*.w2rig.json', options={'HIDDEN'})
+    use_json_legacy: BoolProperty(
+        name="Use JSON (Legacy)",
+        description="Export as .w2rig.json for WolvenKit processing instead of writing .w2rig directly",
+        default=False,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        return export_anims.get_selected_armature(context) is not None
+
     def execute(self, context):
-        obj = context.object
-        fdir = self.filepath
-        ext = file_helpers.getFilenameType(fdir)
-        import_rig.export_w3_rig(context, fdir)
-        return {'FINISHED'}
+        path = _normalize_w2anims_export_path(self.filepath, not self.use_json_legacy, ext=".w2rig")
+        return export_rig.export_w3_rig(context, path, use_json_legacy=self.use_json_legacy)
 
 
 from ..importers.motion_tools import generate_motion_extraction, MotionExtraction
 
-def _normalize_w2anims_export_path(path, use_native_writer):
+def _normalize_w2anims_export_path(path, use_native_writer, ext=".w2anims"):
     p = Path(path)
     if use_native_writer:
         if p.suffix.lower() == ".json":
             p = p.with_suffix("")
-        if p.suffix.lower() != ".w2anims":
-            p = p.with_suffix(".w2anims")
+        if p.suffix.lower() != ext:
+            p = p.with_suffix(ext)
         return str(p)
 
     if p.suffix.lower() == ".json":
         return str(p)
-    if p.suffix.lower() == ".w2anims":
+    if p.suffix.lower() == ext:
         return str(p) + ".json"
     return str(p.with_suffix(".json"))
 
@@ -8480,7 +8487,7 @@ classes = [
     WITCHER_PT_animset_panel,
     TOOL_OT_List_LoadAnim,
     WITCH_OT_ImportW2Rig,
-    WITCH_OT_ExportW2RigJson,
+    WITCH_OT_ExportW2Rig,
     WITCH_UL_AnimExportSet,
     WITCH_OT_AnimExportSetAdd,
     WITCH_OT_AnimExportSetRemove,
