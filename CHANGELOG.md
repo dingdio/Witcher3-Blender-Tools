@@ -6,6 +6,8 @@ Notable changes to **Witcher 3 Blender Tools** are documented here.
 
 ### Added
 - Native `.w2rig` export, no WolvenKit needed; control rig, teleport and LOD data carried over from the source rig; legacy `.w2rig.json` export kept as an option
+- Player panel for walking, running and sprinting Geralt, Ciri, NPCs and ground monsters with their own game animation sets. Supports keyboard and mouse or gamepad input, third-person camera, collision and dangle physics.
+- Player actions for drawing steel and silver swords and chaining light attacks, with game sound events and surface-aware footsteps. Can import REDkit reference terrain when the scene has no ground.
 
 ### Fixed
 - AO power turned materials black at 1.0 and over-darkened every tint-mask material; `Witcher3_Main`, `Witcher3_Sword` and `pbr_std_wear_paint` now apply occlusion the way the engine does and honour `AmbientPower`; scenes saved with the old node group keep it
