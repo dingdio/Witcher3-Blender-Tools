@@ -23,6 +23,7 @@ from ..repo_paths import (
     materialize_entity_repo_path,
     normalize_source_game,
     repo_file_for_source,
+    source_game_for_rig_settings,
     source_roots,
 )
 from ..importers import import_anims, import_cutscene, import_entity, import_rig, import_scene_animation
@@ -93,7 +94,7 @@ def _split_ui_label_text(text, width=110):
 def _find_character_armature(context):
     return get_main_armature(
         context,
-        prefer_active=True,
+        prefer_active=False,
         remember=True,
         fallback=True,
         allow_auxiliary_active=True,
@@ -610,7 +611,11 @@ def _animset_repo_compare_keys(context, repo_rel_path, source_game=""):
         keys.add(_animset_compare_key(repo_rel))
         return {key for key in keys if key}
     repo_fs = repo_rel.replace("/", os.sep).replace("\\", os.sep)
-    for root in source_roots(context, source_game):
+    from ..animation import redkit
+    roots = source_roots(context, source_game)
+    if normalize_source_game(source_game) != 'w2':
+        roots += redkit.depot_roots()
+    for root in roots:
         keys.add(_animset_compare_key(os.path.join(root, repo_fs)))
     return {key for key in keys if key}
 
@@ -669,6 +674,9 @@ def _get_loaded_animset_ui_state(context):
     loaded_key = _animset_compare_key(loaded_path)
     source_tag = str(getattr(scene, "witcher_loaded_w2anims_source_tag", "") or "").strip().upper()
     source_game = "w2" if source_tag == "W2" else "w3"
+    from ..animation import redkit
+    if source_game == 'w3' and redkit.is_depot_file(loaded_path):
+        source_tag = 'REDKIT'
     target_component = str(getattr(scene, "witcher_loaded_w2anims_target_component", "") or "").strip()
     loaded_path_no_json = loaded_path[:-5] if loaded_path.lower().endswith(".json") else loaded_path
 
@@ -684,6 +692,7 @@ def _get_loaded_animset_ui_state(context):
         display_name = "In-memory animation set"
 
     source_badge = {
+        "REDKIT": "REDkit",
         "W2": "W2",
         "W3": "W3",
         "JSON": "JSON",
@@ -704,6 +713,30 @@ def _get_loaded_animset_ui_state(context):
         "clip_count": clip_count,
         "has_loaded_set": has_loaded_set,
     }
+
+
+class WITCH_OT_AnimSourceSettings(bpy.types.Operator):
+    bl_idname = 'witcher.anim_source_settings'
+    bl_label = 'Animation Source'
+    bl_description = 'Choose whether sets load from the game or the REDkit depot, and whether REDkit track names are recovered'
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_popup(self, width=300)
+
+    def draw(self, context):
+        from ..animation import redkit
+        box = self.layout.box()
+        box.label(text='Animation Source', icon='FILE_FOLDER')
+        controls = box.column(align=True)
+        controls.enabled = bool(redkit.depot_roots())
+        controls.prop(context.scene, 'witcher_anim_use_redkit')
+        controls.prop(context.scene, 'witcher_anim_redkit_tracks')
+        if not controls.enabled:
+            box.label(text='Set the REDkit paths in Preferences', icon='INFO')
+        box.label(text='Applies to the next set or clip you load', icon='INFO')
+
+    def execute(self, context):
+        return {'FINISHED'}
 
 
 def _get_selected_collection_item(owner, collection_name, index_name):
@@ -832,6 +865,9 @@ class ListItem(PropertyGroup):
     #        description="",
     #        default="")
 
+from . import ui_anim_authoring
+
+
 class W3AnimExportEntry(PropertyGroup):
     """One entry in the multi-animation export set."""
     action_name: StringProperty(
@@ -866,8 +902,22 @@ class W3AnimExportEntry(PropertyGroup):
     )
     include_motion_extraction: BoolProperty(
         name="Include Motion Extraction",
-        description="Generate motion extraction from Trajectory bone",
-        default=False,
+        description="Write the curve that moves the character in game, built from the Trajectory bone the way "
+                    "CDPR's exporter builds it (see Motion Extraction). A clip whose Trajectory doesn't move gets "
+                    "none, as in game",
+        default=True,
+    )
+    clip_name: StringProperty(
+        name="Export Name",
+        description="Clip name written to the file; empty uses the action name. Blender 4.5 limits action names "
+                    "to 63 characters, game clip names can be longer",
+        default="",
+    )
+    replace_clip: StringProperty(
+        name="Replace",
+        description="Clip of the inject target this action replaces (it keeps that clip's name and events); "
+                    "empty adds the action as a new clip",
+        default="",
     )
 
 
@@ -879,13 +929,13 @@ class WITCH_UL_AnimExportSet(UIList):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
             row.prop(item, "enabled", text="")
-            action_exists = item.action_name in bpy.data.actions
-            icon_id = 'ACTION' if action_exists else 'ERROR'
-            row.label(text=item.action_name or "<empty>", icon=icon_id)
-            type_badges = {'SAT_Additive': 'Add', 'SAT_MS': 'MS'}
-            badge = type_badges.get(item.skeletal_anim_type, '')
-            if badge:
-                row.label(text=badge)
+            # No icon for a found action: the narrow sidebar needs the width for the clip name.
+            icon_id = 'NONE' if item.action_name in bpy.data.actions else 'ERROR'
+            type_icon = {'SAT_Additive': 'ADD', 'SAT_MS': 'ORIENTATION_GLOBAL'}.get(item.skeletal_anim_type, 'POSE_HLT')
+            row.prop(item, "skeletal_anim_type", text="", icon=type_icon, icon_only=True, emboss=False)
+            if item.include_motion_extraction:
+                row.prop(item, "include_motion_extraction", text="", icon='CON_FOLLOWPATH', emboss=False)
+            row.label(text=item.clip_name or item.action_name or "<empty>", icon=icon_id)
         elif self.layout_type == 'GRID':
             layout.alignment = 'CENTER'
             layout.label(text="", icon='ACTION')
@@ -4802,20 +4852,6 @@ class TOOL_UL_List(UIList):
     layout_type = "DEFAULT" # could be "COMPACT" or "GRID"
     # list_id ToDo
 
-    use_name_reverse: bpy.props.BoolProperty(
-        name="Reverse Name",
-        default=False,
-        options=set(),
-        description="Reverse name sort order",
-    )
-
-    use_order_name: bpy.props.BoolProperty(
-        name="Name",
-        default=False,
-        options=set(),
-        description="Sort groups by their name (case-insensitive)",
-    )
-
     filter_string: bpy.props.StringProperty(
         name="filter_string",
         default = "",
@@ -4853,10 +4889,9 @@ class TOOL_UL_List(UIList):
 
         # https://docs.blender.org/api/current/bpy.types.UI_UL_list.html
         # helper functions for handling UIList objects.
-        if self.use_order_name:
+        redkit_order = property == 'witcher_w2anims_list' and context.scene.witcher_anim_redkit_order
+        if redkit_order:
             flt_neworder = bpy.types.UI_UL_list.sort_items_by_name(items, "name")
-            if self.use_name_reverse:
-                flt_neworder.reverse()
         else:
             flt_neworder = []
 
@@ -4871,13 +4906,6 @@ class TOOL_UL_List(UIList):
         row.prop(self, "filter_string", text="Filter", icon="VIEWZOOM")
         row.prop(self, "filter_invert", text="", icon="ARROW_LEFTRIGHT")
 
-
-        row = layout.row(align=True)
-        row.label(text="Order by:")
-        row.prop(self, "use_order_name", toggle=True)
-
-        icon = 'TRIA_UP' if self.use_name_reverse else 'TRIA_DOWN'
-        row.prop(self, "use_name_reverse", text="", icon=icon)
 
     def draw_item(self, context,
                     layout, # Layout to draw the item
@@ -5075,38 +5103,41 @@ class TOOL_OT_List_Remove(Operator):
         return {'FINISHED'}
 
 class TOOL_OT_List_Reorder(Operator):
-    """ Add an Item to the UIList"""
     bl_idname = "witcher.list_reorder"
-    bl_label = "Add"
-    bl_description = "add a new item to the list."
+    bl_label = "Reorder Clip"
+    bl_description = "Move the selected clip in the browser; starts a custom order from the displayed order without importing a clip"
+    bl_options = {'REGISTER', 'UNDO'}
 
-    direction: bpy.props.EnumProperty(items=(('UP', 'Up', ""),
-                                              ('DOWN', 'Down', ""),))
+    direction: EnumProperty(items=(('UP', 'Up', ''), ('DOWN', 'Down', ''),
+                                   ('TOP', 'First', ''), ('BOTTOM', 'Last', '')))
 
     @classmethod
     def poll(cls, context):
-        """ No reason to try to reorder a list with fewer than
-            two items in it.
-        """
-        return (context.scene
-                and context.scene.witcher_w2anims_list
-                and len(context.scene.witcher_w2anims_list) > 1)
-
-    def move_index(self):
-        """ Move index of an item while clamping it. """
-        index = bpy.context.scene.witcher_w2anims_list_index
-        list_length = len(bpy.context.scene.witcher_w2anims_list) - 1
-        new_index = index + (-1 if self.direction == 'UP' else 1)
-
-        bpy.context.scene.witcher_w2anims_list_index = max(0, min(new_index, list_length))
+        scene = context.scene
+        return scene and len(scene.witcher_w2anims_list) > 1 and 0 <= scene.witcher_w2anims_list_index < len(scene.witcher_w2anims_list)
 
     def execute(self, context):
-        alist = context.scene.witcher_w2anims_list
-        index = context.scene.witcher_w2anims_list_index
-
-        neighbor = index + (-1 if self.direction == 'UP' else 1)
-        alist.move(neighbor, index)
-        self.move_index()
+        scene = context.scene
+        items = scene.witcher_w2anims_list
+        index = scene.witcher_w2anims_list_index
+        auto_load = scene.witcher_load_anim_on_select
+        scene.witcher_load_anim_on_select = False
+        try:
+            if scene.witcher_anim_redkit_order:
+                order = bpy.types.UI_UL_list.sort_items_by_name(items, 'name')
+                original_indices = list(range(len(items)))
+                for target, original in enumerate(sorted(range(len(items)), key=order.__getitem__)):
+                    source = original_indices.index(original)
+                    items.move(source, target)
+                    original_indices.insert(target, original_indices.pop(source))
+                index = order[index]
+                scene.witcher_anim_redkit_order = False
+            target = {'UP': max(0, index - 1), 'DOWN': min(len(items) - 1, index + 1),
+                      'TOP': 0, 'BOTTOM': len(items) - 1}[self.direction]
+            items.move(index, target)
+            scene.witcher_w2anims_list_index = target
+        finally:
+            scene.witcher_load_anim_on_select = auto_load
         return {'FINISHED'}
 
 class ButtonOperatorImportW2Anims(bpy.types.Operator, ImportHelper):
@@ -5114,6 +5145,12 @@ class ButtonOperatorImportW2Anims(bpy.types.Operator, ImportHelper):
     bl_idname = "witcher.import_w2_anims_json"
     bl_label = "W2 Anims"
     filename_ext = ".w2anims"
+    def draw(self, context):
+        box = self.layout.box()
+        box.label(text='Event Tracks', icon='NLA')
+        box.prop(context.scene, 'witcher_anim_auto_tracks', text='Auto Create')
+        box.label(text='Applied when loading clips.')
+
     def execute(self, context):
         fdir = self.filepath
         if Path(fdir).is_dir():
@@ -6691,9 +6728,15 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
         nav_row.scale_y = 1.6
         nav_row.prop_enum(scene, "witcher_anim_tab", 'SETS')
         nav_row.prop_enum(scene, "witcher_anim_tab", 'CLIPS')
+        nav_row.prop_enum(scene, "witcher_anim_tab", 'EVENTS')
         nav_row.prop_enum(scene, "witcher_anim_tab", 'RIG')
         nav_row.prop_enum(scene, "witcher_anim_tab", 'SPEECH')
         layout.separator(factor=0.3)
+
+        if anim_tab == 'EVENTS':
+            from . import ui_anim_events
+            ui_anim_events.draw(layout, context)
+            return
 
         # ===================== SETS TAB =====================
         if anim_tab == "SETS":
@@ -6707,6 +6750,7 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 badge_row = head_row.row(align=True)
                 badge_row.enabled = False
                 badge_row.label(text=f"[{loaded_set['source_badge']}]")
+            head_row.operator(WITCH_OT_AnimSourceSettings.bl_idname, text='', icon='PREFERENCES', emboss=False)
             action_row = status_box.row(align=True)
             action_row.operator(ButtonOperatorImportW2Anims.bl_idname, text="Import Set (.w2anims)", icon='IMPORT')
             if loaded_set["has_loaded_set"]:
@@ -6714,29 +6758,20 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
 
             if loaded_set["has_loaded_set"]:
                 title_row = status_box.row(align=True)
-                title_row.label(text=loaded_set["display_name"] or "Loaded animation set", icon='ACTION')
                 title_row.label(text=f"{loaded_set['clip_count']} clips", icon='ANIM_DATA')
-                if loaded_set["target_component"]:
-                    title_row.label(text=loaded_set["target_component"], icon='ARMATURE_DATA')
-                status_box.label(text="Load clip entries in the Clips tab (next to Sets).", icon='INFO')
-                if loaded_set["display_path"]:
-                    path_row = status_box.row()
-                    path_row.scale_y = 0.75
-                    path_row.label(text=loaded_set["display_path"], icon='FILE')
+                status_box.prop(scene, 'witcher_loaded_w2anims_path', text='File')
+                status_box.prop(scene, 'witcher_loaded_w2anims_target_component', text='Target')
             else:
                 status_box.label(text="No .w2anims set loaded yet.", icon='INFO')
-                status_box.label(text="Load a character-linked set below, or import a .w2anims file.", icon='IMPORT')
+                status_box.label(text="Choose a set below or import a file", icon='IMPORT')
 
             if not rig_settings:
                 layout.label(text="Select/import a character armature to browse character-linked sets.", icon='INFO')
             else:
                 # Entity info header
                 info_box = layout.box()
-                info_box.label(text=f"{display_armature.name}", icon='ARMATURE_DATA')
-                skeleton = getattr(rig_settings, 'main_entity_skeleton', '') or '-'
-                info_row = info_box.row()
-                info_row.scale_y = 0.75
-                info_row.label(text=f"Skeleton: {skeleton}", icon='BONE_DATA')
+                info_box.prop(display_armature, 'name', text='Character')
+                info_box.prop(rig_settings, 'main_entity_skeleton', text='Skeleton')
 
                 if not rig_settings.animset_list:
                     layout.label(text="No animation sets found. Import a character entity to populate.", icon='INFO')
@@ -6804,7 +6839,7 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                                 bool(_animset_repo_compare_keys(context, item_path, item_source_game) & loaded_set["loaded_keys"])
                             )
                             button_icon = 'CHECKMARK' if is_loaded_set else 'ACTION'
-                            button_text = filename if not is_loaded_set else f"{filename}  [Loaded]"
+                            button_text = filename
                             file_row = current_box.row(align=True)
                             op = file_row.operator(
                                 "witcher.list_loadapp",
@@ -6817,10 +6852,12 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                             op.component_name = item_component
                             op.source_game = item_source_game
                             reveal_op = file_row.operator("witcher.reveal_anim_in_explorer", text="", icon='FILE_FOLDER')
-                            reveal_op.path = item_path
+                            from ..animation import redkit
+                            resolved_redkit = redkit.depot_file(context, item_path) if scene.witcher_anim_use_redkit and item_source_game == 'w3' else ''
+                            reveal_op.path = resolved_redkit or item_path
                             reveal_op.source_game = item_source_game
                             info_op = file_row.operator("witcher.animset_path_info", text="", icon='QUESTION')
-                            info_op.path = item_path
+                            info_op.path = resolved_redkit or item_path
                             info_op.source_game = item_source_game
 
                     stats_row = search_box.row(align=True)
@@ -6851,22 +6888,21 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                     badge.enabled = False
                     badge.label(text=f"[{loaded_set['source_badge']}]")
                 hdr.label(text=f"{loaded_set['clip_count']} clips", icon='ANIM_DATA')
-                if loaded_set["target_component"]:
-                    hdr.label(text=loaded_set["target_component"], icon='ARMATURE_DATA')
-                set_info.label(text=loaded_set["display_name"] or "Loaded animation set", icon='ACTION')
-                if loaded_set["display_path"]:
-                    path_row = set_info.row()
-                    path_row.scale_y = 0.75
-                    path_row.label(text=loaded_set["display_path"], icon='FILE')
+                hdr.operator(WITCH_OT_AnimSourceSettings.bl_idname, text='', icon='PREFERENCES', emboss=False)
+                set_info.prop(scene, 'witcher_loaded_w2anims_path', text='File')
                 set_info.prop(scene, "witcher_loaded_w2anims_target_component", text="Target")
             else:
                 hint = col_main.box()
-                hint.label(text="No animation set loaded yet.", icon='INFO')
-                hint.label(text="Import a .w2anims set to populate clip entries.", icon='IMPORT')
+                row = hint.row(align=True)
+                row.label(text="No animation set loaded yet.", icon='INFO')
+                row.operator(WITCH_OT_AnimSourceSettings.bl_idname, text='', icon='PREFERENCES', emboss=False)
+                hint.label(text="Choose a set in Sets or import a file", icon='IMPORT')
 
+            col_main.operator("witcher.animation_new_clip", icon='ADD')
             col_main.operator(ButtonOperatorImportW2Anims.bl_idname, text="Import Set (.w2anims)", icon='IMPORT')
 
             box = col_main.box()
+            box.prop(scene, 'witcher_anim_redkit_order')
             list_row = box.row()
             col = list_row.column(align=True)
             col.template_list(
@@ -6881,10 +6917,25 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             if len(scene.witcher_w2anims_list) > 1:
                 reorder_col.operator("witcher.list_reorder", text="", icon="TRIA_UP").direction = "UP"
                 reorder_col.operator("witcher.list_reorder", text="", icon="TRIA_DOWN").direction = "DOWN"
+                reorder_col.operator("witcher.list_reorder", text="", icon="TRIA_UP_BAR").direction = "TOP"
+                reorder_col.operator("witcher.list_reorder", text="", icon="TRIA_DOWN_BAR").direction = "BOTTOM"
 
             row = box.row(align=True)
             row.operator("witcher.list_loadanim", text="Load Clip", icon='PLAY').action = "load"
             row.prop(scene, "witcher_load_anim_on_select", text="Load on Select")
+
+            item, _safe_index = _get_selected_collection_item(scene, "witcher_w2anims_list", "witcher_w2anims_list_index")
+            if item is not None:
+                info = box.box()
+                info.label(text="Selected Clip", icon='INFO')
+                info.prop(item, 'name', text='Name')
+                info.prop(item, 'numFrames', text='Frames')
+                info.prop(item, 'framesPerSecond', text='FPS')
+                info.prop(item, 'duration', text='Seconds')
+                info.prop(item, 'SkeletalAnimationType', text='Type')
+                if item.AdditiveType:
+                    info.prop(item, 'AdditiveType', text='Additive')
+                info.prop(item, 'RootMotion', text='Root Motion')
 
             placement_box = box.box()
             placement_box.label(text="Clip Placement", icon='NLA')
@@ -6893,43 +6944,33 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             nla_mode_row.enabled = _scene_load_clips_to_nla(scene)
             nla_mode_row.prop(scene, "witcher_anim_nla_mode", text="NLA Mode")
 
-            opts = box.box()
-            opts.label(text="Import / Decode Options", icon='SETTINGS')
-            opts.prop(scene, "witcher_prefer_uncompressed_anims", text="Prefer Uncompressed Data")
-            opts.prop(scene, "witcher_bake_every_frame", text="Bake Every Frame")
-            opts.prop(scene, "witcher_smooth_missing_frames", text="Fix Foot Popping (IK)")
-            opts.prop(scene, "witcher_scale_keys_to_duration", text="Scale Keys to Duration")
+            header, opts = box.panel('witcher_clip_decode_options', default_closed=True)
+            header.label(text="Decode Options", icon='SETTINGS')
+            if opts:
+                opts.prop(scene, "witcher_prefer_uncompressed_anims", text="Prefer Uncompressed Data")
+                opts.prop(scene, "witcher_bake_every_frame", text="Bake Every Frame")
+                opts.prop(scene, "witcher_smooth_sparse_tracks")
+                opts.prop(scene, "witcher_smooth_missing_frames", text="Fix Foot Popping (IK)")
+                opts.prop(scene, "witcher_scale_keys_to_duration", text="Scale Keys to Duration")
 
-            motion_box = box.box()
-            motion_box.label(text="Motion Extraction Debug", icon='ACTION')
-            motion_box.label(text="Import motion extraction debug object when present.")
-            motion_box.prop(scene, "witcher_motion_extraction_debug_compressed", text="Compressed")
-            motion_box.prop(scene, "witcher_motion_extraction_debug_uncompressed", text="Uncompressed")
+            header, motion_box = box.panel('witcher_clip_motion_debug', default_closed=True)
+            header.label(text="Motion Extraction Debug", icon='ACTION')
+            if motion_box:
+                motion_box.prop(scene, "witcher_motion_extraction_debug_compressed", text="Compressed")
+                motion_box.prop(scene, "witcher_motion_extraction_debug_uncompressed", text="Uncompressed")
 
             orient_row = box.row(align=True)
             orient_row.prop(scene, "witcher_auto_orient_root", text="Auto Orient Root")
             orient_row.operator(WITCH_OT_ApplyRootOrientation.bl_idname, text="", icon='ORIENTATION_GLOBAL')
 
-            item, _safe_index = _get_selected_collection_item(
-                scene,
-                "witcher_w2anims_list",
-                "witcher_w2anims_list_index",
-            )
-            if item is not None:
-                info = col_main.box()
-                info.label(text="Selected Clip", icon='INFO')
-                info.label(text=f"Name: {item.name}")
-                info.label(text=f"Frames: {item.numFrames}")
-                info.label(text=f"FPS: {round(item.framesPerSecond, 2)}")
-                info.label(text=f"Length: {round(item.duration, 2)} sec")
-                info.label(text=f"Type: {item.SkeletalAnimationType}")
-                if len(item.AdditiveType):
-                    info.label(text=f"Additive: {item.AdditiveType}")
-                info.label(text=f"Root Motion: {item.RootMotion}")
-
         body = section("witcher_anim_retarget_tools", "Retarget", 'ARMATURE_DATA') if anim_tab == "CLIPS" else None
         if body:
             col = body.column(align=True)
+
+            humanoid_box = col.box()
+            humanoid_box.label(text="Mixamo / Humanoid", icon='ARMATURE_DATA')
+            from . import ui_retarget
+            ui_retarget.draw(humanoid_box, context)
 
             w2_box = col.box()
             w2_box.label(text="W2 Import", icon='IMPORT')
@@ -7838,6 +7879,12 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
             else:
                 action_info_box.label(text="No action found.")
 
+        motion_body = section("witcher_anim_motion_extraction", "Motion Extraction", 'CON_FOLLOWPATH', default_closed=True) if anim_tab == "CLIPS" else None
+        if motion_body:
+            from . import ui_motion
+            ui_motion.draw(motion_body, context)
+            motion_body.operator(WITCH_OT_BakePelvisToTrajectory.bl_idname, text="Bake Pelvis → Trajectory", icon='BONE_DATA')
+
         export_body = section("witcher_anim_export_set", "Export Set", 'EXPORT', default_closed=True) if anim_tab == "CLIPS" else None
         if export_body:
             export_set = getattr(scene, "witcher_anim_export_set", None)
@@ -7857,17 +7904,20 @@ class WITCHER_PT_animset_panel(WITCH_PT_Base, Panel):
                 idx = scene.witcher_anim_export_set_index
                 if 0 <= idx < len(export_set):
                     entry = export_set[idx]
+                    export_body.prop(entry, "clip_name", text="Name", placeholder=entry.action_name)
                     settings_row = export_body.row(align=True)
                     settings_row.prop(entry, "skeletal_anim_type", text="")
                     if entry.skeletal_anim_type == 'SAT_Additive':
                         settings_row.prop(entry, "additive_type", text="")
-                    settings_row.prop(entry, "include_motion_extraction", text="Motion Extraction")
+                    settings_row.prop(entry, "include_motion_extraction", text="Motion")
 
-            export_body.separator()
-            bake_row = export_body.row(align=True)
-            bake_row.operator(WITCH_OT_BakePelvisToTrajectory.bl_idname, text="Bake Pelvis → Trajectory", icon='BONE_DATA')
-            export_body.prop(scene, "witcher_anim_export_repo_path", text="Repo Path")
-            export_body.operator(WITCH_OT_ExportW2AnimJson.bl_idname, text="Export...", icon='EXPORT')
+            ui_anim_authoring.draw_summary(export_body, context)
+            export_row = export_body.row()
+            export_row.scale_y = 1.2
+            export_row.operator(WITCH_OT_ExportW2AnimJson.bl_idname, text="Export...", icon='EXPORT')
+            export_body.prop(scene, "witcher_anim_export_repo_path", text="Path")
+            from . import ui_inject
+            ui_inject.draw(export_body, context)
 
 class WITCH_OT_import_w3_fbx(Operator, ImportHelper):
     """Same as normal FBX import but applies materials. Need seprate "FBX Import plugin for blender" enabled. Download from Nexus"""
@@ -8037,6 +8087,7 @@ class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
     """Export Witcher 3 animation set (.w2anims)"""
     bl_idname = "witcher.export_w2_anim"
     bl_label = "Export Animations"
+    bl_description = "Export animation clips with their action event data: event classes, names, tracks, timing, fields and sound references"
     filename_ext = ".w2anims"
 
     @classmethod
@@ -8073,7 +8124,7 @@ class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
     include_motion_extraction: BoolProperty(
         name="Include Motion Extraction",
         description="Generate motion extraction from Trajectory bone",
-        default=False,
+        default=True,
     )
 
     def draw(self, context):
@@ -8104,6 +8155,7 @@ class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
             idx = scene.witcher_anim_export_set_index
             if 0 <= idx < len(export_set):
                 entry = export_set[idx]
+                set_box.prop(entry, "clip_name", text="Name", placeholder=entry.action_name)
                 settings_row = set_box.row(align=True)
                 settings_row.prop(entry, "skeletal_anim_type", text="")
                 if entry.skeletal_anim_type == 'SAT_Additive':
@@ -8125,6 +8177,8 @@ class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
             if self.skeletal_anim_type == 'SAT_Additive':
                 set_box.prop(self, "additive_type")
             set_box.prop(self, "include_motion_extraction")
+
+        ui_anim_authoring.draw_summary(layout.box(), context, self.include_motion_extraction, motion_tolerance=True)
 
         # --- Format ---
         layout.prop(self, "use_json_legacy")
@@ -8158,11 +8212,15 @@ class WITCH_OT_ExportW2AnimJson(bpy.types.Operator, ExportHelper):
         entries = [e for e in export_set if e.enabled]
 
         if entries:
+            skipped = []
             result = export_anims.export_w3_anim_set(
-                context, savepath, entries=entries, use_native_writer=use_native,
+                context, savepath, entries=entries, use_native_writer=use_native, skipped=skipped,
             )
             if result == {'FINISHED'}:
-                self.report({'INFO'}, f"Exported {len(entries)} animation(s) to {savepath}")
+                self.report({'INFO'}, f"Exported {len(entries) - len(skipped)} animation(s) to {savepath}")
+            if skipped:
+                self.report({'WARNING' if result == {'FINISHED'} else 'ERROR'},
+                            f"Skipped {', '.join(skipped)}: missing action or unbaked IK keys; see Export Summary")
             return result or {'FINISHED'}
         else:
             additive = self.additive_type if self.additive_type != 'NONE' else None
@@ -8458,6 +8516,8 @@ class WITCH_OT_ExportW2Cutscene(bpy.types.Operator, ExportHelper):
 #
 classes = [
     *ui_rig.classes,
+    *ui_anim_authoring.CLASSES,
+    WITCH_OT_AnimSourceSettings,
     W3AnimExportEntry,
     ButtonOperatorImportW2Anims,
     ButtonOperatorToggloRootMotion,
@@ -8543,12 +8603,22 @@ def register():
         items=[
             ('SETS',   "Sets",   "Character-linked animation sets (idle, locomotion, facial)"),
             ('CLIPS',  "Clips",  "Import and browse individual animation clips"),
+            ('EVENTS', "Events", "Edit animation events and preview sound and event tracks"),
             ('RIG',    "Rig",    "Create and import story scene PoseKey rig controls"),
             ('SPEECH', "Speech", "Voiceline import and dialogue browser"),
         ],
         default='CLIPS',
     )
-    bpy.types.Scene.witcher_loaded_w2anims_path = StringProperty(default='')
+    bpy.types.Scene.witcher_loaded_w2anims_path = StringProperty(name='Set File', subtype='FILE_PATH', description='Full path of the set supplying the Clips list', default='')
+    bpy.types.Scene.witcher_anim_use_redkit = BoolProperty(name='Load Sets from REDkit', description='Use the configured REDkit depots when clicking a W3 set. Reload the set after changing this; missing files are reported instead of falling back to game data', default=False)
+    bpy.types.Scene.witcher_anim_redkit_tracks = BoolProperty(name='Recover REDkit Track Names', description='On game clip import, recover missing event track names from matching REDkit events, including linked sound files; keep game animation, event timing and payloads', default=True)
+    from .ui_anim_events import TRACK_GROUPING_ITEMS
+    bpy.types.Scene.witcher_anim_auto_tracks = EnumProperty(
+        name='Auto Create Tracks on Import',
+        description='After importing from any source, assign saved track names to events still on unnamed or __Default tracks; preserve existing and recovered track names',
+        items=(('NONE', 'Keep Tracks', 'Keep the imported track names and leave unnamed events on __Default'),) + TRACK_GROUPING_ITEMS,
+        default='NONE')
+    bpy.types.Scene.witcher_anim_redkit_order = BoolProperty(name='REDkit Clip Order', description='List clips alphabetically as in the REDkit AnimBrowser; turn off to use custom order (initially file order)', default=True)
     bpy.types.Scene.witcher_loaded_w2anims_source_tag = StringProperty(
         name="Loaded Animation Set Source",
         description="Compact source tag for the currently loaded .w2anims set (W2/W3/JSON/etc.)",
@@ -8788,6 +8858,11 @@ def register():
         description="Re-solve the leg chains against the skeleton's IK reference tracks after import (if present). Improves display of decompressed animation.",
         default=False
     )
+    bpy.types.Scene.witcher_smooth_sparse_tracks = BoolProperty(
+        name="Smooth Sparse Keys",
+        description="Use Bezier interpolation for editing; changes poses between the original game keys",
+        default=False,
+    )
     bpy.types.Scene.witcher_scale_keys_to_duration = BoolProperty(
         name="Scale Keys to Duration",
         description="Scale key times to fit the animation duration using animation dt (distorts timing; normally leave off)",
@@ -8845,6 +8920,10 @@ def unregister():
         "witcher_w2anims_list",
         "witcher_w2anims_list_index",
         "witcher_loaded_w2anims_path",
+        "witcher_anim_use_redkit",
+        "witcher_anim_redkit_tracks",
+        "witcher_anim_auto_tracks",
+        "witcher_anim_redkit_order",
         "witcher_loaded_w2anims_source_tag",
         "witcher_loaded_w2anims_target_component",
         "witcher_animset_filter_text",
@@ -8871,6 +8950,7 @@ def unregister():
         "witcher_retarget_weapon_offset",
         "witcher_retarget_weapon_rotation_offset",
         "witcher_bake_every_frame",
+        "witcher_smooth_sparse_tracks",
         "witcher_smooth_missing_frames",
         "witcher_scale_keys_to_duration",
         "witcher_anim_export_set",

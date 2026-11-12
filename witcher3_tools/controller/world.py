@@ -21,6 +21,9 @@ MAX_DROP = 60.0
 
 def _skip_object(obj) -> bool:
     from ..ui import ui_map
+    if (obj.get('witcher_environment_preview') or obj.get('witcher_trail_version')
+            or obj.get('witcher_particle_preview_version') or obj.get('witcher_player_effect')):
+        return True
     if obj.display_type in {'WIRE', 'BOUNDS'}:
         return True
     if any(k.startswith(("witcher_water", "witcher_world_water")) for k in obj.keys()):

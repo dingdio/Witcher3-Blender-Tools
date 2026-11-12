@@ -76,10 +76,11 @@ def find_weapons(arm) -> dict:
         back, hand = empties.get(slot.equip_slot), empties.get(slot.hold_slot or "r_weapon")
         if back is None or hand is None:
             continue
-        objects = ([o for o in back.children if o.get("witcher_equip_guid") == slot.equip_guid]
+        objects = ([o for anchor in (back, hand) for o in anchor.children
+                    if o.get("witcher_equip_guid") == slot.equip_guid and not o.get('witcher_bound_parent_guid')]
                    or [o for o in back.children if o.type in {'MESH', 'ARMATURE'}])
         if objects:
-            out[category] = {"back": back, "hand": hand, "objects": objects}
+            out[category] = {"back": back, "hand": hand, "objects": objects, "slot": slot}
     return out
 
 
@@ -130,19 +131,11 @@ class Session:
         self.size = min(max(rig_extent(armature) / 1.8, 0.5), 4.0)       # scale camera for creature size
         self.cam_distance = getattr(settings, "camera_distance", 3.5) * self.size
         self.tick_ms = 0.0
-        self.weapons = find_weapons(armature)
         self.upper_mask = upper_mask(armature)
-        self.moves = None
-        self.drawn = ""                # held sword category
         self.stance, self.combo = "rp", 0
         self._evade_turn = {}
-        if self.weapons:
-            try:
-                self.moves = load_moves(armature)
-            except Exception:
-                log.exception("player: sword moves not loaded for %s", armature.name)
-        self._weapon_saved = [(o, o.parent, o.matrix_parent_inverse.copy(), o.matrix_basis.copy())
-                              for w in self.weapons.values() for o in w["objects"]]
+        self.effects = None
+        self._load_weapons()
         self.sound_info = {}
         self.sound = self._open_sound() if getattr(settings, "sound", False) else None
 
@@ -155,12 +148,8 @@ class Session:
         return out
 
     def _armour(self) -> str:
-        """Use the torso's sound type, or another armour piece's."""
-        meshes = [o.witcherui_MeshSettings for o in self.armature.children_recursive
-                  if o.type == 'MESH' and getattr(o, "witcherui_MeshSettings", None) is not None]
-        typed = [(m.soundInfo_soundBoneMappingInfo, m.soundInfo_soundTypeIdentification) for m in meshes
-                 if m.soundInfo_soundTypeIdentification]
-        return next((t for b, t in typed if b == 'TorsoArmor'), typed[0][1] if typed else "")
+        from .sfx_assets import armour_type
+        return armour_type(self.armature)
 
     def _open_sound(self):
         from .. import get_vgmstream_path
@@ -297,6 +286,41 @@ class Session:
         self.stance = stance_after(evade.clip) or self.stance
         return True
 
+    def _load_weapons(self):
+        """Read the equipped swords; also after one is equipped or put away during play."""
+        armature = self.armature
+        if self.effects is not None:
+            self.effects.close()
+        self.weapons = find_weapons(armature)
+        self.moves = None
+        self.drawn = ""                # held sword category
+        if self.weapons:
+            try:
+                self.moves = load_moves(armature)
+                self.moves.grab = None  # grip timing depends on the sword
+            except Exception:
+                log.exception("player: sword moves not loaded for %s", armature.name)
+        self._weapon_saved = [(o, o.parent, o.matrix_parent_inverse.copy(), o.matrix_basis.copy())
+                              for w in self.weapons.values() for o in w["objects"]]
+        self._initial_drawn = next((c for c, w in self.weapons.items() if w['objects'][0].parent == w['hand']), '')
+        from .effects import Effects
+        self.effects = Effects(bpy.context.scene, armature, self.weapons, self._all_clips())
+
+    def toggle_sword(self, context, category="steelsword") -> str:
+        """Equip the Equipment panel's sword, or the default one when it names none; put an equipped one away."""
+        from ..animation import event_effects
+        from ..ui import ui_equipment
+        if category in self.weapons:
+            if self.drawn and self.moves is not None:
+                self._hold("")
+            ui_equipment.unload_equipment_item(self.weapons[category]["slot"])
+            note = "Sword put away"
+        else:
+            note = event_effects.equip_sword(context, self.armature)
+        self._load_weapons()
+        self._measure_grabs()
+        return note
+
     def _measure_grabs(self):
         """Find each grip time from hand-to-hilt distance; item events vary by clip."""
         if self.moves is None or getattr(self.moves, "grab", None) is not None:
@@ -320,10 +344,13 @@ class Session:
 
     def _hold(self, category: str):
         """Reset swords to their slots, then hold `category` if given."""
-        for obj, parent, inverse, basis in self._weapon_saved:
-            obj.parent, obj.matrix_parent_inverse, obj.matrix_basis = parent, inverse, basis
+        self.effects.stop()
+        saved = {o: (i, b) for o, _, i, b in self._weapon_saved}
+        for weapon in self.weapons.values():
+            for obj in weapon['objects']:
+                obj.parent = weapon['back']
+                obj.matrix_parent_inverse, obj.matrix_basis = saved[obj]
         if category:
-            saved = {o: (i, b) for o, _, i, b in self._weapon_saved}
             for obj in self.weapons[category]["objects"]:
                 obj.parent = self.weapons[category]["hand"]
                 obj.matrix_parent_inverse, obj.matrix_basis = saved[obj]
@@ -345,6 +372,8 @@ class Session:
         }
 
     def start(self):
+        from ..animation.event_preview import stop
+        stop()
         try:
             obj = self.armature
             data = obj.animation_data
@@ -355,7 +384,12 @@ class Session:
                 pb.rotation_mode = 'QUATERNION'
                 pb.scale = (1.0, 1.0, 1.0)
             self._restore_selection()
+            self.effects.hide_bakes()
+            if self.weapons and self.moves is not None:
+                self._hold('')
             self._measure_grabs()
+            if self._initial_drawn and self.moves is not None:
+                self._hold(self._initial_drawn)
             self.apply()
         except Exception:
             self.restore()
@@ -365,11 +399,18 @@ class Session:
         s = self._saved
         layer = bpy.context.view_layer
         for o in layer.objects:
-            o.select_set(o in s["selected"])
-        if s["active"] is not None and s["active"].name in layer.objects:
-            layer.objects.active = s["active"]
+            if o is not None:
+                o.select_set(o in s["selected"])
+        try:
+            if s["active"] is not None and s["active"].name in layer.objects:
+                layer.objects.active = s["active"]
+        except ReferenceError:
+            pass
 
     def restore(self):
+        if getattr(self, 'effects', None) is not None:
+            self.effects.close()
+            self.effects = None
         if getattr(self, "sound", None) is not None:
             self.sound.stop()
             self.sound = None
@@ -377,18 +418,25 @@ class Session:
             return
         obj, s = self.armature, self._saved
         for item, parent, inverse, basis in getattr(self, "_weapon_saved", ()):
-            item.parent, item.matrix_parent_inverse, item.matrix_basis = parent, inverse, basis
-        for pb, (mode, q, e, l, sc) in zip(obj.pose.bones, s["pose"]):
-            pb.rotation_mode = mode
-            pb.rotation_quaternion, pb.rotation_euler, pb.location, pb.scale = q, e, l, sc
-        obj.rotation_mode = s["mode"]
-        obj.matrix_basis = s["matrix"]
-        data = obj.animation_data
-        if data is not None:
-            data.use_nla = s["use_nla"]
-            data.action = s["action"]
-            if s["action"] is not None and s["slot"] is not None and hasattr(data, "action_slot"):
-                data.action_slot = s["slot"]
+            try:
+                item.parent, item.matrix_parent_inverse, item.matrix_basis = parent, inverse, basis
+            except ReferenceError:
+                pass
+        try:
+            for pb, (mode, q, e, l, sc) in zip(obj.pose.bones, s["pose"]):
+                pb.rotation_mode = mode
+                pb.rotation_quaternion, pb.rotation_euler, pb.location, pb.scale = q, e, l, sc
+            obj.rotation_mode = s["mode"]
+            obj.matrix_basis = s["matrix"]
+            data = obj.animation_data
+            if data is not None:
+                data.use_nla = s["use_nla"]
+            if data is not None and data.action is None:
+                data.action = s["action"]
+                if s["action"] is not None and s["slot"] is not None and hasattr(data, "action_slot"):
+                    data.action_slot = s["slot"]
+        except ReferenceError:
+            pass
         self._restore_selection()
         if self._view is not None:
             region_3d, saved = self._view
@@ -422,6 +470,8 @@ class Session:
             kind, _, category = action.partition(":")
             if kind == "sheathe" and self.drawn == category and (name == "item" or name in core.EXIT_EVENTS):
                 self._hold("")
+        for time, event in ctl.effects:
+            self.effects.trigger(self.drawn, time, event, getattr(self.settings, 'blood_preview', False))
         if self.sound is not None:
             from .sfx_assets import H
             master = getattr(self.settings, "sound_volume", 1.0)
@@ -450,6 +500,8 @@ class Session:
         clips.apply(obj, rot, loc)
         obj.matrix_world = (Matrix.Translation((ctl.x, ctl.y, ctl.z)) @ Matrix.Rotation(ctl.yaw, 4, 'Z')
                             @ Matrix.Diagonal(self._scale.to_4d()))
+        if self.effects is not None:
+            self.effects.update(ctl.clock)
 
     def step_dangles(self, dt: float):
         from ..physics import breast_blender, dyng_blender

@@ -2067,11 +2067,12 @@ def _fx_spawner_name(track_item, chunks_by_index) -> str:
     return values[0] if values else ""
 
 
-def _effect_from_definition(definition, particle_items, chunks_by_index, effect_name="") -> dict:
+def _effect_from_definition(definition, particle_items, chunks_by_index, effect_name="", curve_reader=None) -> dict:
     parsed_name = _chunk_prop_string(definition, "name", default="") if definition else ""
     result = {
         "name": str(effect_name or parsed_name or "").strip(),
-        "length": float(_chunk_prop_scalar(definition, "length", default=0.0) or 0.0) if definition else 0.0,
+        # CFXDefinition defaults to 1.0 and omits it when unchanged.
+        "length": float(_chunk_prop_scalar(definition, "length", default=1.0) or 0.0) if definition else 0.0,
         "loop_start": float(_chunk_prop_scalar(definition, "loopStart", default=0.0) or 0.0) if definition else 0.0,
         "loop_end": float(_chunk_prop_scalar(definition, "loopEnd", default=0.0) or 0.0) if definition else 0.0,
         "is_looped": bool(_chunk_prop_bool(definition, "isLooped", default=False)) if definition else False,
@@ -2087,7 +2088,32 @@ def _effect_from_definition(definition, particle_items, chunks_by_index, effect_
             "time_begin": float(_chunk_prop_scalar(item, "timeBegin", default=0.0) or 0.0),
             "duration": float(_chunk_prop_scalar(item, "timeDuration", default=0.0) or 0.0),
         })
+        if curve_reader:
+            curves = curve_reader(item)
+            if curves:
+                result["particle_systems"][-1]["curves"] = curves
     return result
+
+
+def _fx_curve_reader(cr2w, raw_data):
+    from dataclasses import asdict
+    from .dc_particle import _child_indices, _decode_curve
+
+    def read(item):
+        try:
+            return [asdict(_decode_curve(cr2w, index, raw_data))
+                    for index in _child_indices(cr2w, item.ChunkIndex)
+                    if cr2w.CHUNKS.CHUNKS[index].Type == "CCurve"]
+        except (ValueError, IndexError):
+            log.debug("Could not decode effect curves", exc_info=True)
+            return []
+    return read
+
+
+def _effect_dummy(chunk):
+    transform = _find_prop_by_name(chunk, "transform")
+    return {"transform": getattr(transform, "EngineTransform", None),
+            "parent": _chunk_prop_scalar(chunk, "transformParent")}
 
 
 def _parse_cooked_effect_buffer(buffer_prop, effect_name="") -> dict:
@@ -2101,11 +2127,16 @@ def _parse_cooked_effect_buffer(buffer_prop, effect_name="") -> dict:
     chunks_by_index = {getattr(chunk, "ChunkIndex", -1): chunk for chunk in chunks}
     definition = next((chunk for chunk in chunks if getattr(chunk, "Type", "") == "CFXDefinition"), None)
     particle_items = [chunk for chunk in chunks if getattr(chunk, "Type", "") == "CFXTrackItemParticles"]
-    return _effect_from_definition(definition, particle_items, chunks_by_index, effect_name)
+    return _effect_from_definition(definition, particle_items, chunks_by_index, effect_name,
+                                   _fx_curve_reader(effect_file, buffer_bytes))
 
 
-def _extract_uncooked_entity_effects(template_chunk, chunks) -> list[dict]:
+def _extract_uncooked_entity_effects(template_chunk, chunks, cr2w=None) -> list[dict]:
     chunks_by_index = {getattr(chunk, "ChunkIndex", -1): chunk for chunk in chunks}
+    curve_reader = None
+    if cr2w is not None and win_path_isfile(cr2w.fileName):
+        with open(win_safe_path(cr2w.fileName), "rb") as stream:
+            curve_reader = _fx_curve_reader(cr2w, stream.read())
 
     def _referenced(container, prop_name):
         return [
@@ -2126,7 +2157,8 @@ def _extract_uncooked_entity_effects(template_chunk, chunks) -> list[dict]:
                     for item in _referenced(track, "trackItems")
                     if getattr(item, "Type", "") == "CFXTrackItemParticles"
                 )
-        results.append(_effect_from_definition(definition, particle_items, chunks_by_index))
+        results.append(_effect_from_definition(definition, particle_items, chunks_by_index,
+                                               curve_reader=curve_reader))
     return results
 
 
@@ -3679,6 +3711,7 @@ def create_CEntity(
     this_Entity.slots = []
     this_Entity.w2_body_part_states = {}
     this_Entity.cookedEffects = []
+    this_Entity.effectComponents = {}
     this_Entity.isLightOn = None
     this_Entity.plan_components = []
     incomplete_components = []
@@ -4366,6 +4399,8 @@ def create_CEntity(
             if effect.get("name")
         }
         for _depot_path, include_entity in _iter_top_level_included_entities():
+            for name, component in getattr(include_entity, "effectComponents", {}).items():
+                this_Entity.effectComponents.setdefault(name, copy.deepcopy(component))
             for inherited_slot in getattr(include_entity, "slots", None) or []:
                 slot_name = str(getattr(inherited_slot, "name", "") or "").lower()
                 if slot_name and slot_name in slot_names:
@@ -4786,13 +4821,15 @@ def create_CEntity(
 
     seen_effects = set()
     for chunk in CHUNKS:
+        if chunk.Type == "CEffectDummyComponent":
+            this_Entity.effectComponents[_chunk_prop_string(chunk, "name")] = _effect_dummy(chunk)
         if chunk.Type == "CGameplayLightComponent" and this_Entity.isLightOn is None:
             this_Entity.isLightOn = _chunk_prop_bool(chunk, "isLightOn", default=None)
         if chunk.Type != "CEntityTemplate":
             continue
         for effect in (
             _extract_cooked_entity_effects(chunk)
-            + _extract_uncooked_entity_effects(chunk, CHUNKS)
+            + _extract_uncooked_entity_effects(chunk, CHUNKS, file)
         ):
             particle_paths = tuple(
                 str(item.get("path", "") or "").lower()
@@ -5093,6 +5130,9 @@ def create_CEntity(
                     buf_stream = bReadStream(sdb.Bufferdata.Bytes, name='streamingDataBuffer')
                     buf_cr2w = getCR2W(buf_stream)
                     for buf_chunk in buf_cr2w.CHUNKS.CHUNKS:
+                        if buf_chunk.Type == "CEffectDummyComponent":
+                            this_Entity.effectComponents[_chunk_prop_string(buf_chunk, "name")] = _effect_dummy(buf_chunk)
+                            continue
                         if buf_chunk.Type in _FOLIAGE_COMPONENT_TYPES:
                             foliage_component = _foliage_component_from_chunk(buf_chunk)
                             if foliage_component is not None:

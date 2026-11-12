@@ -4,20 +4,32 @@ import sys
 from pathlib import Path
 
 import bpy
+try:
+    from _bpy_restrict_state import RestrictBlend
+except ImportError:  # Blender 4.5
+    from bpy_restrict_state import RestrictBlend
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
 import witcher3_tools as addon
-from witcher3_tools.ui import ui_equipment
+from witcher3_tools.ui import ui_equipment, ui_anim_events
 
 
 registered = False
 try:
     for _ in range(2):
-        addon.register()
+        with RestrictBlend():
+            addon.register()
         registered = True
+        for name in ('quick_anim_category_bulk', 'open_strings_browser', 'image_browser',
+                     'character_image_browser', 'location_image_browser'):
+            assert getattr(bpy.ops.witcher, name).get_rna_type(), name
+        assert bpy.app.timers.is_registered(ui_anim_events.restore_track_layout)
+        if _ == 0:
+            bpy.app.timers.unregister(ui_anim_events.restore_track_layout)
+            ui_anim_events.restore_track_layout()
         assert hasattr(bpy.types.Scene, "witcher_file_browser")
         assert hasattr(bpy.types.Scene, "witcher_character_tab")
         assert hasattr(bpy.types.Scene, "witcher_cutscene_dialog_lines")
@@ -41,6 +53,7 @@ try:
             assert not registered.intersection(cls.__mro__[1:]), f"{cls.__name__} subclasses a registered class"
 
         addon.unregister()
+        assert not bpy.app.timers.is_registered(ui_anim_events.restore_track_layout)
         registered = False
         assert not hasattr(bpy.types.Scene, "witcher_file_browser")
         assert not hasattr(bpy.types.Scene, "witcher_character_tab")

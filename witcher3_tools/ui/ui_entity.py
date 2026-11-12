@@ -1932,9 +1932,14 @@ class WITCH_OT_ENTITY_list_loadapp(Operator):
                     target_component = ""
 
                 if anim_path and ":" not in anim_path:
-                    fdir = repo_file_for_source(anim_path, source_game)  # Extract if available.
+                    from ..animation import redkit
+                    use_redkit = source_game == 'w3' and getattr(scene, 'witcher_anim_use_redkit', False)
+                    fdir = redkit.depot_file(context, anim_path) if use_redkit else repo_file_for_source(anim_path, source_game)
+                    if use_redkit and not fdir:
+                        self.report({'ERROR'}, f"Animation set not found in the configured REDkit depots: {anim_path}")
+                        return {'CANCELLED'}
                     log.debug("Loading anims from: %s", fdir)
-                    if fdir and win_path_exists(fdir + '.json'):
+                    if not use_redkit and fdir and win_path_exists(fdir + '.json'):
                         fdir = fdir + '.json'
                     if not fdir or not win_path_exists(fdir):
                         roots = "; ".join(source_roots(context, source_game)) or "<no configured roots>"

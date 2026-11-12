@@ -2512,7 +2512,7 @@ def find_w2scene_dialogset_slot_item(scene, actor_name="", slot_name="", dialogs
     return None
 
 
-def draw_w2scene_cr2w_class_info(layout, item, *, panel_id, title="Class Fields", empty_label="No set fields.", default_closed=False):
+def draw_w2scene_cr2w_class_info(layout, item, *, panel_id, title="Class Fields", empty_label="No set fields.", default_closed=False, draw_field=None):
     try:
         header, body = layout.panel(panel_id, default_closed=default_closed)
     except Exception:
@@ -2540,6 +2540,7 @@ def draw_w2scene_cr2w_class_info(layout, item, *, panel_id, title="Class Fields"
         False,
         empty_label,
         per_class_show_unset=True,
+        draw_field=draw_field,
     )
 
 

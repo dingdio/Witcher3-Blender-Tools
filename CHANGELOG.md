@@ -4,17 +4,72 @@ Notable changes to **Witcher 3 Blender Tools** are documented here.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-12
+
 ### Added
-- Native `.w2rig` export, no WolvenKit needed; control rig, teleport and LOD data carried over from the source rig; legacy `.w2rig.json` export kept as an option
-- Player panel for walking, running and sprinting Geralt, Ciri, NPCs and ground monsters with their own game animation sets. Supports keyboard and mouse or gamepad input, third-person camera, collision and dangle physics.
-- Player actions for drawing steel and silver swords and chaining light attacks, with game sound events and surface-aware footsteps. Can import REDkit reference terrain when the scene has no ground.
+
+#### Animation events
+- Events tab: create, move and edit clip events with typed fields
+- Event tracks in the viewport, with reordering, blank tracks and locks
+- Auto Create Tracks by event name or class, on import or afterwards
+- Recover REDkit track names for cooked game clips
+- Filter events by text, class and track
+- Game sound preview on the timeline
+- Tracks, Sounds and Effects toggles, remembered between sessions
+- Events export with the clip and can replace those in an existing set
+
+#### Clip authoring and export
+- New Clip, with a frame range and FPS
+- Export Name per clip, for names longer than Blender allows
+- Export summary per clip: events, sound cues and motion extraction
+- Bone scale animation import and export
+- Inject or replace clips in cooked or uncooked `.w2anims` sets
+- Find a clip in the REDkit depot and copy its set to a project workspace, with backups
+- Motion Extraction tools: generate the Trajectory path and preview the exported motion
+- Humanoid (Mixamo) retargeting with auto bone mapping and live preview
+- Load sets from the REDkit depot, listed in REDkit's clip order
+
+#### Weapon effects
+- Sword light trails baked from a clip's item-effect events
+- Blood hit previews at `BloodTrail` markers
+- Baking pauses playback and puts a sword in the hand when none is held
+
+#### Player
+- Player panel: walk, run and sprint as Geralt, Ciri, NPCs and ground monsters
+- Keyboard and mouse or gamepad, third-person and free camera, collision and dangle physics
+- Draw steel and silver swords, chain light attacks, dodge and roll
+- Game sounds and surface-aware footsteps
+- Sword trails during attacks, with optional blood hits
+- R equips or puts away the steel sword, a default one if none is chosen
+- REDkit reference terrain when the scene has no ground
+
+#### Rigs
+- Native `.w2rig` export, no WolvenKit needed
+- Control rig, teleport and LOD data carried over from the source rig
+- Rig tools resolve accessory selections to the body; Select Body Only
+
+### Changed
+- Sparse animation keys import with linear interpolation; Bezier smoothing is an option
+- Legacy `.w2rig.json` export kept as an option
 
 ### Fixed
-- AO power turned materials black at 1.0 and over-darkened every tint-mask material; `Witcher3_Main`, `Witcher3_Sword` and `pbr_std_wear_paint` now apply occlusion the way the engine does and honour `AmbientPower`; scenes saved with the old node group keep it
+- Motion extraction export now matches CDPR's exporter (verified on 14,303 REDkit clips)
+- Turns past 180 degrees and clips with an animated Root exported wrong motion
+- Motion export picked up other NLA tracks; location-only bones exported wrong
+- Additive clips exported as normal clips
+- Clips in an Export Set picked up the pose of the action on the rig
+- Bone scale tracks without a compression flag decoded as garbage
+- Animation sets from older editor builds failed to list
+- Sound-event string arrays lost entries on export
+- Mixamo retarget with Root Motion made the character slide backwards in game
+- FK/IK baking changed limb lengths, joint offsets and unrelated curve interpolation
+- Character import left accessory armatures selected for baking
+- Player spawned on cloud domes above the reference terrain
+- AO power turned materials black at 1.0 and over-darkened tint-mask materials
 - Rig export ignored the rotate-90 display fix and wrote a rolled rest pose
 - Rig export crashed with no armature selected and left a stray `_OLD_FORMAT.json`
 - Native writer wrote `StringAnsi` values one character short
-- Preview environment list was empty without a REDkit depot; it now lists the game bundles' definitions, DLC included, and extracts them on selection
+- Preview environment list was empty without a REDkit depot
 
 ## [1.1.0] - 2026-09-29
 
@@ -131,5 +186,6 @@ Everything since 1.0.1 (24 April): 177 commits. Ready for The Witcher 3 Remaster
 ### Known issues
 - Cutscenes: an actor snaps to T-pose wherever no clip is playing; leave no gaps between clips
 
-[Unreleased]: https://github.com/dingdio/Witcher3_Blender_Tools/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/dingdio/Witcher3_Blender_Tools/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/dingdio/Witcher3_Blender_Tools/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/dingdio/Witcher3_Blender_Tools/compare/v1.0.1...v1.1.0

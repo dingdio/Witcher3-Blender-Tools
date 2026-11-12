@@ -20,7 +20,7 @@ HIDDEN_COLLECTION_NAME = "W3 IK Hidden"
 WIDGET_COLLECTION_NAME = "W3 IK Widgets"
 WIDGET_PREFIX = "W3IK_Widget_"
 CONSTRAINT_PREFIX = "W3IK_"
-RIG_VERSION = 1
+RIG_VERSION = 2
 
 SHARED_WIDGET_NAMES = {
     "arrows": "Arrows",
@@ -183,7 +183,7 @@ REQUIRED_HUMAN_BONES = (
     "r_hand",
 )
 
-_TRANSFORM_PROPS = ("location", "rotation_quaternion")
+_TRANSFORM_PROPS = ("location", "rotation_quaternion", "scale")
 
 
 @dataclass
@@ -1558,6 +1558,8 @@ def _create_edit_control_bones(context, armature, rebuild=False) -> List[str]:
             if bone is None:
                 continue
             bone.parent = parent
+            if bone_name in CHAIN_CONTROLS.values():
+                bone.inherit_scale = 'NONE'
             if parent is not None:
                 bone.use_connect = bool(spec.connected)
     finally:
@@ -1904,70 +1906,8 @@ def _add_constraints(armature):
 
 
 def _set_controls_from_current_pose(armature, limbs: Sequence[str], include_body=True):
-    changed = []
-    limbs = _normalized_limbs(limbs, include_body=include_body)
-    for limb_name in limbs:
-        if limb_name == "body":
-            continue
-        limb = LIMB_DEFS.get(limb_name)
-        if not limb:
-            continue
-        target = armature.pose.bones.get(limb["target"])
-        end = armature.pose.bones.get(limb["end"])
-        if target is not None and end is not None:
-            target.rotation_mode = "QUATERNION"
-            target.matrix = end.matrix.copy()
-            _configure_control_pose_bone(limb["target"], target)
-            changed.append(limb["target"])
-
-        start = _first_existing_bone(armature, limb["start"])
-        start_pose = armature.pose.bones.get(start) if start else None
-        aim = armature.pose.bones.get(limb["aim"])
-        if start_pose is not None and aim is not None:
-            # The aim control is a pure twist dial: seed it with the Y-twist
-            # component of the FK basis (aim and start share rest + parent).
-            aim.rotation_mode = "XYZ"
-            aim.rotation_euler = (0.0, _y_twist_between(Matrix.Identity(4), start_pose.matrix_basis), 0.0)
-            _configure_control_pose_bone(limb["aim"], aim)
-            changed.append(limb["aim"])
-
-        mid = _first_existing_bone(armature, limb["mid"])
-        mid_pose = armature.pose.bones.get(mid) if mid else None
-        chain = armature.pose.bones.get(limb["chain"])
-        if mid_pose is not None and chain is not None:
-            chain.rotation_mode = "XYZ"
-            chain.matrix = mid_pose.matrix.copy()
-            _configure_control_pose_bone(limb["chain"], chain)
-            changed.append(limb["chain"])
-
-        pole = armature.pose.bones.get(limb["pole"])
-        if pole is not None and start_pose is not None and mid_pose is not None and end is not None:
-            distance = POLE_DISTANCE_FACTOR * _bone_length(armature, start, _rig_scale(armature))
-            pole_pos = _pole_position(
-                start_pose.matrix.to_translation(),
-                mid_pose.matrix.to_translation(),
-                end.matrix.to_translation(),
-                mid_pose.matrix,
-                limb_name,
-                distance,
-            )
-            matrix = pole.matrix.copy()
-            matrix.translation = pole_pos
-            pole.matrix = matrix
-            _configure_control_pose_bone(limb["pole"], pole)
-            changed.append(limb["pole"])
-
-        if "foot" in limb["end"]:
-            toe = armature.pose.bones.get(limb["end"].replace("foot", "toe"))
-            _snap_foot_chain_controls(
-                armature,
-                limb,
-                end.matrix.copy() if end is not None else None,
-                toe.matrix.copy() if toe is not None else None,
-                changed,
-            )
-
-    return changed
+    matrices = {bone.name: bone.matrix.copy() for bone in armature.pose.bones}
+    return _set_controls_from_pose_snapshot(armature, limbs, matrices, include_body)
 
 
 def _snap_foot_chain_controls(armature, limb, end_world: Optional[Matrix], toe_world: Optional[Matrix], changed: List[str]):
@@ -2051,6 +1991,12 @@ def _set_controls_from_pose_snapshot(armature, limbs: Sequence[str], matrices: D
             _configure_control_pose_bone(limb["aim"], aim)
             changed.append(limb["aim"])
 
+        mch = armature.pose.bones.get(limb["mch"])
+        if mch is not None and start_matrix is not None:
+            mch.matrix_basis = _pose_basis_from_matrix(armature, mch, start_matrix, matrices)
+            mch.rotation_euler = (0.0, 0.0, 0.0)
+            changed.append(limb["mch"])
+
         mid = _first_existing_bone(armature, limb["mid"])
         mid_matrix = _matrix_from_pose_snapshot(armature, matrices, mid) if mid else None
         chain = armature.pose.bones.get(limb["chain"])
@@ -2059,6 +2005,9 @@ def _set_controls_from_pose_snapshot(armature, limbs: Sequence[str], matrices: D
             chain.matrix = mid_matrix.copy()
             _configure_control_pose_bone(limb["chain"], chain)
             changed.append(limb["chain"])
+            if mch is not None and start_matrix is not None and end_matrix is not None:
+                mch.scale.y = (mid_matrix.translation - start_matrix.translation).length / mch.bone.length
+                chain.scale.y = (end_matrix.translation - mid_matrix.translation).length / chain.bone.length
 
         pole = armature.pose.bones.get(limb["pole"])
         if pole is not None and start_matrix is not None and mid_matrix is not None and end_matrix is not None:
@@ -2206,7 +2155,7 @@ def _key_pose_bones(armature, bone_names: Iterable[str], frame: float, previous_
         if pose_bone is None:
             continue
         _align_pose_quaternion_to_previous(pose_bone, previous_quaternions)
-        for data_path in ("location", _pose_bone_rotation_data_path(pose_bone)):
+        for data_path in ("location", _pose_bone_rotation_data_path(pose_bone), "scale"):
             try:
                 pose_bone.keyframe_insert(data_path=data_path, frame=frame)
             except Exception:
@@ -2237,10 +2186,14 @@ def _control_fcurve_prefixes():
     return prefixes
 
 
-def _set_action_interpolation(action, armature=None):
+def _set_action_interpolation(action, armature=None, bone_names=None):
     if action is None:
         return
     for fcurve in iter_action_fcurves(action, target=armature):
+        if bone_names is not None and not any(
+            fcurve.data_path.startswith(f'pose.bones["{name}"].') for name in bone_names
+        ) and fcurve.data_path not in {f'["{prop}"]' for prop in IK_PROPS.values()}:
+            continue
         for point in getattr(fcurve, "keyframe_points", []) or []:
             try:
                 point.interpolation = "LINEAR"
@@ -2261,7 +2214,7 @@ def _active_action(armature):
     return getattr(anim, "action", None) if anim else None
 
 
-def _store_pose_matrices(armature, sync_markers=True) -> Dict[str, Matrix]:
+def _store_pose_matrices(armature, sync_markers=False) -> Dict[str, Matrix]:
     matrices = {}
     for bone_name in _game_export_bones(armature):
         pose_bone = armature.pose.bones.get(bone_name)
@@ -2350,6 +2303,7 @@ def create_ik_rig(context, armature, options=None) -> IkRigResult:
         _view_update(context)
         _set_limb_props(armature, ("l_arm", "r_arm", "l_leg", "r_leg"), 1.0, include_body=False)
         _calibrate_pole_angles(context, armature)
+        _apply_twist_corrections(context, armature, tuple(LIMB_DEFS), pose_snapshot)
         armature["w3ik_rig_version"] = RIG_VERSION
         armature["w3ik_rig_enabled"] = True
         armature["w3ik_export_requires_bake"] = True
@@ -2433,8 +2387,8 @@ def snap_fk_to_ik(context, armature, limbs, frame, key=False) -> IkRigResult:
         required_controls.extend(
             (limb_def["target"], limb_def["aim"], limb_def["chain"], limb_def["pole"], limb_def["mch"])
         )
-        for key in ("heel", "toe_roll", "ankle"):
-            name = limb_def.get(key)
+        for part in ("heel", "toe_roll", "ankle"):
+            name = limb_def.get(part)
             if name:
                 required_controls.append(name)
     if not all(armature.pose.bones.get(name) for name in required_controls):
@@ -2458,7 +2412,7 @@ def snap_fk_to_ik(context, armature, limbs, frame, key=False) -> IkRigResult:
         if key:
             _key_pose_bones(armature, changed, frame)
             _key_limb_props(armature, limbs, frame, include_body=True)
-            _set_action_interpolation(_active_action(armature), armature)
+            _set_action_interpolation(_active_action(armature), armature, changed)
         _view_update(context)
     finally:
         if int(current_frame) != target_frame:
@@ -2485,7 +2439,7 @@ def snap_ik_to_fk(context, armature, limbs, frame, key=False) -> IkRigResult:
         _enter_mode(context, armature, "POSE")
         _set_limb_props(armature, limbs, 1.0, include_body=True)
         _view_update(context)
-        matrices = _store_pose_matrices(armature, sync_markers=True)
+        matrices = _store_pose_matrices(armature)
         _set_limb_props(armature, limbs, 0.0, include_body=True)
         _view_update(context)
         keyed = _apply_pose_matrices(armature, matrices, frame) if key else []
@@ -2496,7 +2450,7 @@ def snap_ik_to_fk(context, armature, limbs, frame, key=False) -> IkRigResult:
                     pose_bone.matrix = matrix.copy()
         if key:
             _key_limb_props(armature, limbs, frame, include_body=True)
-            _set_action_interpolation(_active_action(armature), armature)
+            _set_action_interpolation(_active_action(armature), armature, keyed)
         _view_update(context)
     finally:
         if int(current_frame) != target_frame:
@@ -2519,6 +2473,8 @@ def bake_fk_to_ik(context, armature, frame_start, frame_end, limbs, clear_keys=T
     current_frame = context.scene.frame_current
     previous_mode = _active_mode()
     action = _active_action(armature)
+    from ..animation import events
+    event_records = events.timeline_events(armature, frame_start, frame_end)
     cleared = 0
     cleared_fk = 0
     if clear_keys and action is not None:
@@ -2543,8 +2499,13 @@ def bake_fk_to_ik(context, armature, frame_start, frame_end, limbs, clear_keys=T
         if clear_keys and action is not None:
             cleared += _clear_matching_action_fcurves(action, armature, _control_fcurve_prefixes())
         cleared_bones = _start_end_game_bones_for_limbs(armature, limbs)
-        cleared_fk = _clear_matching_action_fcurves(_active_action(armature), armature, (), exact_bones=cleared_bones)
-        _reset_pose_bone_basis(armature, cleared_bones)
+        rotation_paths = [f'pose.bones["{name}"].rotation_' for name in cleared_bones]
+        cleared_fk = _clear_matching_action_fcurves(_active_action(armature), armature, rotation_paths)
+        for name in cleared_bones:
+            bone = armature.pose.bones.get(name)
+            if bone is not None:
+                bone.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+                bone.rotation_euler = (0.0, 0.0, 0.0)
 
         control_quaternions = {}
         for frame, control_bases, fk_matrices in samples:
@@ -2556,12 +2517,17 @@ def bake_fk_to_ik(context, armature, frame_start, frame_end, limbs, clear_keys=T
             _apply_twist_corrections(context, armature, limbs, fk_matrices)
             _key_pose_bones(armature, changed, frame, previous_quaternions=control_quaternions)
             _key_limb_props(armature, limbs, frame, include_body=True)
+        _set_action_interpolation(_active_action(armature), armature, keyed_controls)
+        if event_records is not None and action is None:
+            events.store(_active_action(armature), event_records)
+        for frame, _, fk_matrices in samples:
+            context.scene.frame_set(frame)
+            _view_update(context)
             frame_position, frame_rotation = _pose_deviation(armature, fk_matrices)
             if frame_position > max_position or frame_rotation > max_rotation:
                 worst_frame = frame
             max_position = max(max_position, frame_position)
             max_rotation = max(max_rotation, frame_rotation)
-        _set_action_interpolation(_active_action(armature), armature)
         _view_update(context)
     finally:
         context.scene.frame_set(current_frame)
@@ -2590,6 +2556,7 @@ def bake_ik_to_fk(
     frame_end,
     limbs,
     new_action=True,
+    sync_markers=False,
 ) -> IkRigResult:
     validation = validate_human_armature(armature)
     if not validation:
@@ -2601,6 +2568,8 @@ def bake_ik_to_fk(
     current_frame = context.scene.frame_current
     previous_mode = _active_mode()
     source_action = _active_action(armature)
+    from ..animation import events
+    event_records = events.timeline_events(armature, frame_start, frame_end)
     samples = []
     try:
         _enter_mode(context, armature, "POSE")
@@ -2608,16 +2577,26 @@ def bake_ik_to_fk(
             context.scene.frame_set(frame)
             _set_limb_props(armature, limbs, 1.0, include_body=True)
             _view_update(context)
-            samples.append((frame, _store_pose_matrices(armature, sync_markers=True)))
+            samples.append((frame, _store_pose_matrices(armature, sync_markers=sync_markers)))
 
         if new_action or source_action is None:
             source_name = getattr(source_action, "name", armature.name)
             target_action = bpy.data.actions.new(f"{source_name}_W3IK_Baked")
+            if source_action is not None:
+                source_action.use_fake_user = True
             assign_action(armature, target_action)
         else:
             target_action = source_action
             prefixes = _control_fcurve_prefixes()
             _clear_matching_action_fcurves(target_action, armature, prefixes, exact_bones=_game_export_bones(armature))
+
+        armature.animation_data.use_nla = False
+        armature.animation_data.action_blend_type = 'REPLACE'
+        armature.animation_data.action_influence = 1.0
+        if source_action is not None and target_action != source_action:
+            events.copy_events(source_action, target_action)
+        elif event_records is not None and source_action is None:
+            events.store(target_action, event_records)
 
         _set_limb_props(armature, tuple(LIMB_DEFS), 0.0, include_body=False)
         _view_update(context)
@@ -2639,7 +2618,10 @@ def bake_ik_to_fk(
         target_action[ACTION_BAKED_PROP] = True
         if source_action is not None:
             target_action[ACTION_SOURCE_PROP] = source_action.name
-        _set_action_interpolation(target_action, armature)
+        _set_action_interpolation(target_action, armature, keyed)
+        for track in armature.animation_data.nla_tracks:
+            track.mute = True
+            track.is_solo = False
         _view_update(context)
     finally:
         context.scene.frame_set(current_frame)

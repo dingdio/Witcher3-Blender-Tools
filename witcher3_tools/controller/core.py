@@ -47,6 +47,7 @@ class Clip:
     events: list = field(default_factory=list)        # [(time, name)]
     sounds: list = field(default_factory=list)        # [(time, sound event, bone, footstep, cooldown)]
     poses: object = None
+    effects: list = field(default_factory=list)       # [(time, effect name, slot, stop, duration, blood preview)]
 
     @property
     def speed(self) -> float:
@@ -207,6 +208,7 @@ class Controller:
         self.action = ""               # active one-shot kind
         self.queued = None             # (Clip, kind)
         self.fired = []                # [(action kind, event name)]
+        self.effects = []              # [(controller time, Clip.effects entry)]
         self.sounds = []               # [(sound event, bone, footstep)]
         self.clock = 0.0
         self._heard = {}               # (event, bone) -> last sound time
@@ -428,13 +430,15 @@ class Controller:
         self.lean += (self.turn_rate - self.lean) * min(1.0, LEAN_DAMP * dt)
 
         dx = dy = dyaw = total = 0.0
-        self.fired, self.sounds = [], []
+        self.fired, self.sounds, self.effects = [], [], []
         self.clock += dt
         for layer in self.layers:
             motion = layer.advance(dt)
             if layer.state == ACTION and motion and layer.target > 0.0:
                 clip, _, t0, t1 = motion[0]
                 self.fired += [(layer.kind, n) for t, n in clip.events if t0 < t <= t1 or (t0 == t == 0.0)]
+                self.effects += [(self.clock - (t1 - e[0]), e) for e in clip.effects
+                                 if t0 < e[0] <= t1 or (t0 == e[0] == 0.0)]
             if motion:
                 self._hear(layer, *max(motion, key=lambda m: m[1]))
             if layer.weight <= 0.0:
@@ -467,6 +471,8 @@ class Controller:
             if self.upper.target > 0.0:
                 clip, _, t0, t1 = motion[0]
                 self.fired += [(self.upper.kind, n) for t, n in clip.events if t0 < t <= t1 or (t0 == t == 0.0)]
+                self.effects += [(self.clock - (t1 - e[0]), e) for e in clip.effects
+                                 if t0 < e[0] <= t1 or (t0 == e[0] == 0.0)]
                 self._hear(self.upper, *motion[0])
             if not self.upper.step_fade(dt):
                 self.upper = None

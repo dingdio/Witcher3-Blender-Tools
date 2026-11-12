@@ -18,6 +18,7 @@ WALK_TOGGLE_KEYS = {'LEFT_CTRL', 'RIGHT_CTRL'}
 DODGE_KEYS = {'LEFT_ALT', 'RIGHT_ALT'}
 ROLL_KEYS = {'SPACE'}
 SHEATHE_KEY = 'C'
+EQUIP_KEY = 'R'                # equip or put away the steel sword (R rolls the free camera instead)
 FREECAM_KEY = 'F1'
 FREECAM_KEYS = {'Q': (0.0, 1.0), 'E': (0.0, -1.0), 'R': (-1.0, 0.0), 'F': (1.0, 0.0)}      # (roll, up)
 HELD_KEYS = set(MOVE_KEYS) | SPRINT_KEYS | set(FREECAM_KEYS)
@@ -178,6 +179,8 @@ class WitcherPlayerSettings(bpy.types.PropertyGroup):
                     "collision, terrain control map or telling material name)")
     sound_debug: BoolProperty(name="Log Sounds", default=False,
                               description="Log every sound event with its surface and the wems it played")
+    blood_preview: BoolProperty(name="Simulate Blood Hits", default=False,
+                                description="Preview ordinary red blood on the held sword at BloodTrail markers; no enemy or hit detection. Sword light trails play automatically")
     sound_status: StringProperty()
 
 
@@ -185,7 +188,8 @@ class WITCH_OT_player_play(bpy.types.Operator):
     bl_idname = "witcher.player_play"
     bl_label = "Play"
     bl_description = ("Play the selected character with the game's default controls: WASD or left stick, Shift or A sprints, "
-                      "Ctrl toggles walk, 1 / 2 or d-pad draw the steel / silver sword (hold or C to sheathe), left mouse or X "
+                      "Ctrl toggles walk, R equips or puts away the steel sword (the Equipment panel's, or a default one), "
+                      "1 / 2 or d-pad draw the steel / silver sword (hold or C to sheathe), left mouse or X "
                       "attacks, Alt or B dodges and Space or A rolls with a sword drawn, F1 free camera (wheel or d-pad up / down "
                       "sets its FOV), Tab frees the mouse, "
                       "Esc or Back stops")
@@ -299,6 +303,9 @@ class WITCH_OT_player_play(bpy.types.Operator):
         if event.type in HELD_KEYS:
             if event.value == 'PRESS':
                 self._keys.add(event.type)
+                # R is also a held free-camera key; outside the free camera it is the sword toggle.
+                if event.type == EQUIP_KEY and _session.freecam is None and not event.is_repeat:
+                    self._press(context, event.type)
             elif event.value == 'RELEASE':
                 self._keys.discard(event.type)
         elif event.value == 'PRESS':
@@ -327,6 +334,11 @@ class WITCH_OT_player_play(bpy.types.Operator):
             _session.sword_key(category)
         elif key == SHEATHE_KEY:
             _session.sheathe()
+        elif key == EQUIP_KEY:
+            try:
+                self.report({'INFO'}, _session.toggle_sword(context))
+            except ValueError as exc:
+                self.report({'WARNING'}, str(exc))
         elif key in DODGE_KEYS:
             _session.evade("dodge")
         elif key in ROLL_KEYS:
@@ -347,6 +359,9 @@ class WITCH_OT_player_play(bpy.types.Operator):
                 _session.sheathe(WEAPON_KEYS[key.removeprefix("PAD_")])
 
     def _tick(self, context):
+        obj = _session.armature
+        if obj.name not in context.scene.objects or (obj.animation_data and obj.animation_data.action is not None):
+            return self._finish(context)
         now = time.perf_counter()
         self._accumulator += min(now - self._last, 0.25)
         self._last = now
@@ -591,7 +606,7 @@ class WITCH_PT_Player(WITCH_PT_Base, bpy.types.Panel):
                 col.label(text=f"Sword: {props.weapon}", icon='MOD_SIMPLEDEFORM')
                 col.label(text="1/2 Draw (hold) or C Sheathe  LMB Attack")
                 col.label(text="Alt Dodge  Space Roll (sword drawn)")
-            box.label(text="Ctrl Walk  Shift Sprint")
+            box.label(text="Ctrl Walk  Shift Sprint  R Sword On/Off")
             status = layout.box()
             status.label(text=props.state.title(), icon='PLAY')
             status.prop(props, "clip", text="Clip")
@@ -607,6 +622,7 @@ class WITCH_PT_Player(WITCH_PT_Base, bpy.types.Panel):
                 row = box.row()
                 row.scale_y = 1.4
                 row.operator("witcher.player_play", icon='PLAY')
+
             col = box.column(align=True)
             col.label(text="Import & Play", icon='IMPORT')
             row = col.row(align=True)
@@ -634,6 +650,9 @@ class WITCH_PT_Player(WITCH_PT_Base, bpy.types.Panel):
         col = settings.column(align=True)
         col.prop(props, "ground")
         col.prop(props, "dangles")
+        settings.label(text="Weapon Effects", icon='PARTICLES')
+        settings.label(text="Sword trails play automatically")
+        settings.prop(props, "blood_preview")
         settings.label(text="Sound", icon='SOUND')
         col = settings.column(align=True)
         row = col.row()

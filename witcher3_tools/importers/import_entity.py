@@ -2040,6 +2040,11 @@ def _focus_main_armature(context, armature_obj):
     except Exception:
         pass
     try:
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        for obj in context.selected_objects:
+            if obj != armature_obj and obj.type == 'ARMATURE':
+                obj.select_set(False)
         armature_obj.select_set(True)
     except Exception:
         pass

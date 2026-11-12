@@ -146,32 +146,19 @@ def build_cooked_anim_buffer(
     tracks: Optional[List[Dict]] = None,
     use_raw: bool = True,
 ) -> Tuple[bytes, bytes, List[Dict], List[Dict]]:
-    """Build cooked animation buffer data with correct dataAddr offsets.
+    """Return (buffer_bytes, fallback_bytes, bone_info, track_info).
 
-    When use_raw=True (default): ABBCP_Raw format
-        - Positions: Float16 (compression=2, 6 bytes/frame)
-        - Rotations: AsFloat_XYZSignedWInLastBit (12 bytes/frame)
-        - Scales: Float16 (compression=2, 6 bytes/frame)
-
-    When use_raw=False: ABBCP_NormalQuality format
-        - Positions: Float16 (compression=2, 6 bytes/frame)
-        - Rotations: PackIn48bitsW (6 bytes/frame)
-        - Scales: Float16 (compression=2, 6 bytes/frame)
-
-    Returns:
-        (buffer_bytes, fallback_bytes, bone_info, track_info) where bone_info is a list
-        of dicts with 'pos_addr', 'rot_addr', 'scale_addr',
-        'pos_addr_fb', 'rot_addr_fb', 'scale_addr_fb',
-        'pos_multi', 'rot_multi', 'scale_multi' per bone, and track_info is
-        a list of dicts with 'addr', 'addr_fb', 'multi', 'compression' per track.
+    Metadata records channel offsets, compression and multi-frame flags.
+    Positions/scales default to Float32, except constant zero positions and unit
+    scales. use_raw selects XYZ floats with W's sign instead of 48-bit rotations.
     """
     buf = io.BytesIO()       # main buffer (all frames)
     fb_buf = io.BytesIO()    # fallback buffer (first frame only)
     bone_info = []
 
-    pos_bytes_per_frame = 6   # always Float16 (compression=2)
+    pos_bytes_per_frame = 6
     rot_bytes_per_frame = 12 if use_raw else 6
-    scale_bytes_per_frame = 6  # always Float16
+    scale_bytes_per_frame = 6
 
     for bone in bones:
         pos_frames = _pad_frames(bone["pos_frames"], num_frames)
@@ -188,7 +175,12 @@ def build_cooked_anim_buffer(
             )
             or 0
         )
-        scale_compression = int(bone.get("scale_compression", 2) or 2)
+        # Snap near-unit scale to avoid Float16 truncation to 0.996.
+        unit_scale = all(abs(c - 1.0) <= 1e-5 for frame in scale_frames for c in frame)
+        if unit_scale:
+            scale_frames = [(1.0, 1.0, 1.0)] * len(scale_frames)
+            scale_multi = False
+        scale_compression = int(bone.get("scale_compression", 2 if unit_scale else 0))
 
         info = {
             'pos_multi': pos_multi,
@@ -382,6 +374,24 @@ def _make_cutscene_event_prop(event: Dict[str, object]) -> Optional[PROPERTY]:
     event_type = str(event.get("event_type", "") or event.get("type", "") or "").strip()
     if not event_type:
         return None
+
+    if 'raw_fields' in event:
+        from .cutscene_event_schema import event_declared_fields
+        from .event_props import make_field
+        game = event.get('source_game', 'W3')
+        fields = event_declared_fields(game, event_type) or event_declared_fields(game, 'CExtAnimEvent')
+        types = {f.name: f.type_name for f in fields}
+        types.update(event.get('field_types', {}))
+        raw = dict(event['raw_fields'])
+        for source, target in (('event_name', 'eventName'), ('start_time', 'startTime'),
+                               ('duration', 'duration'), ('animation_name', 'animationName'), ('track_name', 'trackName')):
+            if source in event and (target in types or source != 'duration'):
+                raw[target] = event[source]
+        missing = set(raw) - set(types)
+        if missing:
+            raise ValueError(f"Event '{event_type}' has unknown field types: {', '.join(sorted(missing))}")
+        return PROPERTY(theName=event_type, theType=event_type,
+                        More=[make_field(n, types[n], value) for n, value in raw.items()])
 
     props = []
     event_name = str(event.get("event_name", "") or "").strip()
@@ -878,6 +888,8 @@ def _build_animation_chunks(
             PROPERTY(CR2WFILE=cr2w, Handles=[uncompressed_motion_handle], elements=[uncompressed_motion_handle],
                      theName="uncompressedMotionExtraction", theType="ptr:CUncompressedMotionExtraction")
         )
+    if skeletal_type and skeletal_type != "SAT_Normal":
+        anim_props.append(_make_enum_prop(cr2w, "Animation type for reimport", "ESkeletalAnimationType", skeletal_type))
     if additive_type:
         anim_props.append(_make_enum_prop(cr2w, "Additive type for reimport", "EAdditiveType", additive_type))
     _, anim_chunk = _add_chunk(cr2w, "CSkeletalAnimation", anim_props)

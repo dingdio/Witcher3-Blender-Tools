@@ -17,8 +17,8 @@ log = logging.getLogger(__name__)
 from ..animation.camera_tracks import CAMERA_TRACK_NAMES
 from ..rigging.constants import human_bone_order
 from ..CR2W import w3_types
-from ..CR2W import anims_builder, cr2w_writer
-from ..importers.motion_tools import cline_from_per_frame
+from ..CR2W import anims_builder, cr2w_writer, w2anims_inject
+from ..animation import motion_extraction
 from .. import get_rig_rot90_enabled
 from ..rigging import ik as ik_rig
 from ..ui.armature_context import get_main_armature
@@ -71,7 +71,7 @@ def _remap_cline_rot90(frames, flags):
 def get_selected_armature(context):
     if context is None:
         return None
-    return get_main_armature(context, prefer_active=True, remember=True, fallback=True)
+    return get_main_armature(context, prefer_active=False, remember=True, fallback=True)
 
 
 def _get_armature_bone_order(armature) -> List[str]:
@@ -389,13 +389,13 @@ def _rotation_default_values_for_prop(bone, prop_name, rotation_mode=None):
 def _select_rotation_prop(rotation_curves, rotation_mode):
     """Choose one rotation representation before binding any FCurve channels."""
 
-    available = {prop for prop, curves in rotation_curves.items() if curves}
+    priority = {'rotation_quaternion': 2, 'rotation_axis_angle': 1, 'rotation_euler': 0}
+    available = {prop for prop, curves in rotation_curves.items() if prop in priority and curves}
     if not available:
         return None
     preferred = _rotation_prop_for_mode(rotation_mode)
     if preferred in available:
         return preferred
-    priority = {'rotation_quaternion': 2, 'rotation_axis_angle': 1, 'rotation_euler': 0}
     return max(available, key=lambda prop: (len(rotation_curves.get(prop, ())), priority[prop]))
 
 
@@ -495,7 +495,8 @@ class W3AnimationExporter:
         #t2 = prev_q.rotation_difference(-curr_q).angle
         return -curr_q if t2 < t1 else curr_q
 
-    def __exportBoneAnimation(self, armObj, frame_numbers: Optional[List[int]] = None, action=None, face_animation: bool = False):
+    def __exportBoneAnimation(self, armObj, frame_numbers: Optional[List[int]] = None, action=None, face_animation: bool = False,
+                              additive: bool = False):
         if armObj is None:
             return None
         if action is None:
@@ -527,13 +528,20 @@ class W3AnimationExporter:
                 logging.warning(' * Bone not found: %s', m.group(1))
                 continue
             prop_name = m.group(2)
-            if prop_name not in {'location', *rotation_props}:
+            if prop_name not in {'location', 'scale', *rotation_props}:
                 continue
             bone_group = grouped_curves.setdefault(
                 bone,
-                {"location": [], **{rotation_prop: [] for rotation_prop in rotation_props}},
+                {"location": [], "scale": [], **{rotation_prop: [] for rotation_prop in rotation_props}},
             )
             bone_group[prop_name].append(fcurve)
+
+        if not face_animation:
+            # Unkeyed bones still need their static pose, including the rig's rest transform.
+            for bone_name in self.__bone_order:
+                bone = armObj.pose.bones.get(bone_name)
+                if bone is not None:
+                    grouped_curves.setdefault(bone, {"location": []})
 
         for bone, bone_group in grouped_curves.items():
             bone_mode = getattr(bone, "rotation_mode", "QUATERNION")
@@ -542,7 +550,8 @@ class W3AnimationExporter:
             rotation_mode = _rotation_mode_for_prop(effective_prop, bone_mode)
             data = list(bone.location)
             data += _rotation_default_values_for_prop(bone, effective_prop, rotation_mode)
-            bone_curves = [_FCurve(value) for value in data]  # x, y, z, rw, rx, ry, rz
+            data += list(bone.scale)
+            bone_curves = [_FCurve(value) for value in data]  # x, y, z, rw, rx, ry, rz, sx, sy, sz
             anim_bones[bone] = bone_curves
             bone_rotation_props[bone] = selected_prop
             bone_rotation_modes[bone] = rotation_mode
@@ -550,6 +559,9 @@ class W3AnimationExporter:
             for fcurve in bone_group["location"]:
                 if 0 <= fcurve.array_index < 3:
                     bone_curves[fcurve.array_index].setFCurve(fcurve)
+            for fcurve in bone_group.get("scale", ()):
+                if 0 <= fcurve.array_index < 3:
+                    bone_curves[7 + fcurve.array_index].setFCurve(fcurve)
             if selected_prop in {'rotation_quaternion', 'rotation_axis_angle'}:
                 for fcurve in bone_group[selected_prop]:
                     if 0 <= fcurve.array_index < 4:
@@ -570,7 +582,7 @@ class W3AnimationExporter:
             key_name = bone.name
             frame_keys = vmd_bone_anim[key_name]
             prev_rot = None
-            for frame_number, x, y, z, rw, rx, ry, rz in self.__allFrameKeys(bone_curves, frame_numbers=frame_numbers):
+            for frame_number, x, y, z, rw, rx, ry, rz, sx, sy, sz in self.__allFrameKeys(bone_curves, frame_numbers=frame_numbers):
                 key = BoneFrameKey()
                 key.frame_number = frame_number - self.__frame_start
 
@@ -583,9 +595,15 @@ class W3AnimationExporter:
                     ry,
                     rz,
                 )
-                if face_animation:
+                # Interpolated quaternion channels need normalization, as in Blender's pose evaluation.
+                if quat.dot(quat) <= 1e-12:
+                    quat = Quaternion((1.0, 0.0, 0.0, 0.0))
+                else:
+                    quat.normalize()
+                if face_animation or additive:
+                    # Deltas stay in rest-relative space, mirroring the importer.
                     co = Vector([x[0], y[0], z[0]])
-                    if rot90_active:
+                    if rot90_active and (face_animation or bl_bone.parent):
                         co = rot_neg90_mat @ co
                     ro = quat.copy()
                     if rot90_active:
@@ -616,7 +634,7 @@ class W3AnimationExporter:
                     curr_rot = self.__minRotationDiff(prev_rot, curr_rot)
                 prev_rot = curr_rot
                 key.rotation = [curr_rot.x, curr_rot.y, curr_rot.z, curr_rot.w]
-                key.scale = [1.0, 1.0, 1.0]
+                key.scale = [1.0, 1.0, 1.0] if face_animation else [_sample_float(s, 1.0) for s in (sx, sy, sz)]
                 frame_keys.append(key)
             logging.info('(bone) frames:%5d  name: %s', len(frame_keys), key_name)
         logging.info('---- bone animations:%5d  source: %s', len(vmd_bone_anim), armObj.name)
@@ -632,7 +650,7 @@ class W3AnimationExporter:
                 return (frames, False)
         return ([firstFrame], True)
         
-    def collect_json_entry(self, action_name: str):
+    def collect_json_entry(self, action_name: str, action=None):
         """Build a CSkeletalAnimationSetEntry from current boneAnimation state without writing."""
         bones = []
         longestnumframes = 0
@@ -649,7 +667,7 @@ class W3AnimationExporter:
             for frame in frames:
                 positionFrames.append({"x": round(frame.location.x, 8), "y": round(frame.location.y, 8), "z": round(frame.location.z, 8)})
                 rotationFrames.append({"X": round(frame.rotation[0], 11), "Y": round(frame.rotation[1], 11), "Z": round(frame.rotation[2], 11), "W": round(frame.rotation[3], 11)})
-                scaleFrames.append({"x": 1.0, "y": 1.0, "z": 1.0})
+                scaleFrames.append({"x": round(frame.scale[0], 8), "y": round(frame.scale[1], 8), "z": round(frame.scale[2], 8)})
 
             position_dt = rotation_dt = scale_dt = 0.0333333351
             if len(positionFrames) != longestnumframes and len(positionFrames) != 1:
@@ -673,10 +691,12 @@ class W3AnimationExporter:
         CBuffer.duration = longestnumframes * 0.0333333351
         CAnimation = w3_types.CSkeletalAnimation(action_name, CBuffer.duration, 30.0, CBuffer)
         del CAnimation.motionExtraction
-        return w3_types.CSkeletalAnimationSetEntry(CAnimation)
+        from ..animation import events
+        entries = events.export_events(action, 30, self.__frame_start, self.__frame_end, name=action_name) if action is not None else None
+        return w3_types.CSkeletalAnimationSetEntry(CAnimation, entries or [])
 
-    def __save(self, filepath, action_name, single_action):
-        CSetEntry = self.collect_json_entry(action_name)
+    def __save(self, filepath, action, single_action):
+        CSetEntry = self.collect_json_entry(action.name, action)
         if not single_action:
             CSkeletalAnimationSet = w3_types.CSkeletalAnimationSet([CSetEntry])
         else:
@@ -684,6 +704,16 @@ class W3AnimationExporter:
         log.info("Exporting Animation")
         with open(filepath, "w") as file:
             file.write(json.dumps(CSkeletalAnimationSet.__dict__, default=lambda obj: obj.__json_serializable__() if hasattr(obj, "__json_serializable__") else obj.__dict__, indent=2, sort_keys=False))
+
+    def collect_bone_animation(self, armature, frame_numbers, action, additive=False):
+        """Sample one clip's bones. The action on the rig keeps its unkeyed static pose; any other
+        clip is isolated so it cannot pick up whatever pose the rig happens to be in."""
+        data = armature.animation_data
+        if action is None or (data is not None and data.action == action):
+            return self.__exportBoneAnimation(armature, frame_numbers=frame_numbers, action=action, additive=additive)
+        from ..animation import trajectory_tools
+        with trajectory_tools.using_action(armature, action):
+            return self.__exportBoneAnimation(armature, frame_numbers=frame_numbers, action=action, additive=additive)
 
     def collect_native_anim_spec(self, **args) -> Optional[Dict]:
         """Collect all data needed to build one native animation, without writing.
@@ -706,7 +736,8 @@ class W3AnimationExporter:
             return None
 
         frame_numbers = list(range(int(self.__frame_start), int(self.__frame_end) + 1))
-        self.boneAnimation = self.__exportBoneAnimation(armature, frame_numbers=frame_numbers, action=action)
+        self.boneAnimation = self.collect_bone_animation(armature, frame_numbers, action,
+                                                         additive=args.get('skeletal_type') == 'SAT_Additive')
         if self.boneAnimation is None:
             return None
         if action is None and armature and armature.animation_data:
@@ -714,7 +745,7 @@ class W3AnimationExporter:
         if action is None:
             log.warning(f'No action found on armature "{armature.name}", skipping export')
             return None
-        action_name = action.name if action else armature.name
+        action_name = args.get('clip_name') or (action.name if action else armature.name)
 
         num_frames = max(1, int(self.__frame_end - self.__frame_start + 1))
         fps_base = bpy.context.scene.render.fps_base if bpy.context.scene.render.fps_base else 1.0
@@ -767,43 +798,19 @@ class W3AnimationExporter:
 
         motion_extraction_data = None
         if include_motion_extraction:
-            trajectory_bone = armature.pose.bones.get("Trajectory")
-            if trajectory_bone and armature.animation_data:
-                try:
-                    uncomp_frames = []
-                    initial_pos = None
-                    initial_yaw = 0.0
-                    for frame_idx in frame_numbers:
-                        bpy.context.scene.frame_set(frame_idx)
-                        traj = armature.pose.bones.get("Trajectory")
-                        if not traj:
-                            break
-                        pos = traj.matrix.to_translation()
-                        yaw = traj.matrix.to_euler('XYZ').z
-                        if initial_pos is None:
-                            initial_pos = pos.copy()
-                            initial_yaw = yaw
-                        dx = float(pos.x - initial_pos.x)
-                        dy = float(pos.y - initial_pos.y)
-                        dz = float(pos.z - initial_pos.z)
-                        dyaw = float(yaw - initial_yaw)
-                        uncomp_frames.append((dx, dy, dz, dyaw))
-                    bpy.context.scene.frame_set(int(self.__frame_start))
+            if armature.pose.bones.get("Trajectory") is None:
+                log.warning(f'"{action_name}": no Trajectory bone, so no motion extraction')
+            else:
+                from ..animation import trajectory_tools
+                with trajectory_tools.using_action(armature, action):
+                    raw = trajectory_tools.motion_from_trajectory(bpy.context, armature, frame_numbers)
+                motion_extraction_data = motion_extraction.compress(
+                    raw, dt * max(num_frames - 1, 0),
+                    eps=args.get('motion_eps', motion_extraction.DEFAULT_EPS), flags=args.get('motion_flags'))
+                if motion_extraction_data is None:
+                    log.info(f'"{action_name}": no motion extraction with the current thresholds and axes')
 
-                    fps_val = float(bpy.context.scene.render.fps)
-                    me = cline_from_per_frame(uncomp_frames, frame_numbers, fps_val)
-                    if me is not None:
-                        motion_extraction_data = {
-                            "duration": me.duration,
-                            "frames": me.frames,
-                            "delta_times": me.delta_times,
-                            "flags": me.flags,
-                            "uncompressed_frames": uncomp_frames,
-                        }
-                except Exception as e:
-                    log.warning(f"Failed to generate motion extraction: {e}")
-
-        return {
+        result = {
             "action_name": action_name,
             "bones": bones_data,
             "num_frames": num_frames,
@@ -813,6 +820,13 @@ class W3AnimationExporter:
             "additive_type": additive_type,
             "motion_extraction": motion_extraction_data,
         }
+        from ..animation import events
+        entry_events = events.export_events(action, fps, self.__frame_start, self.__frame_end, name=action_name)
+        if entry_events is not None:
+            result['entry_events'] = entry_events
+            result['replace_events'] = events.modified(action, self.__frame_start, self.__frame_end)
+            result['event_sources'] = events.event_sources(action, self.__frame_start, self.__frame_end)
+        return result
 
     def export_native(self, **args):
         armature = args.get('armature', None)
@@ -850,7 +864,7 @@ class W3AnimationExporter:
             if action is None:
                 log.warning(f'No action found on armature "{armature.name}", skipping export')
                 return
-            self.__save(filepath, action.name, single_action)
+            self.__save(filepath, action, single_action)
 
 def export_w3_anim(context, savePath, use_native_writer=False,
                    skeletal_type="SAT_Normal", additive_type=None,
@@ -877,7 +891,8 @@ def export_w3_anim(context, savePath, use_native_writer=False,
                                skeletal_type = skeletal_type,
                                additive_type = additive_type,
                                include_motion_extraction = include_motion_extraction,
-                               action = curr_action)
+                               action = curr_action,
+                               **_motion_options())
         log.info(f'Finished Exporting {curr_action.name} (native .w2anims)')
     else:
         exporter.export(armature = armObj,
@@ -889,51 +904,93 @@ def export_w3_anim(context, savePath, use_native_writer=False,
     return {'FINISHED'}
 
 
-def export_w3_anim_set(context, savePath, entries, use_native_writer=True):
+def _motion_options():
+    motion = getattr(bpy.context.scene, "witcher_motion", None)
+    if motion is None:
+        return {}
+    from ..ui.ui_motion import flags_from_settings
+    return {"motion_eps": motion.eps, "motion_flags": flags_from_settings(motion)}
+
+
+def collect_set_specs(armObj, entries, force_motion=()):
+    """Collect clip specs; force_motion names replacements requiring motion extraction."""
+    specs, skipped = [], []
+    motion = _motion_options()
+    for entry in entries:
+        action = bpy.data.actions.get(entry.action_name)
+        if action is None:
+            log.warning(f'Export set entry "{entry.action_name}": action not found, skipping')
+            skipped.append(entry.action_name)
+            continue
+        if _has_unbaked_ik_export_keys(armObj, action):
+            skipped.append(entry.action_name)
+            continue
+
+        exporter = W3AnimationExporter()
+        exporter._W3AnimationExporter__frame_start = int(action.frame_range[0])
+        exporter._W3AnimationExporter__frame_end = int(action.frame_range[1])
+        exporter._W3AnimationExporter__bone_order = _get_armature_bone_order(armObj)
+
+        additive = entry.additive_type if entry.additive_type != 'NONE' else None
+        spec = exporter.collect_native_anim_spec(
+            armature=armObj,
+            action=action,
+            skeletal_type=entry.skeletal_anim_type,
+            additive_type=additive,
+            include_motion_extraction=entry.include_motion_extraction or
+            getattr(entry, "replace_clip", "").lower() in force_motion,
+            clip_name=getattr(entry, "clip_name", "").strip(),
+            **motion,
+        )
+        if spec is None:
+            log.warning(f'Export set entry "{entry.action_name}": failed to collect animation data, skipping')
+            skipped.append(entry.action_name)
+            continue
+        if getattr(entry, "replace_clip", ""):
+            spec["replace"] = entry.replace_clip
+        specs.append(spec)
+        log.info(f'Collected spec for "{entry.action_name}" ({spec["num_frames"]} frames)')
+    return specs, skipped
+
+
+def inject_w3_anim_set(context, source_path, out_path, entries, embed_buffers=False, backup_dir=None):
+    """Inject export-set clips; return (report, skipped)."""
+    armObj = get_selected_armature(context)
+    if not armObj:
+        raise w2anims_inject.InjectError("No armature selected")
+    with open(source_path, "rb") as f:
+        clips = w2anims_inject.describe_set(w2anims_inject.RawCR2W(f.read()))
+    moving = {c["name"].lower() for c in clips if c["me"] is not None}
+    specs, skipped = collect_set_specs(armObj, entries, force_motion=moving)
+    if not specs:
+        raise w2anims_inject.InjectError("No valid animations collected from the export set")
+    for spec in specs:
+        target = spec.get("replace", "").lower()
+        motion = spec.get("motion_extraction")
+        if target in moving and (motion is None or not any(abs(v) > 1e-6 for v in motion["frames"])):
+            raise w2anims_inject.InjectError(
+                f"'{spec['replace']}' needs motion extraction, but '{spec['action_name']}' exports no movement; "
+                "check its Trajectory and Motion Extraction axis settings")
+    report = w2anims_inject.inject_file(source_path, out_path, specs, embed_buffers=embed_buffers,
+                                        backup_dir=backup_dir)
+    return report, skipped
+
+
+def export_w3_anim_set(context, savePath, entries, use_native_writer=True, skipped=None):
     """Export multiple animations from the export set into one .w2anims/.w2anims.json file.
+
+    skipped collects the names of entries that were left out.
     """
     armObj = get_selected_armature(context)
     if not armObj:
         log.warning("No armature selected for export")
         return {'CANCELLED'}
 
-    skipped = []
+    skipped = [] if skipped is None else skipped
 
     if use_native_writer:
-        specs = []
-        for entry in entries:
-            action = bpy.data.actions.get(entry.action_name)
-            if action is None:
-                log.warning(f'Export set entry "{entry.action_name}": action not found, skipping')
-                skipped.append(entry.action_name)
-                continue
-            if _has_unbaked_ik_export_keys(armObj, action):
-                skipped.append(entry.action_name)
-                continue
-
-            frame_start = int(action.frame_range[0])
-            frame_end = int(action.frame_range[1])
-
-            exporter = W3AnimationExporter()
-            exporter._W3AnimationExporter__frame_start = frame_start
-            exporter._W3AnimationExporter__frame_end = frame_end
-            exporter._W3AnimationExporter__bone_order = _get_armature_bone_order(armObj)
-
-            additive = entry.additive_type if entry.additive_type != 'NONE' else None
-            spec = exporter.collect_native_anim_spec(
-                armature=armObj,
-                action=action,
-                skeletal_type=entry.skeletal_anim_type,
-                additive_type=additive,
-                include_motion_extraction=entry.include_motion_extraction,
-            )
-            if spec is None:
-                log.warning(f'Export set entry "{entry.action_name}": failed to collect animation data, skipping')
-                skipped.append(entry.action_name)
-                continue
-            specs.append(spec)
-            log.info(f'Collected spec for "{entry.action_name}" ({spec["num_frames"]} frames)')
-
+        specs, left_out = collect_set_specs(armObj, entries)
+        skipped.extend(left_out)
         if not specs:
             log.warning("No valid animations collected for export set")
             return {'CANCELLED'}
@@ -966,15 +1023,14 @@ def export_w3_anim_set(context, savePath, entries, use_native_writer=True):
             exporter._W3AnimationExporter__frame_end = frame_end
             exporter._W3AnimationExporter__bone_order = _get_armature_bone_order(armObj)
 
-            exporter.boneAnimation = exporter._W3AnimationExporter__exportBoneAnimation(
-                armObj, frame_numbers=list(range(frame_start, frame_end + 1)), action=action
-            )
+            exporter.boneAnimation = exporter.collect_bone_animation(
+                armObj, list(range(frame_start, frame_end + 1)), action)
             if exporter.boneAnimation is None:
                 log.warning(f'Export set entry "{entry.action_name}": failed to collect bone animation, skipping')
                 skipped.append(entry.action_name)
                 continue
 
-            json_entry = exporter.collect_json_entry(entry.action_name)
+            json_entry = exporter.collect_json_entry(getattr(entry, "clip_name", "").strip() or entry.action_name, action)
             json_entries.append(json_entry)
             log.info(f'Collected JSON entry for "{entry.action_name}"')
 

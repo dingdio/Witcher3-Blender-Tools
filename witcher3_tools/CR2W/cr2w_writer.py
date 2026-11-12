@@ -619,7 +619,7 @@ def _encode_property_value(prop, name_to_index, import_index):
     if raw_bytes is not None:
         return struct.pack("<I", len(raw_bytes)) + bytes(raw_bytes)
 
-    if p_type.endswith("StringAnsi"):
+    if p_type == "StringAnsi":
         value = getattr(prop, "String", None)
         if hasattr(value, "String"):
             value = value.String

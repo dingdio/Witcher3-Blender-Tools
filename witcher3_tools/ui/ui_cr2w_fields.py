@@ -375,7 +375,7 @@ def _schema_from_field_items(field_items):
     return tuple((class_name, tuple(fields)) for class_name, fields in schema)
 
 
-def _draw_imported_class_sections(layout, field_items, schema, show_unset, empty_label, per_class_show_unset=False):
+def _draw_imported_class_sections(layout, field_items, schema, show_unset, empty_label, per_class_show_unset=False, draw_field=None):
     visible_any = False
     for class_name, _fields in schema:
         all_class_items = [
@@ -411,6 +411,8 @@ def _draw_imported_class_sections(layout, field_items, schema, show_unset, empty
         col.use_property_split = True
         col.use_property_decorate = False
         for item in class_items:
+            if draw_field is not None and draw_field(col, item):
+                continue
             has_children = bool(getattr(item, "has_children", False))
             type_text = str(getattr(item, "type_text", "") or "").strip()
             if has_children:

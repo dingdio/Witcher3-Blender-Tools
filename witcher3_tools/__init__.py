@@ -522,6 +522,10 @@ from .ui import armature_context
 from .ui import ui_cache_export
 from .ui import ui_timers
 from .ui import ui_player
+from .ui import ui_retarget
+from .ui import ui_motion
+from .ui import ui_inject
+from .ui import ui_anim_events
 from . import lipsync
 from . import livelink_face
 from . import strings_browser
@@ -555,7 +559,7 @@ import addon_utils
 bl_info = {
     "name": "Witcher 3 Tools",
     "author": "Dingdio",
-    "version": (1, 1, 0),
+    "version": (1, 2, 0),
     "blender": (4, 5, 0),
     "location": "File > Import-Export > Witcher 3 Assets",
     "description": "Tools for Witcher 3 and Witcher 2",
@@ -5359,6 +5363,10 @@ def register():
     ui_cutscene.register()
     ui_animated_component.register()
     ui_player.register()
+    ui_retarget.register()
+    ui_motion.register()
+    ui_inject.register()
+    ui_anim_events.register()
     bpy.utils.register_class(WITCHER_OT_cache_info)
     bpy.utils.register_class(WITCHER_OT_check_cache)
     bpy.utils.register_class(WITCHER_OT_refresh_cache_checked)
@@ -5453,6 +5461,10 @@ def unregister():
     ui_import_menu.unregister()
     ui_texture_export.unregister()
     ui_cutscene.unregister()
+    ui_anim_events.unregister()
+    ui_inject.unregister()
+    ui_motion.unregister()
+    ui_retarget.unregister()
     ui_player.unregister()
     ui_animated_component.unregister()
     ui_scene.unregister()

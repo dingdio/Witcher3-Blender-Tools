@@ -1901,7 +1901,18 @@ def _retarget_w2_animation_entry(context, animation_entry, source_rig_path, targ
     )
 
 
-def load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0,
+def load_anim_into_scene(context, *args, **kwargs):
+    result = _load_anim_into_scene(context, *args, **kwargs)
+    try:
+        from ..animation import event_effects
+        owner = args[2] if len(args) > 2 else kwargs.get('main_arm_obj')
+        event_effects.refresh_after_load(context, owner)
+    except Exception:
+        log.debug("Weapon effects were not refreshed for the loaded clip", exc_info=True)
+    return result
+
+
+def _load_anim_into_scene(context, anim_name, fdir, main_arm_obj, NLA_track = 'anim_import', at_frame = 0,
                          face_target_mode="auto", nla_mode='replace', target_component="", source_game="",
                          use_NLA=True, cutscene_template=None, cutscene_entry=None,
                          cutscene_source_index=None):

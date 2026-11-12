@@ -155,7 +155,22 @@ def load_clip(arm, animset_path: str, name: str, rig_path=None, cyclic: bool = F
     clip.windows = sorted((n, t, t + d) for n, t, d in named if d > 0.0)
     clip.events = sorted((t, n) for n, t, d in named if d <= 0.0)
     clip.sounds = sorted(_sound(e) for e in events if getattr(e, "sound_event_name", None))
+    clip.effects = effect_events(events)
     return clip
+
+
+def effect_events(events):
+    from ..animation.event_effects import ITEM_EFFECT_TYPES
+    result = []
+    for event in events:
+        fields = getattr(event, 'raw_fields', {}) or {}
+        if event.type_name in ITEM_EFFECT_TYPES:
+            duration = float(event.duration) if event.type_name == 'CExtAnimItemEffectDurationEvent' else None
+            result.append((float(event.start_time), fields.get('effectName', 'item_effect'),
+                           fields.get('itemSlot', 'r_weapon'), fields.get('action', 'IEA_Start') == 'IEA_Stop', duration, False))
+        elif event.event_name in ('BloodTrail', 'BloodTrailForced'):
+            result.append((float(event.start_time), 'default_blood_trail', 'r_weapon', False, None, True))
+    return sorted(result, key=lambda e: e[0])
 
 
 def _sound(event):

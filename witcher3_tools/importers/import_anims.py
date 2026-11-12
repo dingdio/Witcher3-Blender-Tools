@@ -1189,6 +1189,13 @@ class AnimImporter:
                 self.__split_nla_strip_at_cursor(target, target_track, strip, cursor, insert_length)
 
     def __assign_action(self, target: Union[bpy.types.ID, HasAnimationData], action: bpy.types.Action, camera_cut_frames=None, num_frames=0):
+        from ..animation.events import import_events
+        # Only multipart buffers split their events between parts; a single clip keeps all of them.
+        multipart = self.__AnimationBufferType == AnimationBufferType.Multi
+        import_events(action, getattr(self.__SetEntry, 'entries', []),
+                      self.__SetEntry.animation.framesPerSecond or 30.0,
+                      offset=self.__frame_current, end=max(0, num_frames - 1) if num_frames else None, keep_outside=not multipart,
+                      auto_tracks=getattr(bpy.context.scene, 'witcher_anim_auto_tracks', 'NONE'))
         if target.animation_data is None:
             target.animation_data_create()
 
@@ -1471,13 +1478,7 @@ class AnimImporter:
         witcher_scale_keys_to_duration = getattr(bpy.context.scene, 'witcher_scale_keys_to_duration', False)
         foot_ik_cleanup = getattr(bpy.context.scene, 'witcher_smooth_missing_frames', False)
 
-        # Skip-frame compressed tracks only store every Nth frame. Raw FK
-        # playback in Blender can expose those gaps as visible jitter, so sparse
-        # tracks get C1 (auto-clamped bezier) interpolation instead of linear.
-        # Keyed values stay bit-exact; full-rate tracks are untouched. With
-        # bake-every-frame the same curves are then sampled per frame, so both
-        # modes play back identically.
-        smooth_sparse_tracks = not camera_animation
+        smooth_sparse_tracks = not camera_animation and getattr(bpy.context.scene, 'witcher_smooth_sparse_tracks', False)
 
         def _track_interp(num_track_frames):
             if smooth_sparse_tracks and 1 < num_track_frames < total_frames:
@@ -1518,14 +1519,28 @@ class AnimImporter:
             loc_data_path, rot_data_path = curve_per_bone[mdl_bone.BoneName]
 
             #! SCALE FRAMES
-            bone_frames = len(bone.scaleFrames)
-            if bone_frames == 1 and self.facePose and bone.scaleFrames[0].count(1.0) == 3:
-                pass
-            else:
-                if bone.scaleFrames[0].count(1.0) != 3:
-                    loc_frame_number = 0
-                    #frame_skip_loc = round(float(total_frames)/float(len(keyFrames_loc)))
-                    frame_skip_loc = float(total_frames)/float(len(keyFrames_loc))
+            # Only real scale animation is keyed; cooked unit scale carries float noise.
+            scales = [s for s in bone.scaleFrames if all(math.isfinite(v) for v in s)]
+            if not self.facePose and not face_animation:
+                bl_bone.scale = (1.0, 1.0, 1.0)  # unkeyed scale must not leak in from the previous clip
+            if not self.facePose and not face_animation and any(abs(v - 1.0) > 0.01 for s in scales for v in s):
+                scale_dt = round(bone.scale_dt if bone.scale_dt and bone.scale_dt > 0 else base_dt, 8)
+                last_frame = total_frames - 1
+                scale_key_frames, scale_key_values = [], ([], [], [])
+                for n, scale_frame in enumerate(scales):
+                    if len(scales) == 1:
+                        frame = 0.0
+                    elif n == len(scales) - 1:
+                        frame = last_frame
+                    else:
+                        frame = min(last_frame, n * (scale_dt / base_dt if base_dt > 0 else 1.0))
+                    if scale_key_frames and abs(frame - scale_key_frames[-1]) < 1e-6:
+                        continue
+                    scale_key_frames.append(frame)
+                    for axis in range(3):
+                        scale_key_values[axis].append(round(scale_frame[axis], 8))
+                _flush_channel_batch('pose.bones["%s"].scale' % bl_bone.name, bl_bone.name, scale_key_frames,
+                                     scale_key_values, _track_interp(len(scales)), densify=witcher_bake_every_frame)
 
             #! POSITION FRAMES
             bone_frames = len(bone.positionFrames)
@@ -2112,6 +2127,8 @@ def create_lopsided_cube():
     return cube
 
 def import_anim(context, fileName, AnimationSetEntry, facePose=False, use_NLA=False, override_select = False, update_scene_settings = True, NLA_track = 'anim_import', at_frame = 0, nla_mode = 'replace'):
+    from ..animation.redkit import prepare_entry
+    AnimationSetEntry = prepare_entry(context, fileName, AnimationSetEntry)
     if not override_select:
         selected_objects = set(context.selected_objects)
     else:

@@ -29,6 +29,14 @@ def wav_cache_dir() -> str:
     return os.path.join(get_cache_root(create=True), "player_sfx")
 
 
+def armour_type(armature):
+    meshes = [obj.witcherui_MeshSettings for obj in armature.children_recursive
+              if obj.type == 'MESH' and getattr(obj, 'witcherui_MeshSettings', None) is not None]
+    typed = [(m.soundInfo_soundBoneMappingInfo, m.soundInfo_soundTypeIdentification) for m in meshes
+             if m.soundInfo_soundTypeIdentification]
+    return next((kind for bone, kind in typed if bone == 'TorsoArmor'), typed[0][1] if typed else '')
+
+
 class Library:
     """Every bank of the given sound cache items merged into one graph; a wem resolves to (file, offset, size)."""
 

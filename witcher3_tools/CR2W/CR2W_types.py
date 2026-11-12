@@ -1469,7 +1469,8 @@ class SAnimationBufferBitwiseCompressedBoneTrack(object):
         self.CR2WFILE = CR2WFILE
     def Read(self, f, size, classEnd = 9999):
         self.classEnd = classEnd
-        f.seek(1,1)#zero= readUByte(f)
+        if self.CR2WFILE.HEADER.version >= 158:  # serialization-stream flags byte
+            f.seek(1,1)
         self.position = PROPERTY(f,self.CR2WFILE, self)
         self.orientation = PROPERTY(f,self.CR2WFILE, self)
         self.scale = PROPERTY(f,self.CR2WFILE, self)
@@ -1617,8 +1618,8 @@ class PROPERTY:
             self.chunks.Read(f, 0)
             return
         elif ("SAnimationBufferBitwiseCompressedData" == Type.type):
-            #zero1 = readSByte(f)
-            f.seek(1,1)
+            if CR2WFILE.HEADER.version >= 158:  # serialization-stream flags byte
+                f.seek(1,1)
             this_end = dataEnd - 2
             while f.tell() != this_end:
                 name = CR2WFILE.CNAMES[readUShort(f)].name.value; #string
@@ -1672,7 +1673,7 @@ class PROPERTY:
             arrayType = theType[delim+1:len(theType)]#SubStr( theType, delim+1, len(theType) - delim);
             theType = arrayType
             pos = f.tell()
-            if (pos+2 < FileSize(f) and theType != "inkWidgetLibraryItem" and (peek32 := readU32Check(f, pos)) != 0 and peek32 + pos < dataEnd):
+            if (pos+4 <= FileSize(f) and theType != "inkWidgetLibraryItem" and (peek32 := readU32Check(f, pos)) != 0 and peek32 + pos < dataEnd):
                 if (readUShortCheck(f, pos) == 0):
                     f.seek(2,1)
                     self.Count = readUShort(f)
@@ -1709,6 +1710,12 @@ class PROPERTY:
         # Read them before the generic scalar-size heuristics.
         if arrayDataType == "array" and elementType == "Float":
             self.value = [readFloat(f) for _ in range(count)]
+            if f.tell() < dataEnd:
+                f.seek(dataEnd)
+            return
+        # 1, 2, 4 or 8 bools would otherwise match the size heuristics for other scalar types.
+        if arrayDataType == "array" and elementType == "Bool":
+            self.value = [readUByte(f) for _ in range(count)]
             if f.tell() < dataEnd:
                 f.seek(dataEnd)
             return
@@ -1760,12 +1767,13 @@ class PROPERTY:
                 for _ in range(0, count):
                     self.Handles.append(HANDLE(f,CR2WFILE, self))
                 f.seek(startofHandles); # FSeek(startof(Handles));
-        elif arrayDataType == "array" and elementType == "String":
+        elif arrayDataType == "array" and elementType in {"String", "StringAnsi"}:
             if CR2WFILE.HEADER.version <= 115:
                 STRINGINDEX(f, CR2WFILE, self)
                 if readInt16(f) != -1:
                     raise ValueError('Unexpected String array header')
-            self.elements = [CSTRING(f) for _ in range(count)]
+            string_type = STRINGANSI if elementType == "StringAnsi" else CSTRING
+            self.elements = [string_type(f) for _ in range(count)]
         elif ("array:array" in Type.type):
             pass
         elif ("StringAnsi" in Type.type):
@@ -1975,6 +1983,11 @@ class PROPERTY:
                 #     buffers2[self.ValueA-1] = Type.strIdx.Index;
             else:
                 self.Bufferdata = CByteArray().Read(f, 0)
+                if f.tell() > dataEnd:
+                    # Pre-158 deferred buffers are a fixed-size reference, not an inline byte array.
+                    self.Bufferdata = None
+                    self.ValueA = 0  # no buffer index: the clip data is inline
+                    f.seek(dataEnd)
         elif ("TagList" == theType):
             self.TagList = []
             count = ReadBit6(f)

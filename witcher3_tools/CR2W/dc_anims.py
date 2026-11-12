@@ -1216,7 +1216,7 @@ def read_anim_buffer(file, CAnimationBufferBitwiseCompressed, duration, Skeleton
         if compression is not None:
             compression = bone.scale.GetVariableByName('compression').Value
         else:
-            compression = 2
+            compression = 0  # ABBC_None, the engine default, like position
         dataAddr = bone.scale.GetVariableByName('dataAddr')
         dataAddrFallback = bone.scale.GetVariableByName('dataAddrFallback')
         if dataAddr is not None:
@@ -1802,8 +1802,22 @@ def _read_event_field_prop(prop, type_name, chunks):
     type_name = str(type_name or "")
     if prop is None:
         return None
+    if type_name.startswith('array:') and 'handle:' in type_name:
+        from .prop_utils import read_handle_label
+        return [read_handle_label(h, chunks or []) for h in getattr(prop, 'Handles', [])]
+    if type_name.startswith('array:') and type_name.rsplit(',', 1)[-1] in {
+        'Float', 'Bool', 'Uint8', 'Uint16', 'Uint32', 'Int8', 'Int16', 'Int32'
+    }:
+        return list(getattr(prop, 'value', []))
+    if type_name.startswith('array:') and type_name.rsplit(',', 1)[-1] in {'String', 'StringAnsi'}:
+        return [_read_string_prop(p) for p in getattr(prop, 'elements', [])]
+    if type_name.startswith('array:') and type_name.rsplit(',', 1)[-1] == 'CName':
+        return _read_array_string_prop(prop)
     if type_name == "CName":
         return _read_cname_prop(prop)
+    if type_name.startswith('soft:'):
+        # The same index also resolves in the name table; only the import path is meant.
+        return str(getattr(getattr(prop, 'Index', None), 'Path', '') or '')
     if type_name in {"String", "StringAnsi"}:
         return _read_string_prop(prop)
     if type_name in {"Float", "CFloat"}:
@@ -1818,6 +1832,14 @@ def _read_event_field_prop(prop, type_name, chunks):
         enum_value = _read_enum_prop(prop)
         if enum_value:
             return enum_value
+    from .event_props import children
+    items = children(prop)
+    struct = lambda props: {p.theName: _read_event_field_prop(p, p.theType, chunks) for p in props}
+    if type_name.startswith('array:') and items:
+        # Several structs parse as unnamed ELEMENTs, a single one as its bare members.
+        return [struct(children(e)) for e in items] if not hasattr(items[0], 'theName') else [struct(items)]
+    if items and all(hasattr(p, 'theName') for p in items) and not type_name.startswith(('handle:', 'soft:', 'ptr:')):
+        return struct(items)
     return _read_prop_value(prop, chunks or [])
 
 
@@ -1835,29 +1857,10 @@ def _event_raw_fields_from_chunk(chunk, game=GAME_W3, chunks=None):
     if not type_name:
         return {}
 
-    fields = {}
-    declared_fields = event_declared_fields(game, type_name)
-    if declared_fields:
-        for field in declared_fields:
-            prop = _event_prop_by_name(chunk, field.name)
-            if prop is not None:
-                fields[field.name] = _read_event_field_prop(prop, field.type_name, chunks)
-        return fields
-
-    for field_name, type_name in (
-        ("eventName", "CName"),
-        ("startTime", "Float"),
-        ("animationName", "CName"),
-        ("trackName", "String"),
-        ("duration", "Float"),
-        ("effectName", "CName"),
-        ("effect", "CName"),
-        ("appearance", "CName"),
-    ):
-        prop = _event_prop_by_name(chunk, field_name)
-        if prop is not None:
-            fields[field_name] = _read_event_field_prop(prop, type_name, chunks)
-    return fields
+    from .event_props import children
+    declared = {field.name: field.type_name for field in event_declared_fields(game, type_name)}
+    return {prop.theName: _read_event_field_prop(prop, declared.get(prop.theName, prop.theType), chunks)
+            for prop in children(chunk)}
 
 
 def _parse_event_chunk(chunk, chunks=None, game=GAME_W3):
@@ -1871,7 +1874,10 @@ def _parse_event_chunk(chunk, chunks=None, game=GAME_W3):
     if not type_name:
         return None
 
-    return build_event_data(game, type_name, _event_raw_fields_from_chunk(chunk, game=game, chunks=chunks))
+    from .event_props import children, field_type
+    event = build_event_data(game, type_name, _event_raw_fields_from_chunk(chunk, game=game, chunks=chunks))
+    event.field_types = {p.theName: field_type(p) for p in children(chunk)}
+    return event
 
 
 def _read_buffered_cutscene_events(chunk_set, cr2w_file):
@@ -1941,10 +1947,15 @@ def _read_cutscene_entry_events(entry_chunk, cr2w_file):
 
     props = list(getattr(entry_chunk, 'PROPS', None) or [])
     file_name = str(getattr(cr2w_file, 'fileName', '') or '')
-    if not props or not file_name:
+    if not file_name:
         return []
 
-    last_prop_end = int(getattr(props[-1], 'dataEnd', 0) or 0)
+    if props:
+        last_prop_end = int(getattr(props[-1], 'dataEnd', 0) or 0)
+    elif entry_chunk.name == 'CExtAnimEventsFile' and cr2w_file.HEADER.version >= 158:
+        last_prop_end = cr2w_file.start + cr2w_file.CR2WExport[entry_chunk.ChunkIndex].dataOffset + 1
+    else:
+        return []
     class_end = int(getattr(entry_chunk, 'classEnd', 0) or 0)
     if last_prop_end <= 0 or class_end <= last_prop_end:
         return []

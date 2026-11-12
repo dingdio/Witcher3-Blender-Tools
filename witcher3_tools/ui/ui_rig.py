@@ -10,7 +10,7 @@ from bpy.types import PropertyGroup, UIList
 from ..animation import pose_keys as pose_key_tools
 from ..rigging import ik as ik_rig
 from ..lipsync import redkit_project
-from .armature_context import get_main_armature
+from .armature_context import get_main_armature, set_main_armature
 
 log = logging.getLogger(__name__)
 _REDKIT_PROJECT_ENUM_CACHE = []
@@ -28,11 +28,21 @@ _RIG_AUTO_CAPTURE_IDLE_DELAY = 0.22
 def _find_character_armature(context):
     return get_main_armature(
         context,
-        prefer_active=True,
+        prefer_active=False,
         remember=True,
         fallback=True,
         allow_auxiliary_active=True,
     )
+
+
+def _find_ik_armature(context):
+    target = _find_character_armature(context)
+    candidate = target
+    while candidate is not None:
+        if ik_rig.validate_human_armature(candidate):
+            return candidate
+        candidate = candidate.parent
+    return target
 
 
 class WITCH_PG_RigBoneItem(PropertyGroup):
@@ -1508,20 +1518,76 @@ def _ik_frame_range(context):
             end = frame
         return (start, end) if start <= end else (end, start)
     if mode == "ACTION":
-        armature = _find_character_armature(context)
+        armature = _find_ik_armature(context)
         action = getattr(getattr(armature, "animation_data", None), "action", None) if armature else None
+        if action is None and armature is not None:
+            from ..animation.events import nla_strips
+            strips = nla_strips(armature)
+            if strips:
+                return int(min(s.frame_start for s in strips)), int(max(s.frame_end for s in strips))
         return ik_rig.action_frame_range(action, scene)
     return int(scene.frame_start), int(scene.frame_end)
 
 
 def _report_ik_result(operator, context, result):
     scene = context.scene
+    target = _find_ik_armature(context)
+    scene.witcher_rig_ik_status_target = target.name if target else ''
+    scene.witcher_rig_ik_details = json.dumps(getattr(result, 'details', {}))
     scene.witcher_rig_ik_status = str(getattr(result, "message", "") or "")
     if result:
+        if ik_rig.validate_human_armature(target):
+            set_main_armature(scene, target)
         operator.report({'INFO'}, scene.witcher_rig_ik_status)
         return {'FINISHED'}
     operator.report({'ERROR'}, scene.witcher_rig_ik_status or "IK rig operation failed")
     return {'CANCELLED'}
+
+
+class WITCH_OT_RigIkDetails(bpy.types.Operator):
+    bl_idname = 'witcher.rig_ik_details'
+    bl_label = 'Rig Details'
+    target: StringProperty(name='Target')
+    result: StringProperty(name='Last Operation')
+    missing: StringProperty(name='Missing Bones')
+    details: StringProperty(name='Details')
+
+    def invoke(self, context, event):
+        armature = _find_ik_armature(context)
+        self.target = armature.name if armature else ''
+        validation = ik_rig.validate_human_armature(armature)
+        self.missing = ', '.join(validation.details.get('missing', []))
+        if context.scene.witcher_rig_ik_status_target == self.target:
+            self.result = context.scene.witcher_rig_ik_status
+            self.details = context.scene.witcher_rig_ik_details
+        return context.window_manager.invoke_props_dialog(self, width=650)
+
+    def draw(self, context):
+        for name in ('target', 'missing', 'result', 'details'):
+            if getattr(self, name):
+                self.layout.prop(self, name)
+
+    def execute(self, context):
+        return {'FINISHED'}
+
+
+class WITCH_OT_RigSelectBody(bpy.types.Operator):
+    bl_idname = 'witcher.rig_select_body'
+    bl_label = 'Select Body Only'
+    bl_description = 'Select only the body armature for pose editing and Blender Bake Action'
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        armature = _find_ik_armature(context)
+        if armature is None:
+            return {'CANCELLED'}
+        if context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+        armature.select_set(True)
+        context.view_layer.objects.active = armature
+        set_main_armature(context.scene, armature)
+        return {'FINISHED'}
 
 
 class WITCH_OT_RigCreateIkControls(bpy.types.Operator):
@@ -1532,7 +1598,7 @@ class WITCH_OT_RigCreateIkControls(bpy.types.Operator):
     rebuild: BoolProperty(default=False)
 
     def execute(self, context):
-        armature = _find_character_armature(context)
+        armature = _find_ik_armature(context)
         result = ik_rig.create_ik_rig(context, armature, options={"rebuild": self.rebuild})
         return _report_ik_result(self, context, result)
 
@@ -1543,7 +1609,7 @@ class WITCH_OT_RigRemoveIkControls(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        armature = _find_character_armature(context)
+        armature = _find_ik_armature(context)
         result = ik_rig.remove_ik_rig(context, armature)
         return _report_ik_result(self, context, result)
 
@@ -1554,7 +1620,7 @@ class WITCH_OT_RigSnapFkToIk(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        armature = _find_character_armature(context)
+        armature = _find_ik_armature(context)
         result = ik_rig.snap_fk_to_ik(
             context,
             armature,
@@ -1571,7 +1637,7 @@ class WITCH_OT_RigSnapIkToFk(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        armature = _find_character_armature(context)
+        armature = _find_ik_armature(context)
         result = ik_rig.snap_ik_to_fk(
             context,
             armature,
@@ -1588,7 +1654,7 @@ class WITCH_OT_RigBakeFkToIk(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        armature = _find_character_armature(context)
+        armature = _find_ik_armature(context)
         frame_start, frame_end = _ik_frame_range(context)
         result = ik_rig.bake_fk_to_ik(
             context,
@@ -1607,7 +1673,7 @@ class WITCH_OT_RigBakeIkToGame(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        armature = _find_character_armature(context)
+        armature = _find_ik_armature(context)
         frame_start, frame_end = _ik_frame_range(context)
         result = ik_rig.bake_ik_to_fk(
             context,
@@ -1616,6 +1682,7 @@ class WITCH_OT_RigBakeIkToGame(bpy.types.Operator):
             frame_end,
             _selected_ik_limbs(context.scene),
             new_action=bool(getattr(context.scene, "witcher_rig_ik_new_action", True)),
+            sync_markers=context.scene.witcher_rig_ik_sync_markers,
         )
         return _report_ik_result(self, context, result)
 
@@ -1638,7 +1705,7 @@ class WITCH_OT_RigLimbSwitch(bpy.types.Operator):
     to_ik: BoolProperty(default=True)
 
     def execute(self, context):
-        armature = _find_character_armature(context)
+        armature = _find_ik_armature(context)
         snap = ik_rig.snap_fk_to_ik if self.to_ik else ik_rig.snap_ik_to_fk
         result = snap(
             context,
@@ -1657,7 +1724,7 @@ class WITCH_OT_RigRecalibratePoles(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        armature = _find_character_armature(context)
+        armature = _find_ik_armature(context)
         result = ik_rig.recalibrate_pole_angles(context, armature)
         return _report_ik_result(self, context, result)
 
@@ -2125,9 +2192,12 @@ def _draw_section_header(layout, scene, prop_name, title, icon='TRIA_RIGHT'):
 
 def _draw_ik_rigging_tools(layout, context, armature):
     scene = context.scene
+    armature = _find_ik_armature(context)
 
     setup_box = layout.box()
     setup_box.label(text="Setup", icon='ARMATURE_DATA')
+    setup_box.prop(scene, 'witcher_main_armature', text='Target')
+    setup_box.operator(WITCH_OT_RigSelectBody.bl_idname, icon='RESTRICT_SELECT_OFF')
     if armature is None:
         row = setup_box.row()
         row.enabled = False
@@ -2140,11 +2210,11 @@ def _draw_ik_rigging_tools(layout, context, armature):
     row = setup_box.row(align=True)
     row.operator(WITCH_OT_RigRecalibratePoles.bl_idname, text="Recalibrate Poles", icon='ORIENTATION_GIMBAL')
     row.operator(WITCH_OT_RigRemoveIkControls.bl_idname, text="Remove", icon='TRASH')
-    status = str(getattr(scene, "witcher_rig_ik_status", "") or "")
-    if status:
-        info = setup_box.row()
-        info.enabled = False
-        info.label(text=status, icon='INFO')
+    validation = ik_rig.validate_human_armature(armature)
+    info = setup_box.row(align=True)
+    status = ('Using parent body' if armature != scene.witcher_main_armature else 'Human rig ready') if validation else 'Human skeleton required'
+    info.label(text=status, icon='CHECKMARK' if validation else 'INFO')
+    info.operator(WITCH_OT_RigIkDetails.bl_idname, text='', icon='INFO')
 
     live_box = layout.box()
     live_box.label(text="Live IK", icon='CONSTRAINT')
@@ -2164,7 +2234,7 @@ def _draw_ik_rigging_tools(layout, context, armature):
             op.to_ik = False
         hint = live_box.row()
         hint.enabled = False
-        hint.label(text="Buttons snap & switch at the current frame (Key Snap keys it).", icon='INFO')
+        hint.label(text="Buttons snap at the playhead", icon='INFO')
 
     snap_box = layout.box()
     snap_box.label(text="FK / IK Snap", icon='SNAP_ON')
@@ -2187,6 +2257,7 @@ def _draw_ik_rigging_tools(layout, context, armature):
         row.prop(scene, "witcher_rig_ik_frame_end", text="End")
     bake_box.prop(scene, "witcher_rig_ik_new_action", text="New Action")
     bake_box.prop(scene, "witcher_rig_ik_clear_keys", text="Clear IK Keys")
+    bake_box.prop(scene, 'witcher_rig_ik_sync_markers')
     bake_box.operator(WITCH_OT_RigBakeFkToIk.bl_idname, text="Bake FK -> IK Controls", icon='KEY_HLT')
     bake_box.operator(WITCH_OT_RigBakeIkToGame.bl_idname, text="Bake IK -> Game Action", icon='EXPORT')
 
@@ -2315,6 +2386,8 @@ classes = [
     WITCH_OT_RigAddPoseKey,
     WITCH_OT_RigRemovePoseKey,
     WITCH_OT_RigCreateIkControls,
+    WITCH_OT_RigIkDetails,
+    WITCH_OT_RigSelectBody,
     WITCH_OT_RigRemoveIkControls,
     WITCH_OT_RigSnapFkToIk,
     WITCH_OT_RigSnapIkToFk,
@@ -2443,7 +2516,7 @@ def register_props():
         items=[
             ('CURRENT', "Current", "Bake the current frame only"),
             ('SCENE', "Scene", "Use the scene frame range"),
-            ('ACTION', "Action", "Use the active action frame range"),
+            ('ACTION', "Action / NLA", "Use the active action, or the enabled NLA strip range when there is no active action"),
             ('CUSTOM', "Custom", "Use the custom start and end frames"),
         ],
         default='ACTION',
@@ -2457,6 +2530,12 @@ def register_props():
     )
     bpy.types.Scene.witcher_rig_ik_clear_keys = BoolProperty(name="Clear IK Keys", default=True)
     bpy.types.Scene.witcher_rig_ik_status = StringProperty(name="IK Status", default="", options={'SKIP_SAVE'})
+    bpy.types.Scene.witcher_rig_ik_status_target = StringProperty(options={'SKIP_SAVE'})
+    bpy.types.Scene.witcher_rig_ik_details = StringProperty(options={'SKIP_SAVE'})
+    bpy.types.Scene.witcher_rig_ik_sync_markers = BoolProperty(
+        name='Update Game IK Markers', default=False,
+        description='Align game IK markers to the edited body when baking; leave off to preserve authored markers',
+    )
     bpy.types.Scene.witcher_rig_last_pose_key_strip = StringProperty(default="", options={'SKIP_SAVE'})
     bpy.types.Scene.witcher_rig_last_pose_key_metadata = StringProperty(default="", options={'SKIP_SAVE'})
     bpy.types.Scene.witcher_rig_pose_status = StringProperty(name="Pose Status", default="", options={'SKIP_SAVE'})
@@ -2511,6 +2590,9 @@ def unregister_props():
         "witcher_rig_ik_new_action",
         "witcher_rig_ik_clear_keys",
         "witcher_rig_ik_status",
+        "witcher_rig_ik_status_target",
+        "witcher_rig_ik_details",
+        "witcher_rig_ik_sync_markers",
         "witcher_rig_last_pose_key_strip",
         "witcher_rig_last_pose_key_metadata",
         "witcher_rig_pose_status",

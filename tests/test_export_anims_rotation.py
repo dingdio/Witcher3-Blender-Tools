@@ -64,6 +64,8 @@ class ExportAnimRotationTests(unittest.TestCase):
                 else:
                     sys.modules[name] = old
 
+        self.addCleanup(restore_modules)
+
         pkg = types.ModuleType("witcher3_tools")
         pkg.__path__ = [str(REPO_ROOT / "witcher3_tools")]
         pkg.__package__ = "witcher3_tools"
@@ -104,7 +106,7 @@ class ExportAnimRotationTests(unittest.TestCase):
         cr2w = types.ModuleType("witcher3_tools.CR2W")
         cr2w.__path__ = []
         put("witcher3_tools.CR2W", cr2w)
-        for name in ("w3_types", "anims_builder", "cr2w_writer"):
+        for name in ("w3_types", "anims_builder", "cr2w_writer", "w2anims_inject"):
             put(f"witcher3_tools.CR2W.{name}", types.ModuleType(f"witcher3_tools.CR2W.{name}"))
 
         importers = types.ModuleType("witcher3_tools.importers")
@@ -131,7 +133,6 @@ class ExportAnimRotationTests(unittest.TestCase):
             sys.modules.pop(name, None)
             created.append(name)
         module = importlib.import_module("witcher3_tools.exporters.export_anims")
-        self.addCleanup(restore_modules)
         return module
 
     def test_euler_rotation_sample_exports_as_quaternion(self):
@@ -192,6 +193,10 @@ class ExportAnimRotationTests(unittest.TestCase):
         self.assertAlmostEqual(values[1], 0.0, places=6)
         self.assertAlmostEqual(values[2], 0.0, places=6)
         self.assertAlmostEqual(values[3], math.sqrt(0.5), places=6)
+
+    def test_location_only_bone_uses_default_rotation(self):
+        export_anims = self._import_export_anims_with_stubs()
+        self.assertIsNone(export_anims._select_rotation_prop({'location': [object()]}, 'QUATERNION'))
 
 
 if __name__ == "__main__":

@@ -260,6 +260,7 @@ class Enums:
     ,"ESkeletalAnimationType"
     ,"ENearPlaneDistance"
     ,"EFarPlaneDistance"
+    ,"EApertureValue"
     ,"EAnimationEventType"
     ,"EInteractionPriority"
     ,"ECameraSolver"

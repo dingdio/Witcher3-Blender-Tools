@@ -392,6 +392,39 @@ class FreeCameraTests(unittest.TestCase):
         self.assertEqual(cam.fov, 5.0)
 
 
+class EffectEventTests(unittest.TestCase):
+    def test_payloads_fire_once_with_their_crossing_time(self):
+        attack = PlayerCoreTests.attack()
+        attack.effects = [(0.0, 'start', 'r_weapon', False, None, False),
+                          (0.253, 'light_trail_fx', 'r_weapon', False, 0.2, False),
+                          (0.4, 'default_blood_trail', 'r_weapon', False, None, True),
+                          (0.6, 'light_trail_fx', 'r_weapon', True, None, False)]
+        for upper in (False, True):
+            ctl = core.Controller(profile())
+            ctl.play(attack, 'attack', upper=upper)
+            fired = []
+            for _ in range(90):
+                ctl.step(DT, (0.0, 0.0), 1.0)
+                fired.extend(ctl.effects)
+            self.assertEqual([e for _, e in fired], attack.effects)
+            for time, event in fired:
+                self.assertAlmostEqual(time, event[0])
+
+    def test_replaced_action_does_not_start_an_effect(self):
+        first, second = PlayerCoreTests.attack('first'), PlayerCoreTests.attack('second')
+        first.effects = [(0.2, 'old', 'r_weapon', False, None, False)]
+        second.effects = [(0.2, 'new', 'r_weapon', False, None, False)]
+        ctl = core.Controller(profile())
+        ctl.play(first, 'attack')
+        run(ctl, 0.1)
+        ctl.play(second, 'attack')
+        fired = []
+        for _ in range(60):
+            ctl.step(DT, (0.0, 0.0), 1.0)
+            fired.extend(ctl.effects)
+        self.assertEqual([e[1] for _, e in fired], ['new'])
+
+
 class SoundEventTests(unittest.TestCase):
     @staticmethod
     def heard(ctl, seconds, move=(0.0, 0.0), speed=1.0):
